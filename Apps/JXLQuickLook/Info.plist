@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Info.plist for the Quick Look thumbnail extension (M10).
+  Declares that this appex provides thumbnails for the JPEG XL UTI.
+  Add this target to an Xcode project; it cannot be built with Command Line
+  Tools alone (appex packaging + codesigning require Xcode).
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key>
+    <string>JXL Quick Look</string>
+    <key>CFBundleIdentifier</key>
+    <string>dev.jxl.JXLQuickLook</string>
+    <key>CFBundlePackageType</key>
+    <string>XPC!</string>
+    <key>NSExtension</key>
+    <dict>
+        <key>NSExtensionPointIdentifier</key>
+        <string>com.apple.quicklook.thumbnail</string>
+        <key>NSExtensionPrincipalClass</key>
+        <string>$(PRODUCT_MODULE_NAME).ThumbnailProvider</string>
+        <key>NSExtensionAttributes</key>
+        <dict>
+            <key>QLSupportedContentTypes</key>
+            <array>
+                <string>public.jpeg-xl</string>
+                <string>org.jpeg.jxl</string>
+            </array>
+            <key>QLThumbnailMinimumDimension</key>
+            <integer>0</integer>
+        </dict>
+    </dict>
+</dict>
+</plist>
