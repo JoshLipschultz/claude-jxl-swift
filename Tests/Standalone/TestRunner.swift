@@ -14,8 +14,10 @@ struct TestRunner {
     static var passed = 0
     static var failed = 0
 
-    static func check(_ condition: @autoclosure () -> Bool, _ label: String,
-                      file: StaticString = #file, line: UInt = #line) {
+    static func check(
+        _ condition: @autoclosure () -> Bool, _ label: String,
+        file: StaticString = #file, line: UInt = #line
+    ) {
         if condition() {
             passed += 1
         } else {
@@ -24,13 +26,16 @@ struct TestRunner {
         }
     }
 
-    static func eq<T: Equatable>(_ a: T, _ b: T, _ label: String,
-                                 file: StaticString = #file, line: UInt = #line) {
+    static func eq<T: Equatable>(
+        _ a: T, _ b: T, _ label: String,
+        file: StaticString = #file, line: UInt = #line
+    ) {
         if a == b {
             passed += 1
         } else {
             failed += 1
-            FileHandle.standardError.write(Data("  ✗ \(label): \(a) != \(b)  (\(file):\(line))\n".utf8))
+            FileHandle.standardError.write(
+                Data("  ✗ \(label): \(a) != \(b)  (\(file):\(line))\n".utf8))
         }
     }
 
@@ -40,8 +45,8 @@ struct TestRunner {
         }
         // Derive from this source file's compile-time path: <root>/Tests/Standalone/TestRunner.swift
         let here = URL(fileURLWithPath: #filePath)
-        return here.deletingLastPathComponent()        // Standalone
-            .deletingLastPathComponent()               // Tests
+        return here.deletingLastPathComponent()  // Standalone
+            .deletingLastPathComponent()  // Tests
             .appendingPathComponent("JXLCoreTests/Fixtures")
     }
 
@@ -49,6 +54,7 @@ struct TestRunner {
         print("Running JXLCore standalone tests...")
         bitstream()
         headers()
+        metadata()
         container()
 
         print("\n\(passed) passed, \(failed) failed")
@@ -120,20 +126,65 @@ struct TestRunner {
         }
     }
 
+    // MARK: - Metadata
+
+    static func metadata() {
+        let cases:
+            [(
+                name: String, bits: UInt32, exponentBits: UInt32, colorSpace: JXLColorSpace,
+                alpha: Bool, extra: Int
+            )] = [
+                ("40x30_gray8.jxl", 8, 0, .grayscale, false, 0),
+                ("40x30_rgba8.jxl", 8, 0, .rgb, true, 1),
+                ("40x30_rgb16.jxl", 16, 0, .rgb, false, 0),
+                ("40x30_rgbf32.jxl", 32, 8, .rgb, false, 0),
+            ]
+
+        let dir = fixturesDir()
+        for c in cases {
+            let url = dir.appendingPathComponent(c.name)
+            guard let data = try? Data(contentsOf: url) else {
+                check(false, "missing fixture \(c.name)")
+                continue
+            }
+            do {
+                let info = try JXL.readInfo(from: data)
+                eq(info.width, 40, "\(c.name) width")
+                eq(info.height, 30, "\(c.name) height")
+                eq(info.bitDepth.bitsPerSample, c.bits, "\(c.name) bits")
+                eq(info.bitDepth.exponentBitsPerSample, c.exponentBits, "\(c.name) exponent bits")
+                eq(info.bitDepth.isFloatingPoint, c.exponentBits > 0, "\(c.name) float")
+                eq(info.colorSpace, c.colorSpace, "\(c.name) color space")
+                eq(info.hasAlpha, c.alpha, "\(c.name) alpha")
+                eq(info.extraChannelCount, c.extra, "\(c.name) extra channels")
+            } catch {
+                check(false, "\(c.name) metadata threw \(error)")
+            }
+        }
+    }
+
     // MARK: - Container
 
     static func container() {
         let dir = fixturesDir()
-        if let raw = try? JXL.readInfo(from: Data(contentsOf: dir.appendingPathComponent("64x48_lossless.jxl"))) {
+        if let raw = try? JXL.readInfo(
+            from: Data(contentsOf: dir.appendingPathComponent("64x48_lossless.jxl")))
+        {
             check(!raw.isContainer, "raw not container")
             check(raw.boxTypes.isEmpty, "raw no boxes")
-        } else { check(false, "load raw fixture") }
+        } else {
+            check(false, "load raw fixture")
+        }
 
-        if let c = try? JXL.readInfo(from: Data(contentsOf: dir.appendingPathComponent("64x48_container.jxl"))) {
+        if let c = try? JXL.readInfo(
+            from: Data(contentsOf: dir.appendingPathComponent("64x48_container.jxl")))
+        {
             check(c.isContainer, "container detected")
             check(c.boxTypes.contains("ftyp"), "has ftyp box")
             check(c.boxTypes.contains { $0 == "jxlc" || $0 == "jxlp" }, "has codestream box")
-        } else { check(false, "load container fixture") }
+        } else {
+            check(false, "load container fixture")
+        }
 
         // Non-JXL rejection
         do {

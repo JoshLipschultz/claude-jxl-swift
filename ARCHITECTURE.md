@@ -17,7 +17,7 @@ codestream itself begins with `FF 0A` and is structured as:
 ```
 codestream
 ├── SizeHeader            image dimensions                         [M1 ✅]
-├── ImageMetadata         bit depth, channels, color, animation…   [M2]
+├── ImageMetadata         bit depth, channels, color, animation…   [M2 partial]
 └── frames…
     └── FrameHeader + TOC
         ├── LfGlobal       (incl. Modular global, patches, splines, noise)
@@ -48,7 +48,7 @@ Sources/JXLCore/
     Container.swift     ISOBMFF box demux + codestream reassembly  [M1 ✅]
   Headers/
     SizeHeader.swift    image dimensions                           [M1 ✅]
-    ImageMetadata.swift basic info: BitDepth, channels, color      [M2]
+    ImageMetadata.swift basic info: BitDepth, channels, color      [M2 partial]
     ColorEncoding.swift color space signaling / ICC                [M2]
   Entropy/
     PrefixCode.swift    canonical prefix (Huffman) codes           [M3]
@@ -84,7 +84,7 @@ Sources/JXLCore/
 | #  | Milestone | Deliverable | Status |
 |----|-----------|-------------|--------|
 | M1 | Foundation | container demux, dimensions, CLI, oracle harness | ✅ done |
-| M2 | Image metadata | full `jxl info` matching `jxlinfo` (depth, channels, color, animation) | next |
+| M2 | Image metadata | `jxl info` pixel format matching `jxlinfo` (depth, channels, color model, alpha) | partial |
 | M3 | Entropy coding | prefix + ANS + LZ77 + context modeling | |
 | M4 | Frame layer | FrameHeader, TOC, group/pass model | |
 | M5 | **Modular mode** | first real pixels: lossless `.jxl` → RGBA | |
@@ -96,6 +96,18 @@ Sources/JXLCore/
 
 Cross-cutting, ongoing: conformance corpus from the libjxl test suite, fuzzing,
 and SIMD/performance once correctness is locked per stage.
+
+**M2 status (in progress).** Bit depth (integer/float incl. exponent bits),
+color model (RGB/Gray), channel counts, and alpha are parsed and validated
+against libjxl across the fixture matrix — `jxl info`'s pixel-format string is
+byte-identical to `jxlinfo`'s. Deferred to a later milestone (and not yet
+bit-exact): the *tail* of ColorEncoding (white point, primaries, transfer
+function, rendering intent) and the trailing ImageMetadata fields (tone mapping,
+extensions). Differential testing showed our model of that tail does not yet
+reproduce libjxl's resolved values, so the parser deliberately stops at
+`color_space` rather than advance the bit reader by an unverified amount; nothing
+exposed today depends on the bits past that point. The orientation/animation
+(`extra_fields`) path is implemented but not yet covered by a fixture.
 
 ## Validation strategy
 

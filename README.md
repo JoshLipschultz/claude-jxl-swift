@@ -12,8 +12,8 @@ extension. No dependency on libjxl; libjxl is used only as a test oracle.
 ## What works today
 
 ```
-$ jxl info  image.jxl     # dimensions + container layout
-1024 x 768  (bare codestream)
+$ jxl info  image.jxl     # dimensions + basic metadata + container layout
+1024 x 768  8-bit RGB  (bare codestream)
 
 $ jxl boxes image.jxl     # ISOBMFF box listing
 'JXL '  12 bytes  (payload 4)
@@ -27,7 +27,7 @@ Library:
 import JXLCore
 
 let info = try JXL.readInfo(contentsOf: url)
-print(info.width, info.height, info.isContainer, info.boxTypes)
+print(info.width, info.height, info.bitDepth.bitsPerSample, info.colorSpace, info.hasAlpha)
 ```
 
 ## Building & testing

@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import JXLCore
 
 final class HeaderTests: XCTestCase {
@@ -13,7 +14,10 @@ final class HeaderTests: XCTestCase {
     func fixtureURL(_ name: String) throws -> URL {
         let base = (name as NSString).deletingPathExtension
         let ext = (name as NSString).pathExtension
-        guard let url = Bundle.module.url(forResource: base, withExtension: ext, subdirectory: "Fixtures") else {
+        guard
+            let url = Bundle.module.url(
+                forResource: base, withExtension: ext, subdirectory: "Fixtures")
+        else {
             throw XCTSkip("fixture \(name) not bundled")
         }
         return url
@@ -49,9 +53,38 @@ final class HeaderTests: XCTestCase {
         }
     }
 
+    func testImageMetadataFixtures() throws {
+        let cases:
+            [(
+                name: String, bits: UInt32, exponentBits: UInt32, colorSpace: JXLColorSpace,
+                alpha: Bool, extra: Int
+            )] = [
+                ("40x30_gray8.jxl", 8, 0, .grayscale, false, 0),
+                ("40x30_rgba8.jxl", 8, 0, .rgb, true, 1),
+                ("40x30_rgb16.jxl", 16, 0, .rgb, false, 0),
+                ("40x30_rgbf32.jxl", 32, 8, .rgb, false, 0),
+            ]
+
+        for c in cases {
+            let info = try JXL.readInfo(contentsOf: fixtureURL(c.name))
+            XCTAssertEqual(info.width, 40, "width mismatch for \(c.name)")
+            XCTAssertEqual(info.height, 30, "height mismatch for \(c.name)")
+            XCTAssertEqual(info.bitDepth.bitsPerSample, c.bits, "bits mismatch for \(c.name)")
+            XCTAssertEqual(
+                info.bitDepth.exponentBitsPerSample, c.exponentBits,
+                "exponent bits mismatch for \(c.name)")
+            XCTAssertEqual(
+                info.bitDepth.isFloatingPoint, c.exponentBits > 0, "float mismatch for \(c.name)")
+            XCTAssertEqual(info.colorSpace, c.colorSpace, "color space mismatch for \(c.name)")
+            XCTAssertEqual(info.hasAlpha, c.alpha, "alpha mismatch for \(c.name)")
+            XCTAssertEqual(
+                info.extraChannelCount, c.extra, "extra channel count mismatch for \(c.name)")
+        }
+    }
+
     func testSizeHeaderAspectRatioMath() {
-        XCTAssertEqual(SizeHeader.width(forRatio: 3, height: 48), 64)   // 4:3
-        XCTAssertEqual(SizeHeader.width(forRatio: 1, height: 100), 100) // 1:1
+        XCTAssertEqual(SizeHeader.width(forRatio: 3, height: 48), 64)  // 4:3
+        XCTAssertEqual(SizeHeader.width(forRatio: 1, height: 100), 100)  // 1:1
         XCTAssertEqual(SizeHeader.width(forRatio: 7, height: 50), 100)  // 2:1
     }
 }

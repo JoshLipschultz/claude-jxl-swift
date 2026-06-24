@@ -3,8 +3,8 @@
 // Top-level entry points. This is the orchestrator that will grow to drive the
 // full decode pipeline (headers -> frames -> entropy -> Modular/VarDCT -> pixels).
 //
-// Current milestone (M1): container demux + image dimensions. Deeper metadata
-// (bit depth, color, channels) and pixel decoding land in subsequent milestones.
+// Current milestone (M2 partial): container demux + dimensions + basic image
+// metadata. Frame, entropy, Modular/VarDCT, and pixel decoding land next.
 
 import Foundation
 
@@ -12,6 +12,13 @@ import Foundation
 public struct JXLImageInfo: Equatable {
     public let width: UInt32
     public let height: UInt32
+    public let bitDepth: JXLBitDepth
+    public let colorSpace: JXLColorSpace
+    public let colorChannelCount: Int
+    public let extraChannelCount: Int
+    public let hasAlpha: Bool
+    public let orientation: UInt32
+    public let hasAnimation: Bool
     /// `true` if delivered inside an ISOBMFF container, `false` for a bare codestream.
     public let isContainer: Bool
     /// The container's box types in order (empty for a bare codestream).
@@ -24,19 +31,28 @@ public enum JXL {
         let parsed = try JXLContainer.parse(data)
 
         guard parsed.codestream.count >= 2,
-              parsed.codestream[0] == 0xFF,
-              parsed.codestream[1] == 0x0A else {
+            parsed.codestream[0] == 0xFF,
+            parsed.codestream[1] == 0x0A
+        else {
             throw JXLError.invalidSignature
         }
 
         let reader = BitReader(parsed.codestream)
-        reader.skip(16) // consume the FF 0A signature
+        reader.skip(16)  // consume the FF 0A signature
         let size = SizeHeader(reader)
-        try reader.ensureInBounds("SizeHeader")
+        let metadata = JXLImageMetadata(reader)
+        try reader.ensureInBounds("ImageMetadata")
 
         return JXLImageInfo(
             width: size.width,
             height: size.height,
+            bitDepth: metadata.bitDepth,
+            colorSpace: metadata.colorSpace,
+            colorChannelCount: metadata.colorChannelCount,
+            extraChannelCount: metadata.extraChannelCount,
+            hasAlpha: metadata.hasAlpha,
+            orientation: metadata.orientation,
+            hasAnimation: metadata.hasAnimation,
             isContainer: parsed.isContainer,
             boxTypes: parsed.boxes.map(\.type)
         )

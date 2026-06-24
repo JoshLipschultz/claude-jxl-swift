@@ -7,6 +7,15 @@
 import Foundation
 import JXLCore
 
+func colorSpaceName(_ colorSpace: JXLColorSpace) -> String {
+    switch colorSpace {
+    case .rgb: return "RGB"
+    case .grayscale: return "Grayscale"
+    case .xyb: return "XYB"
+    case .unknown: return "Unknown"
+    }
+}
+
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write(Data((message + "\n").utf8))
     exit(1)
@@ -14,13 +23,13 @@ func fail(_ message: String) -> Never {
 
 func usage() -> Never {
     let text = """
-    jxl — pure-Swift JPEG XL tools
+        jxl — pure-Swift JPEG XL tools
 
-    USAGE:
-      jxl info  <file.jxl>    Print dimensions and container layout
-      jxl boxes <file.jxl>    List ISOBMFF container boxes
+        USAGE:
+          jxl info  <file.jxl>    Print dimensions and container layout
+          jxl boxes <file.jxl>    List ISOBMFF container boxes
 
-    """
+        """
     FileHandle.standardError.write(Data(text.utf8))
     exit(2)
 }
@@ -42,9 +51,22 @@ do {
     case "info":
         let info = try JXL.readInfo(from: bytes)
         let kind = info.isContainer ? "container" : "bare codestream"
-        print("\(info.width) x \(info.height)  (\(kind))")
+        let sampleKind =
+            info.bitDepth.isFloatingPoint
+            ? "\(info.bitDepth.bitsPerSample)-bit float (\(info.bitDepth.exponentBitsPerSample) exponent bits)"
+            : "\(info.bitDepth.bitsPerSample)-bit"
+        let colorSpace = colorSpaceName(info.colorSpace)
+        let channels =
+            info.hasAlpha
+            ? "\(colorSpace)+Alpha"
+            : colorSpace
+        print("\(info.width) x \(info.height)  \(sampleKind) \(channels)  (\(kind))")
         if !info.boxTypes.isEmpty {
             print("boxes: \(info.boxTypes.joined(separator: ", "))")
+        }
+        if info.orientation != 1 || info.hasAnimation {
+            print(
+                "orientation: \(info.orientation), animation: \(info.hasAnimation ? "yes" : "no")")
         }
 
     case "boxes":
