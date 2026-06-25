@@ -68,6 +68,17 @@ public final class BitReader {
         read(1) == 1
     }
 
+    /// Returns the next `count` bits without advancing the position
+    /// (libjxl `PeekBits`). Pair with `skip` (libjxl `Consume`).
+    public func peek(_ count: Int) -> UInt64 {
+        let savedPosition = bitPosition
+        let savedOverread = didOverread
+        let value = read(count)
+        bitPosition = savedPosition
+        didOverread = savedOverread
+        return value
+    }
+
     /// Advances by `count` bits without returning a value.
     public func skip(_ count: Int) {
         precondition(count >= 0)

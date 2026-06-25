@@ -50,9 +50,10 @@ Sources/JXLCore/
     SizeHeader.swift    image dimensions                           [M1 ✅]
     ImageMetadata.swift BitDepth, channels, full ColorEncoding     [M2 ✅]
   Entropy/
-    PrefixCode.swift    canonical prefix (Huffman) codes           [M3]
-    ANS.swift           rANS alias-method decoder                  [M3]
-    EntropyDecoder.swift histograms, clustering, LZ77, hybrid uint [M3]
+    HybridUint.swift    hybrid integer coder (token + extra bits)  [M3 ✅]
+    PrefixCode.swift    canonical prefix (Huffman) codes           [M3 ✅]
+    ANS.swift           rANS alias-method decoder                  [M3 wip]
+    EntropyDecoder.swift histograms, clustering, LZ77, context map [M3 wip]
   Frame/
     FrameHeader.swift   frame type, passes, blending, TOC          [M4]
     Frame.swift         group/pass orchestration                   [M4]
@@ -84,7 +85,7 @@ Sources/JXLCore/
 |----|-----------|-------------|--------|
 | M1 | Foundation | container demux, dimensions, CLI, oracle harness | ✅ done |
 | M2 | Image metadata | full `ImageMetadata` bit-exact vs libjxl (depth, channels, full color encoding) | ✅ done |
-| M3 | Entropy coding | prefix + ANS + LZ77 + context modeling | |
+| M3 | Entropy coding | prefix + ANS + LZ77 + context modeling | wip (hybrid-uint + prefix codes done) |
 | M4 | Frame layer | FrameHeader, TOC, group/pass model | |
 | M5 | **Modular mode** | first real pixels: lossless `.jxl` → RGBA | |
 | M6 | VarDCT mode | lossy photographic `.jxl` → pixels | |

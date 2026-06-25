@@ -56,6 +56,7 @@ struct TestRunner {
         headers()
         metadata()
         container()
+        entropy()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -167,6 +168,109 @@ struct TestRunner {
             } catch {
                 check(false, "\(c.name) metadata threw \(error)")
             }
+        }
+    }
+
+    // MARK: - Entropy coding (M3)
+
+    /// LSB-first bit writer used to construct streams for round-trip tests.
+    final class BitWriter {
+        var bytes: [UInt8] = []
+        var bitPos = 0
+        func write(_ value: UInt64, _ count: Int) {
+            for i in 0..<count {
+                let bit = UInt8((value >> UInt64(i)) & 1)
+                let byteIndex = bitPos >> 3
+                if byteIndex >= bytes.count { bytes.append(0) }
+                bytes[byteIndex] |= bit << UInt8(bitPos & 7)
+                bitPos += 1
+            }
+        }
+        var reader: BitReader { BitReader(bytes.isEmpty ? [0] : bytes) }
+    }
+
+    /// Mirror of BuildHuffmanTable's reversed-key advance (for the test encoder).
+    static func nextKey(_ key: Int, _ len: Int) -> Int {
+        var step = 1 << (len - 1)
+        while (key & step) != 0 { step >>= 1 }
+        return (key & (step - 1)) + step
+    }
+
+    /// Canonical (key, length) per symbol, matching BuildHuffmanTable's assignment.
+    static func canonicalCodes(_ codeLengths: [UInt8]) -> [(key: Int, len: Int)] {
+        var symbolsByLen = [[Int]](repeating: [], count: 16)
+        for (sym, cl) in codeLengths.enumerated() where cl != 0 {
+            symbolsByLen[Int(cl)].append(sym)
+        }
+        var codes = [(key: Int, len: Int)](repeating: (0, 0), count: codeLengths.count)
+        var key = 0
+        for len in 1...15 {
+            for sym in symbolsByLen[len] {
+                codes[sym] = (key, len)
+                key = nextKey(key, len)
+            }
+        }
+        return codes
+    }
+
+    static func entropy() {
+        // Hybrid-uint: Encode -> bits -> Decode round-trips for several configs.
+        let configs = [
+            HybridUintConfig(splitExponent: 4, msbInToken: 2, lsbInToken: 0),
+            HybridUintConfig(splitExponent: 0, msbInToken: 0, lsbInToken: 0),
+            HybridUintConfig(splitExponent: 6, msbInToken: 3, lsbInToken: 2),
+            HybridUintConfig(splitExponent: 8, msbInToken: 0, lsbInToken: 0),
+        ]
+        let values: [UInt32] = [0, 1, 2, 7, 15, 16, 17, 63, 64, 100, 1000, 65535, 1 << 20, 0xFF_FFFF]
+        for cfg in configs {
+            for v in values {
+                let (token, nbits, bits) = cfg.encode(v)
+                let w = BitWriter()
+                w.write(UInt64(bits), Int(nbits))
+                let decoded = cfg.decode(token: token, reader: w.reader)
+                eq(decoded, v, "hybriduint se=\(cfg.splitExponent) msb=\(cfg.msbInToken) lsb=\(cfg.lsbInToken) v=\(v)")
+            }
+        }
+
+        // Prefix code: BuildHuffmanTable + readSymbol round-trip, including codes
+        // longer than the 8-bit root table (exercises 2nd-level sub-tables).
+        let lengthSets: [[UInt8]] = [
+            [2, 2, 2, 2],
+            [1, 2, 3, 3],
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 9],  // Kraft sum = 1, max length 9 > 8
+        ]
+        for lengths in lengthSets {
+            var count = [UInt16](repeating: 0, count: 16)
+            for c in lengths { count[Int(c)] += 1 }
+            var table = [HuffmanCode](repeating: HuffmanCode(bits: 0, value: 0), count: lengths.count + 376)
+            let size = buildHuffmanTable(&table, rootBits: 8, codeLengths: lengths, count: &count)
+            check(size > 0, "buildHuffmanTable size>0 for \(lengths)")
+            table.removeLast(table.count - size)
+            let pc = PrefixCode(table: table)
+
+            let codes = canonicalCodes(lengths)
+            // Encode a sequence of all symbols (twice, shuffled) and decode it back.
+            let sequence = Array(0..<lengths.count) + Array((0..<lengths.count).reversed())
+            let w = BitWriter()
+            for sym in sequence { w.write(UInt64(codes[sym].key), codes[sym].len) }
+            let reader = w.reader
+            var allOK = true
+            for sym in sequence where Int(pc.readSymbol(reader)) != sym { allOK = false }
+            check(allOK, "prefix round-trip for lengths \(lengths)")
+        }
+
+        // Simple prefix code: 2 explicit symbols, decode a known bit pattern.
+        let sw = BitWriter()
+        sw.write(1, 2)  // simple code
+        sw.write(1, 2)  // num_symbols - 1 = 1  -> 2 symbols
+        sw.write(1, 2)  // symbol 1
+        sw.write(3, 2)  // symbol 3   (alphabet size 4 -> maxBits 2)
+        if let simple = PrefixCode(reader: sw.reader, alphabetSize: 4) {
+            let r = BitReader([0b0000_1010])  // bits LSB-first: 0,1,0,1
+            eq(simple.readSymbol(r), 1, "simple code bit0 -> sym1")
+            eq(simple.readSymbol(r), 3, "simple code bit1 -> sym3")
+        } else {
+            check(false, "simple code failed to parse")
         }
     }
 
