@@ -58,6 +58,7 @@ struct TestRunner {
         container()
         entropy()
         frame()
+        modular()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -486,6 +487,44 @@ struct TestRunner {
         if index == acGlobalIndex { return .acGlobal }
         let acIndex = index - acGlobalIndex - 1
         return .acGroup(pass: acIndex / info.numGroups, group: acIndex % info.numGroups)
+    }
+
+    // MARK: - Modular: MA tree from real data (M5)
+
+    /// Decodes the global Modular MA tree from each lossless fixture. Reaching a
+    /// valid tree (with CheckANSFinalState passing) end-to-end validates the M3
+    /// entropy decoder on real codestream bytes.
+    static func modular() {
+        let dir = fixturesDir()
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else {
+            check(false, "list fixtures for modular test")
+            return
+        }
+        var treesDecoded = 0
+        for f in files.sorted() where f.hasSuffix(".jxl") {
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent(f)),
+                let info = try? JXL.readFrameInfo(from: [UInt8](data)),
+                info.isModular, info.flags == 0, info.frameType == .regular,
+                let section0 = try? JXL.readFrameSectionData(from: [UInt8](data), sectionIndex: 0)
+            else { continue }
+
+            let br = BitReader([UInt8](section0))
+            // LfGlobal preamble for a flags=0 Modular frame: DequantMatrices.DecodeDC.
+            if br.read(1) == 0 {  // dc_quant all_default
+                for _ in 0..<3 { _ = br.readF16() }
+            }
+            // GlobalModular: has_tree, then (if set) the global MA tree.
+            let hasTree = br.read(1) == 1
+            if hasTree {
+                if let tree = decodeMATree(br, treeSizeLimit: 1 << 22) {
+                    check(!tree.isEmpty, "\(f): global MA tree is non-empty")
+                    treesDecoded += 1
+                } else {
+                    check(false, "\(f): global MA tree failed to decode")
+                }
+            }
+        }
+        check(treesDecoded > 0, "decoded at least one global MA tree from real codestream data")
     }
 
     // MARK: - Container

@@ -34,6 +34,10 @@ public final class BitReader {
     /// Whether the reader has consumed (or passed) every bit.
     public var isAtEnd: Bool { bitPosition >= bitCount }
 
+    /// True if every read so far stayed within the buffer (libjxl
+    /// `AllReadsWithinBounds`).
+    public var allReadsWithinBounds: Bool { !didOverread && bitPosition <= bitCount }
+
     /// Reads `count` bits (0...64), LSB-first, and returns them right-aligned.
     @discardableResult
     public func read(_ count: Int) -> UInt64 {

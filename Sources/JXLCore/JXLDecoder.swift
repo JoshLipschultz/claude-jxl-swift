@@ -53,6 +53,7 @@ public struct JXLFrameSectionInfo: Equatable {
 public struct JXLFrameInfo {
     public let isModular: Bool
     public let frameType: FrameType
+    public let flags: UInt64
     public let isLast: Bool
     public let numGroups: Int
     public let numDCGroups: Int
@@ -174,6 +175,7 @@ public enum JXL {
         return JXLFrameInfo(
             isModular: frameHeader.isModular,
             frameType: frameHeader.frameType,
+            flags: frameHeader.flags,
             isLast: frameHeader.isLast,
             numGroups: dim.numGroups,
             numDCGroups: dim.numDCGroups,

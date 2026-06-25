@@ -61,11 +61,14 @@ Sources/JXLCore/
     FrameDimensions.swift group/DC-group grid math                 [M4 ✅ partial]
     TOC.swift           section-size table + permutation decode    [M4 ✅ partial]
     Frame.swift         group/pass orchestration                   [M4]
+    Frame.swift         role-aware TOC sections (in JXLDecoder)     [M4 ✅]
+  Headers/
+    CustomTransformData.swift opsin matrix + upsampling weights    [M4 ✅]
   Modular/
-    MATree.swift        meta-adaptive decision tree                [M5]
-    Predictors.swift    self-correcting predictor + weighted       [M5]
-    Transforms.swift    RCT, Palette, Squeeze                      [M5]
-    ModularDecoder.swift channel decode driver                     [M5]
+    MATree.swift        meta-adaptive decision tree                [M5 ✅]
+    Predictors.swift    self-correcting predictor + weighted       [M5 wip]
+    Transforms.swift    RCT, Palette, Squeeze                      [M5 wip]
+    ModularDecoder.swift channel decode driver                     [M5 wip]
   VarDCT/
     XYB.swift           XYB <-> linear color                       [M6]
     DCT.swift           separable DCTs for all block sizes         [M6]
@@ -89,9 +92,9 @@ Sources/JXLCore/
 |----|-----------|-------------|--------|
 | M1 | Foundation | container demux, dimensions, CLI, oracle harness | ✅ done |
 | M2 | Image metadata | full `ImageMetadata` bit-exact vs libjxl (depth, channels, full color encoding) | ✅ done |
-| M3 | Entropy coding | prefix + ANS + LZ77 + context modeling | ✅ implemented (integration-validated at M4) |
-| M4 | Frame layer | FrameHeader, TOC, group/pass model | 🟡 structural parser done; payload orchestration next |
-| M5 | **Modular mode** | first real pixels: lossless `.jxl` → RGBA | |
+| M3 | Entropy coding | prefix + ANS + LZ77 + context modeling | ✅ done — validated on real codestream data via the MA tree |
+| M4 | Frame layer | FrameHeader, TOC, role-aware sections | ✅ structural parser done |
+| M5 | **Modular mode** | first real pixels: lossless `.jxl` → RGBA | 🟡 MA tree decodes from real data; predictors/transforms next |
 | M6 | VarDCT mode | lossy photographic `.jxl` → pixels | |
 | M7 | Restoration | Gaborish + EPF + upsampling | |
 | M8 | Color pipeline | XYB→sRGB, ICC, alpha, 8/16-bit/float output | |
