@@ -502,6 +502,7 @@ struct TestRunner {
         }
         var treesDecoded = 0
         var imagesDecoded = 0
+        var pixelsVerified = 0
         for f in files.sorted() where f.hasSuffix(".jxl") {
             guard let data = try? Data(contentsOf: dir.appendingPathComponent(f)),
                 let frame = try? JXL.readFrameInfo(from: [UInt8](data)),
@@ -544,10 +545,12 @@ struct TestRunner {
                 bitdepth: Int(info.bitDepth.bitsPerSample),
                 channelCount: nbChans + info.extraChannelCount)
             do {
-                try modularDecode(
+                let header = try modularDecode(
                     br, image: image, groupID: 0, globalTree: globalTree, globalCode: globalCode,
                     globalCtxMap: globalCtxMap)
+                try undoTransforms(image, transforms: header.transforms)
                 imagesDecoded += 1
+                if verifyDecodedPixels(name: f, image: image, info: info) { pixelsVerified += 1 }
             } catch ModularDecodeError.unsupportedTransform {
                 // Palette/Squeeze not yet applied; skip these fixtures.
             } catch {
@@ -555,9 +558,59 @@ struct TestRunner {
             }
         }
         FileHandle.standardError.write(
-            Data("  [modular] trees=\(treesDecoded) images fully decoded=\(imagesDecoded)\n".utf8))
+            Data(
+                "  [modular] trees=\(treesDecoded) images decoded=\(imagesDecoded) pixels byte-exact=\(pixelsVerified)\n"
+                    .utf8))
         check(treesDecoded > 0, "decoded at least one global MA tree from real codestream data")
         check(imagesDecoded > 0, "fully decoded at least one global modular image (CheckANSFinalState)")
+        check(pixelsVerified > 0, "decoded pixels byte-exact vs known generator formula")
+    }
+
+    /// Verifies decoded channels against the deterministic generator formulas the
+    /// fixtures were created from (lossless => byte-exact). Returns true if the
+    /// fixture was checked and matched; false if its formula isn't known (skipped).
+    static func verifyDecodedPixels(name: String, image: ModularImage, info: JXLImageInfo) -> Bool {
+        let w = Int(info.width)
+        let h = Int(info.height)
+        func ch(_ c: Int) -> ModularChannel { image.channels[c] }
+        func allMatch(_ expect: (Int, Int) -> [Int32]) -> Bool {
+            for y in 0..<h {
+                for x in 0..<w {
+                    let e = expect(x, y)
+                    for c in 0..<e.count where ch(c).at(x, y) != e[c] { return false }
+                }
+            }
+            return true
+        }
+
+        let base = (name as NSString).deletingPathExtension
+        if name == "40x30_gray8.jxl" {
+            let ok = allMatch { x, y in [Int32((x * 7 + y * 5) & 255)] }
+            check(ok, "\(name) grayscale pixels byte-exact")
+            return ok
+        }
+        if name == "40x30_rgba8.jxl" {
+            let ok = allMatch { x, y in
+                [Int32((x * 37) & 255), Int32((y * 53) & 255), Int32(((x + y) * 29) & 255), Int32((x * 3) & 255)]
+            }
+            check(ok, "\(name) RGBA pixels byte-exact")
+            return ok
+        }
+        if name == "40x30_rgb16.jxl" {
+            let ok = allMatch { x, y in
+                [Int32((x * 1600) & 0xFFFF), Int32((y * 2100) & 0xFFFF), Int32(((x + y) * 900) & 0xFFFF)]
+            }
+            check(ok, "\(name) 16-bit RGB pixels byte-exact")
+            return ok
+        }
+        if base.hasSuffix("_lossless") || base.hasSuffix("_container") {
+            let ok = allMatch { x, y in
+                [Int32((x * 37) & 255), Int32((y * 53) & 255), Int32(((x + y) * 29) & 255)]
+            }
+            check(ok, "\(name) RGB pixels byte-exact")
+            return ok
+        }
+        return false  // e.g. float fixtures — decoded but formula not checked here
     }
 
     // MARK: - Container

@@ -204,13 +204,14 @@ enum ModularDecodeError: Error { case unsupportedTransform, badGroupHeader, badT
 
 /// Decodes a Modular image stream into `image` (libjxl ModularDecode), using a
 /// pre-decoded global tree/code when `header.use_global_tree` is set.
+@discardableResult
 func modularDecode(
     _ br: BitReader, image: ModularImage, groupID: Int,
     globalTree: [MATreeNode]?, globalCode: ANSCode?, globalCtxMap: [UInt8]?
-) throws {
+) throws -> GroupHeader {
     guard let header = readGroupHeader(br) else { throw ModularDecodeError.badGroupHeader }
     // RCT and an empty transform list keep the channel layout unchanged; other
-    // transforms change it and aren't applied yet.
+    // transforms change it and aren't applied yet (MetaApply).
     for t in header.transforms where t.id != .rct {
         throw ModularDecodeError.unsupportedTransform
     }
@@ -246,4 +247,5 @@ func modularDecode(
     }
 
     if !reader.checkANSFinalState() { throw ModularDecodeError.finalState }
+    return header
 }
