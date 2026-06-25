@@ -52,8 +52,9 @@ Sources/JXLCore/
   Entropy/
     HybridUint.swift    hybrid integer coder (token + extra bits)  [M3 ✅]
     PrefixCode.swift    canonical prefix (Huffman) codes           [M3 ✅]
-    ANS.swift           rANS alias-method decoder                  [M3 wip]
-    EntropyDecoder.swift histograms, clustering, LZ77, context map [M3 wip]
+    ANS.swift           histogram decode + alias table + flat/prec [M3 ✅]
+    ANSReader.swift     rANS state machine + LZ77 token reader     [M3 ✅]
+    EntropyDecoder.swift header assembler + context map + MTF      [M3 ✅]
   Frame/
     FrameHeader.swift   frame type, passes, blending, TOC          [M4]
     Frame.swift         group/pass orchestration                   [M4]
@@ -85,7 +86,7 @@ Sources/JXLCore/
 |----|-----------|-------------|--------|
 | M1 | Foundation | container demux, dimensions, CLI, oracle harness | ✅ done |
 | M2 | Image metadata | full `ImageMetadata` bit-exact vs libjxl (depth, channels, full color encoding) | ✅ done |
-| M3 | Entropy coding | prefix + ANS + LZ77 + context modeling | wip (hybrid-uint + prefix codes done) |
+| M3 | Entropy coding | prefix + ANS + LZ77 + context modeling | ✅ implemented (integration-validated at M4) |
 | M4 | Frame layer | FrameHeader, TOC, group/pass model | |
 | M5 | **Modular mode** | first real pixels: lossless `.jxl` → RGBA | |
 | M6 | VarDCT mode | lossy photographic `.jxl` → pixels | |
@@ -96,6 +97,17 @@ Sources/JXLCore/
 
 Cross-cutting, ongoing: conformance corpus from the libjxl test suite, fuzzing,
 and SIMD/performance once correctness is locked per stage.
+
+**M3 status (implemented).** The full entropy substrate is ported from libjxl
+v0.11.2: the hybrid-uint integer coder, canonical prefix codes, the rANS
+alias-method decoder (histogram reading, alias-table construction, 32-bit state
+machine), the context-map decoder (simple + entropy-coded/MTF), the LZ77 copy
+layer, and the header assembler that ties them together. Unit-verified in
+isolation: hybrid-uint and prefix-code round-trips, **the alias table realises
+its distribution exactly across all 4096 slots** (the trickiest component),
+flat-histogram/population-count math, inverse-MTF, and simple/flat histogram
+decode. End-to-end validation against real ANS-coded bytes arrives at M4, the
+first point a frame's entropy-coded data can actually be reached.
 
 **M2 status (done).** The entire `ImageMetadata` bundle is now parsed
 bit-exactly — a faithful port of libjxl v0.11.2's `VisitFields` (the field

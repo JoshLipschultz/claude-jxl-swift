@@ -272,6 +272,100 @@ struct TestRunner {
         } else {
             check(false, "simple code failed to parse")
         }
+
+        ans()
+    }
+
+    static func writeVarLenUint8(_ w: BitWriter, _ v: Int) {
+        if v == 0 { w.write(0, 1); return }
+        w.write(1, 1)
+        if v == 1 { w.write(0, 3); return }
+        let nbits = floorLog2Nonzero(UInt32(v))
+        w.write(UInt64(nbits), 3)
+        w.write(UInt64(v - (1 << nbits)), nbits)
+    }
+
+    static func ans() {
+        // Flat histogram: positive, differ by <= 1, sum to total, bigger first.
+        let flat = createFlatHistogram(length: 5, totalCount: 4096)
+        eq(flat.reduce(0) { $0 + Int($1) }, 4096, "flat histogram sum")
+        eq(flat, [820, 819, 819, 819, 819], "flat histogram shape")
+
+        // Population-count precision against the closed-form formula.
+        eq(getPopulationCountPrecision(5, shift: 12), 5, "popcount precision (5,12)")
+        eq(getPopulationCountPrecision(2, shift: 2), 0, "popcount precision clamps to 0")
+
+        // Alias table realises the distribution exactly: each symbol appears
+        // `freq` times across the 4096 slots, with offsets 0..freq-1, and the
+        // looked-up freq matches the distribution. (Tests InitAliasTable + Lookup,
+        // the hardest part of the ANS engine.)
+        let logAlpha = 8
+        let tableSize = 1 << logAlpha
+        let logEntry = 12 - logAlpha
+        let entryM1 = (1 << logEntry) - 1
+        let distributions: [[Int32]] = [
+            [1000, 2000, 1096],
+            [4096],
+            [1, 4095],
+            createFlatHistogram(length: 7, totalCount: 4096),
+        ]
+        for dist in distributions {
+            var table = [AliasEntry](repeating: AliasEntry(), count: tableSize)
+            initAliasTable(distribution: dist, logAlphaSize: logAlpha, into: &table, base: 0)
+            var counts = [Int: Int]()
+            var offsetSets = [Int: Set<Int>]()
+            for res in 0..<4096 {
+                let s = aliasLookup(table, base: 0, value: res, logEntrySize: logEntry, entrySizeMinus1: entryM1)
+                counts[s.value, default: 0] += 1
+                offsetSets[s.value, default: []].insert(s.offset)
+                eq(s.freq, Int(dist[s.value]), "alias freq for sym \(s.value)")
+            }
+            var ok = true
+            for (sym, f) in dist.enumerated() where f > 0 {
+                if counts[sym] != Int(f) { ok = false }
+                if offsetSets[sym] != Set(0..<Int(f)) { ok = false }
+            }
+            check(ok, "alias table realises distribution \(dist)")
+        }
+
+        // Inverse move-to-front is the inverse of forward MTF.
+        func forwardMTF(_ v: [UInt8]) -> [UInt8] {
+            var mtf = (0..<256).map { UInt8($0) }
+            var out = [UInt8]()
+            for x in v {
+                let idx = mtf.firstIndex(of: x)!
+                out.append(UInt8(idx))
+                mtf.remove(at: idx)
+                mtf.insert(x, at: 0)
+            }
+            return out
+        }
+        let original: [UInt8] = [3, 3, 1, 0, 0, 2, 3, 1, 1, 4]
+        var roundtrip = forwardMTF(original)
+        inverseMoveToFront(&roundtrip)
+        eq(roundtrip, original, "inverse MTF round-trips")
+
+        // ReadHistogram: hand-built "simple 1-symbol" and "flat" streams.
+        let hw = BitWriter()
+        hw.write(1, 1)  // simple
+        hw.write(0, 1)  // num_symbols - 1 = 0
+        writeVarLenUint8(hw, 5)  // symbol = 5
+        if let counts = readHistogram(precisionBits: 12, reader: hw.reader) {
+            eq(counts.count, 6, "simple histogram size")
+            eq(counts[5], 4096, "simple histogram count")
+        } else {
+            check(false, "simple histogram failed to parse")
+        }
+
+        let fw = BitWriter()
+        fw.write(0, 1)  // not simple
+        fw.write(1, 1)  // flat
+        writeVarLenUint8(fw, 3)  // alphabet_size - 1 = 3 -> 4
+        if let counts = readHistogram(precisionBits: 12, reader: fw.reader) {
+            eq(counts, [1024, 1024, 1024, 1024], "flat histogram decode")
+        } else {
+            check(false, "flat histogram failed to parse")
+        }
     }
 
     // MARK: - Container
