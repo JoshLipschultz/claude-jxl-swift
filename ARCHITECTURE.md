@@ -69,7 +69,7 @@ Sources/JXLCore/
     ModularImage.swift  Image/Channel sample planes                [M5 ✅]
     Predictors.swift    14 predictors + self-correcting weighted   [M5 ✅]
     ModularDecoder.swift GroupHeader, transforms, channel decode   [M5 ✅ decode]
-    Transforms.swift    inverse RCT ✅ (Palette/Squeeze pending)    [M5 wip]
+    Transforms.swift    inverse RCT ✅ + Palette ✅ (Squeeze pending) [M5 wip]
   VarDCT/
     XYB.swift           XYB <-> linear color                       [M6]
     DCT.swift           separable DCTs for all block sizes         [M6]
@@ -95,7 +95,7 @@ Sources/JXLCore/
 | M2 | Image metadata | full `ImageMetadata` bit-exact vs libjxl (depth, channels, full color encoding) | ✅ done |
 | M3 | Entropy coding | prefix + ANS + LZ77 + context modeling | ✅ done — validated on real codestream data via the MA tree |
 | M4 | Frame layer | FrameHeader, TOC, role-aware sections | ✅ structural parser done |
-| M5 | **Modular mode** | first real pixels: lossless `.jxl` → RGBA | 🟢 **byte-exact pixels** for RCT/no-transform lossless (gray/RGB/RGBA/16-bit); Palette + Squeeze + multi-group remain |
+| M5 | **Modular mode** | first real pixels: lossless `.jxl` → RGBA | 🟢 **all 13 single-group lossless fixtures byte-exact vs djxl** (RCT + Palette, gray/RGB/RGBA/8/16-bit); multi-group, Squeeze, float remain |
 | M6 | VarDCT mode | lossy photographic `.jxl` → pixels | |
 | M7 | Restoration | Gaborish + EPF + upsampling | |
 | M8 | Color pipeline | XYB→sRGB, ICC, alpha, 8/16-bit/float output | |

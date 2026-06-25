@@ -212,8 +212,12 @@ func modularDecode(
     guard let header = readGroupHeader(br) else { throw ModularDecodeError.badGroupHeader }
     // RCT and an empty transform list keep the channel layout unchanged; other
     // transforms change it and aren't applied yet (MetaApply).
-    for t in header.transforms where t.id != .rct {
+    for t in header.transforms where t.id != .rct && t.id != .palette {
         throw ModularDecodeError.unsupportedTransform
+    }
+    // MetaApply: Palette changes the channel layout before decoding.
+    for t in header.transforms {
+        try metaApplyTransform(image, transform: t)
     }
 
     let tree: [MATreeNode]
