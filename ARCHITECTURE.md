@@ -66,9 +66,10 @@ Sources/JXLCore/
     CustomTransformData.swift opsin matrix + upsampling weights    [M4 ✅]
   Modular/
     MATree.swift        meta-adaptive decision tree                [M5 ✅]
-    Predictors.swift    self-correcting predictor + weighted       [M5 wip]
-    Transforms.swift    RCT, Palette, Squeeze                      [M5 wip]
-    ModularDecoder.swift channel decode driver                     [M5 wip]
+    ModularImage.swift  Image/Channel sample planes                [M5 ✅]
+    Predictors.swift    14 predictors + self-correcting weighted   [M5 ✅]
+    ModularDecoder.swift GroupHeader, transforms, channel decode   [M5 ✅ decode]
+    Transforms.swift    inverse RCT/Palette/Squeeze (undo)         [M5 wip]
   VarDCT/
     XYB.swift           XYB <-> linear color                       [M6]
     DCT.swift           separable DCTs for all block sizes         [M6]
@@ -94,7 +95,7 @@ Sources/JXLCore/
 | M2 | Image metadata | full `ImageMetadata` bit-exact vs libjxl (depth, channels, full color encoding) | ✅ done |
 | M3 | Entropy coding | prefix + ANS + LZ77 + context modeling | ✅ done — validated on real codestream data via the MA tree |
 | M4 | Frame layer | FrameHeader, TOC, role-aware sections | ✅ structural parser done |
-| M5 | **Modular mode** | first real pixels: lossless `.jxl` → RGBA | 🟡 MA tree decodes from real data; predictors/transforms next |
+| M5 | **Modular mode** | first real pixels: lossless `.jxl` → RGBA | 🟡 channel decode validated on real data (9 images, ANS final state OK); inverse transforms + pixel assembly next |
 | M6 | VarDCT mode | lossy photographic `.jxl` → pixels | |
 | M7 | Restoration | Gaborish + EPF + upsampling | |
 | M8 | Color pipeline | XYB→sRGB, ICC, alpha, 8/16-bit/float output | |

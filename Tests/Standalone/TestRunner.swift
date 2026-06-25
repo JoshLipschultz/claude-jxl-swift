@@ -501,10 +501,12 @@ struct TestRunner {
             return
         }
         var treesDecoded = 0
+        var imagesDecoded = 0
         for f in files.sorted() where f.hasSuffix(".jxl") {
             guard let data = try? Data(contentsOf: dir.appendingPathComponent(f)),
-                let info = try? JXL.readFrameInfo(from: [UInt8](data)),
-                info.isModular, info.flags == 0, info.frameType == .regular,
+                let frame = try? JXL.readFrameInfo(from: [UInt8](data)),
+                let info = try? JXL.readInfo(from: [UInt8](data)),
+                frame.isModular, frame.flags == 0, frame.frameType == .regular,
                 let section0 = try? JXL.readFrameSectionData(from: [UInt8](data), sectionIndex: 0)
             else { continue }
 
@@ -513,18 +515,49 @@ struct TestRunner {
             if br.read(1) == 0 {  // dc_quant all_default
                 for _ in 0..<3 { _ = br.readF16() }
             }
-            // GlobalModular: has_tree, then (if set) the global MA tree.
-            let hasTree = br.read(1) == 1
-            if hasTree {
-                if let tree = decodeMATree(br, treeSizeLimit: 1 << 22) {
-                    check(!tree.isEmpty, "\(f): global MA tree is non-empty")
-                    treesDecoded += 1
-                } else {
+            // GlobalModular: has_tree, then (if set) the global MA tree + code.
+            var globalTree: [MATreeNode]? = nil
+            var globalCode: ANSCode? = nil
+            var globalCtxMap: [UInt8]? = nil
+            if br.read(1) == 1 {  // has_tree
+                guard let tree = decodeMATree(br, treeSizeLimit: 1 << 22) else {
                     check(false, "\(f): global MA tree failed to decode")
+                    continue
                 }
+                check(!tree.isEmpty, "\(f): global MA tree is non-empty")
+                treesDecoded += 1
+                guard let (code, ctx) = decodeHistograms(br, numContexts: (tree.count + 1) / 2, disallowLZ77: false)
+                else {
+                    check(false, "\(f): global modular histograms failed")
+                    continue
+                }
+                globalTree = tree
+                globalCode = code
+                globalCtxMap = ctx
+            }
+
+            // Full global modular decode is only the whole image for single groups.
+            guard frame.numGroups == 1 else { continue }
+            let nbChans = info.colorSpace == .grayscale ? 1 : 3
+            let image = ModularImage(
+                w: Int(info.width), h: Int(info.height),
+                bitdepth: Int(info.bitDepth.bitsPerSample),
+                channelCount: nbChans + info.extraChannelCount)
+            do {
+                try modularDecode(
+                    br, image: image, groupID: 0, globalTree: globalTree, globalCode: globalCode,
+                    globalCtxMap: globalCtxMap)
+                imagesDecoded += 1
+            } catch ModularDecodeError.unsupportedTransform {
+                // Palette/Squeeze not yet applied; skip these fixtures.
+            } catch {
+                check(false, "\(f): global modular decode failed: \(error)")
             }
         }
+        FileHandle.standardError.write(
+            Data("  [modular] trees=\(treesDecoded) images fully decoded=\(imagesDecoded)\n".utf8))
         check(treesDecoded > 0, "decoded at least one global MA tree from real codestream data")
+        check(imagesDecoded > 0, "fully decoded at least one global modular image (CheckANSFinalState)")
     }
 
     // MARK: - Container
