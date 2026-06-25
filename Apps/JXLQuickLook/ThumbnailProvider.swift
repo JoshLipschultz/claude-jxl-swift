@@ -3,7 +3,7 @@
 // Quick Look thumbnail provider for .jxl files. This is the M10 integration
 // target: it lives in an Xcode-built appex (it is NOT compiled by the SwiftPM
 // scripts, which have no QuickLookThumbnailing SDK packaging). See
-// Apps/JXLQuickLook/README.md for how to add it to an Xcode project.
+// Apps/README.md for how to add it to an Xcode project.
 //
 // Today it draws a placeholder sized to the real image dimensions (which the
 // decoder can already report). Once the decode pipeline reaches M5+, replace

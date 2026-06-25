@@ -222,14 +222,19 @@ struct TestRunner {
             HybridUintConfig(splitExponent: 6, msbInToken: 3, lsbInToken: 2),
             HybridUintConfig(splitExponent: 8, msbInToken: 0, lsbInToken: 0),
         ]
-        let values: [UInt32] = [0, 1, 2, 7, 15, 16, 17, 63, 64, 100, 1000, 65535, 1 << 20, 0xFF_FFFF]
+        let values: [UInt32] = [
+            0, 1, 2, 7, 15, 16, 17, 63, 64, 100, 1000, 65535, 1 << 20, 0xFF_FFFF,
+        ]
         for cfg in configs {
             for v in values {
                 let (token, nbits, bits) = cfg.encode(v)
                 let w = BitWriter()
                 w.write(UInt64(bits), Int(nbits))
                 let decoded = cfg.decode(token: token, reader: w.reader)
-                eq(decoded, v, "hybriduint se=\(cfg.splitExponent) msb=\(cfg.msbInToken) lsb=\(cfg.lsbInToken) v=\(v)")
+                eq(
+                    decoded, v,
+                    "hybriduint se=\(cfg.splitExponent) msb=\(cfg.msbInToken) lsb=\(cfg.lsbInToken) v=\(v)"
+                )
             }
         }
 
@@ -243,7 +248,8 @@ struct TestRunner {
         for lengths in lengthSets {
             var count = [UInt16](repeating: 0, count: 16)
             for c in lengths { count[Int(c)] += 1 }
-            var table = [HuffmanCode](repeating: HuffmanCode(bits: 0, value: 0), count: lengths.count + 376)
+            var table = [HuffmanCode](
+                repeating: HuffmanCode(bits: 0, value: 0), count: lengths.count + 376)
             let size = buildHuffmanTable(&table, rootBits: 8, codeLengths: lengths, count: &count)
             check(size > 0, "buildHuffmanTable size>0 for \(lengths)")
             table.removeLast(table.count - size)
@@ -278,9 +284,15 @@ struct TestRunner {
     }
 
     static func writeVarLenUint8(_ w: BitWriter, _ v: Int) {
-        if v == 0 { w.write(0, 1); return }
+        if v == 0 {
+            w.write(0, 1)
+            return
+        }
         w.write(1, 1)
-        if v == 1 { w.write(0, 3); return }
+        if v == 1 {
+            w.write(0, 3)
+            return
+        }
         let nbits = floorLog2Nonzero(UInt32(v))
         w.write(UInt64(nbits), 3)
         w.write(UInt64(v - (1 << nbits)), nbits)
@@ -316,7 +328,8 @@ struct TestRunner {
             var counts = [Int: Int]()
             var offsetSets = [Int: Set<Int>]()
             for res in 0..<4096 {
-                let s = aliasLookup(table, base: 0, value: res, logEntrySize: logEntry, entrySizeMinus1: entryM1)
+                let s = aliasLookup(
+                    table, base: 0, value: res, logEntrySize: logEntry, entrySizeMinus1: entryM1)
                 counts[s.value, default: 0] += 1
                 offsetSets[s.value, default: []].insert(s.offset)
                 eq(s.freq, Int(dist[s.value]), "alias freq for sym \(s.value)")
@@ -387,22 +400,92 @@ struct TestRunner {
                     "\(f) TOC sum invariant")
                 check(info.frameType == .regular, "\(f) is a regular frame")
                 eq(info.sectionSizes.count, info.tocEntryCount, "\(f) section count")
+                eq(info.sections.count, info.tocEntryCount, "\(f) section range count")
+
+                var totalRangeBytes = 0
+                for section in info.sections {
+                    eq(
+                        section.size, Int(info.sectionSizes[section.index]),
+                        "\(f) section \(section.index) size mirrors TOC")
+                    eq(
+                        section.codestreamRange.lowerBound, info.dataStartByte + section.offset,
+                        "\(f) section \(section.index) range start")
+                    eq(
+                        section.codestreamRange.count, section.size,
+                        "\(f) section \(section.index) range size")
+                    eq(
+                        section.role, expectedSectionRole(section.index, info),
+                        "\(f) section \(section.index) role")
+                    if let bytes = try? JXL.readFrameSectionData(
+                        from: [UInt8](data), sectionIndex: section.index)
+                    {
+                        eq(
+                            bytes.count, section.size,
+                            "\(f) section \(section.index) byte slice size")
+                    } else {
+                        check(false, "\(f) section \(section.index) byte slice")
+                    }
+                    if let reader = try? JXL.readFrameSectionReader(
+                        from: [UInt8](data), sectionIndex: section.index)
+                    {
+                        eq(
+                            reader.bitCount, section.size * 8,
+                            "\(f) section \(section.index) reader size")
+                    } else {
+                        check(false, "\(f) section \(section.index) reader")
+                    }
+                    check(
+                        section.codestreamRange.lowerBound >= info.dataStartByte,
+                        "\(f) section \(section.index) starts after TOC")
+                    check(
+                        section.codestreamRange.upperBound <= info.codestreamLength,
+                        "\(f) section \(section.index) ends inside codestream")
+                    totalRangeBytes += section.size
+                }
+                eq(totalRangeBytes, info.totalSectionBytes, "\(f) section ranges total")
+
+                let physicalRanges = info.sections.map(\.codestreamRange).sorted {
+                    $0.lowerBound < $1.lowerBound
+                }
+                var nextByte = info.dataStartByte
+                var coversPayload = true
+                for range in physicalRanges {
+                    if range.lowerBound != nextByte { coversPayload = false }
+                    nextByte = range.upperBound
+                }
+                check(
+                    coversPayload && nextByte == info.codestreamLength,
+                    "\(f) section ranges cover payload")
             } catch {
                 check(false, "\(f) frame parse threw \(error)")
             }
         }
 
         // Lossless fixtures are Modular; lossy are VarDCT.
-        if let m = try? JXL.readFrameInfo(contentsOf: dir.appendingPathComponent("64x48_lossless.jxl")) {
+        if let m = try? JXL.readFrameInfo(
+            contentsOf: dir.appendingPathComponent("64x48_lossless.jxl"))
+        {
             check(m.isModular, "lossless fixture is Modular")
         } else {
             check(false, "read 64x48_lossless frame")
         }
-        if let v = try? JXL.readFrameInfo(contentsOf: dir.appendingPathComponent("513x257_lossy.jxl")) {
+        if let v = try? JXL.readFrameInfo(
+            contentsOf: dir.appendingPathComponent("513x257_lossy.jxl"))
+        {
             check(!v.isModular, "lossy fixture is VarDCT")
         } else {
             check(false, "read 513x257_lossy frame")
         }
+    }
+
+    static func expectedSectionRole(_ index: Int, _ info: JXLFrameInfo) -> JXLFrameSectionRole {
+        if info.numGroups == 1 && info.numPasses == 1 { return .singleSectionCoalesced }
+        if index == 0 { return .dcGlobal }
+        let acGlobalIndex = info.numDCGroups + 1
+        if index < acGlobalIndex { return .dcGroup(index - 1) }
+        if index == acGlobalIndex { return .acGlobal }
+        let acIndex = index - acGlobalIndex - 1
+        return .acGroup(pass: acIndex / info.numGroups, group: acIndex % info.numGroups)
     }
 
     // MARK: - Container

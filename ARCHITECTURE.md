@@ -49,6 +49,7 @@ Sources/JXLCore/
   Headers/
     SizeHeader.swift    image dimensions                           [M1 ✅]
     ImageMetadata.swift BitDepth, channels, full ColorEncoding     [M2 ✅]
+    CustomTransformData.swift header transform bundle skipper       [M4 ✅]
   Entropy/
     HybridUint.swift    hybrid integer coder (token + extra bits)  [M3 ✅]
     PrefixCode.swift    canonical prefix (Huffman) codes           [M3 ✅]
@@ -56,7 +57,9 @@ Sources/JXLCore/
     ANSReader.swift     rANS state machine + LZ77 token reader     [M3 ✅]
     EntropyDecoder.swift header assembler + context map + MTF      [M3 ✅]
   Frame/
-    FrameHeader.swift   frame type, passes, blending, TOC          [M4]
+    FrameHeader.swift   frame type, passes, blending               [M4 ✅ partial]
+    FrameDimensions.swift group/DC-group grid math                 [M4 ✅ partial]
+    TOC.swift           section-size table + permutation decode    [M4 ✅ partial]
     Frame.swift         group/pass orchestration                   [M4]
   Modular/
     MATree.swift        meta-adaptive decision tree                [M5]
@@ -87,7 +90,7 @@ Sources/JXLCore/
 | M1 | Foundation | container demux, dimensions, CLI, oracle harness | ✅ done |
 | M2 | Image metadata | full `ImageMetadata` bit-exact vs libjxl (depth, channels, full color encoding) | ✅ done |
 | M3 | Entropy coding | prefix + ANS + LZ77 + context modeling | ✅ implemented (integration-validated at M4) |
-| M4 | Frame layer | FrameHeader, TOC, group/pass model | |
+| M4 | Frame layer | FrameHeader, TOC, group/pass model | 🟡 structural parser done; payload orchestration next |
 | M5 | **Modular mode** | first real pixels: lossless `.jxl` → RGBA | |
 | M6 | VarDCT mode | lossy photographic `.jxl` → pixels | |
 | M7 | Restoration | Gaborish + EPF + upsampling | |
@@ -108,6 +111,16 @@ its distribution exactly across all 4096 slots** (the trickiest component),
 flat-histogram/population-count math, inverse-MTF, and simple/flat histogram
 decode. End-to-end validation against real ANS-coded bytes arrives at M4, the
 first point a frame's entropy-coded data can actually be reached.
+
+**M4 status (partial).** The first-frame structural layer now consumes the full
+codestream header prefix (`SizeHeader`, `ImageMetadata`, `CustomTransformData`,
+and byte alignment), parses `FrameHeader`, derives frame/DC group counts, and
+reads the entropy-coded TOC section sizes/permutation. It exposes logical section
+roles (`singleSectionCoalesced`, DC global/group, AC global/group) plus raw
+codestream byte ranges/readers for each section. Validation checks the header +
+TOC + section-byte sum invariant and section coverage across the fixture matrix,
+including both Modular/lossless and VarDCT/lossy samples. Pixel payload decoding
+still starts at M5.
 
 **M2 status (done).** The entire `ImageMetadata` bundle is now parsed
 bit-exactly — a faithful port of libjxl v0.11.2's `VisitFields` (the field
@@ -143,14 +156,15 @@ A Quick Look extension is a small appex embedded in a host app:
 Apps/JXLViewer.app
 └── PlugIns/
     └── JXLQuickLook.appex      (QuickLookThumbnailing provider)
-        └── links JXLCore, declares public.jxl / org.jpeg.jxl in Info.plist
+        └── links JXLCore, declares public.jpeg-xl / org.jpeg.jxl in Info.plist
 ```
 
-The decoder produces a `CGImage`; the thumbnail provider hands it to
-`QLThumbnailReply(contextSize:…)` and the preview provider renders it. The
-appex itself requires **full Xcode** to build and codesign — `Apps/` holds the
-provider source and Info.plist so it is ready to drop into an Xcode project. The
-core decoder stays a plain SwiftPM library so it builds and tests without Xcode.
+Once pixel decoding lands, the decoder will produce a `CGImage`; the thumbnail
+provider will hand it to `QLThumbnailReply(contextSize:…)` and the preview
+provider will render it. The appex itself requires **full Xcode** to build and
+codesign — `Apps/` holds the provider source and Info.plist so it is ready to
+drop into an Xcode project. The core decoder stays a plain SwiftPM library so it
+builds and tests without Xcode.
 
 ## Toolchain note
 

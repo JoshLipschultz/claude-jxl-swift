@@ -24,7 +24,7 @@ purpose so it builds and tests without Xcode.
 The provider currently renders an aspect-correct **placeholder** using
 `JXL.readInfo`. Once Milestone 5 (Modular mode) lands and `JXLCore` can return a
 `CGImage`, swap the placeholder for the decoded image — the integration point is
-marked with a `TODO`/`M5+` comment in `ThumbnailProvider.swift`.
+marked with an `M5+` comment in `ThumbnailProvider.swift`.
 
 ## Registering the UTI
 
