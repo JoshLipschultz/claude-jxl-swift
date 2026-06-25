@@ -57,6 +57,7 @@ struct TestRunner {
         metadata()
         container()
         entropy()
+        frame()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -365,6 +366,42 @@ struct TestRunner {
             eq(counts, [1024, 1024, 1024, 1024], "flat histogram decode")
         } else {
             check(false, "flat histogram failed to parse")
+        }
+    }
+
+    // MARK: - Frame layer (M4)
+
+    static func frame() {
+        let dir = fixturesDir()
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else {
+            check(false, "list fixtures for frame test")
+            return
+        }
+        for f in files.sorted() where f.hasSuffix(".jxl") {
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent(f)) else { continue }
+            do {
+                let info = try JXL.readFrameInfo(from: [UInt8](data))
+                // The header + TOC + all section bytes must exactly fill the codestream.
+                eq(
+                    info.dataStartByte + info.totalSectionBytes, info.codestreamLength,
+                    "\(f) TOC sum invariant")
+                check(info.frameType == .regular, "\(f) is a regular frame")
+                eq(info.sectionSizes.count, info.tocEntryCount, "\(f) section count")
+            } catch {
+                check(false, "\(f) frame parse threw \(error)")
+            }
+        }
+
+        // Lossless fixtures are Modular; lossy are VarDCT.
+        if let m = try? JXL.readFrameInfo(contentsOf: dir.appendingPathComponent("64x48_lossless.jxl")) {
+            check(m.isModular, "lossless fixture is Modular")
+        } else {
+            check(false, "read 64x48_lossless frame")
+        }
+        if let v = try? JXL.readFrameInfo(contentsOf: dir.appendingPathComponent("513x257_lossy.jxl")) {
+            check(!v.isModular, "lossy fixture is VarDCT")
+        } else {
+            check(false, "read 513x257_lossy frame")
         }
     }
 

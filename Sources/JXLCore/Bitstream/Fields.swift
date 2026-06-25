@@ -71,6 +71,18 @@ extension BitReader {
         readU32(.value(0), .value(1), .bits(4, offset: 2), .bits(6, offset: 18))
     }
 
+    /// Reads and discards a JPEG XL extensions field: a `U64` bitmask followed
+    /// by a `U64` size (in bits) for each set bit, then skips that many bits.
+    public func skipExtensions() {
+        let extensions = readU64()
+        if extensions == 0 { return }
+        var totalBits: UInt64 = 0
+        for i in 0..<64 where (extensions & (UInt64(1) << UInt64(i))) != 0 {
+            totalBits &+= readU64()
+        }
+        skip(Int(totalBits))
+    }
+
     /// `F16()` — IEEE-754 binary16 stored little-endian in the bitstream,
     /// returned as a `Float` (ISO/IEC 18181-1 §C.2.6).
     public func readF16() -> Float {

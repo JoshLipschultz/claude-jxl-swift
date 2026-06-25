@@ -49,6 +49,8 @@ public struct JXLImageMetadata: Equatable {
     public let hasAlpha: Bool
     public let orientation: UInt32
     public let hasAnimation: Bool
+    /// Whether color channels are XYB-encoded (true for lossy/VarDCT defaults).
+    public let xybEncoded: Bool
 
     public var colorSpace: JXLColorSpace { colorEncoding.colorSpace }
     public var colorChannelCount: Int { colorSpace == .grayscale ? 1 : 3 }
@@ -62,6 +64,7 @@ public struct JXLImageMetadata: Equatable {
             self.hasAlpha = false
             self.orientation = 1
             self.hasAnimation = false
+            self.xybEncoded = true
             return
         }
 
@@ -95,13 +98,13 @@ public struct JXLImageMetadata: Equatable {
             if type == 0 { alpha = true }  // kAlpha
         }
 
-        _ = reader.readBool()  // xyb_encoded
+        let parsedXybEncoded = reader.readBool()  // xyb_encoded
         let parsedColor = ImageMetadataFields.readColorEncoding(reader)
 
         if extraFields {
             ImageMetadataFields.skipToneMapping(reader)
         }
-        ImageMetadataFields.skipExtensions(reader)
+        reader.skipExtensions()
 
         self.bitDepth = parsedBitDepth
         self.colorEncoding = parsedColor
@@ -109,6 +112,7 @@ public struct JXLImageMetadata: Equatable {
         self.hasAlpha = alpha
         self.orientation = parsedOrientation
         self.hasAnimation = parsedHasAnimation
+        self.xybEncoded = parsedXybEncoded
     }
 }
 
@@ -235,16 +239,6 @@ private enum ImageMetadataFields {
         _ = reader.readF16()  // min_nits
         _ = reader.readBool()  // relative_to_max_display
         _ = reader.readF16()  // linear_below
-    }
-
-    static func skipExtensions(_ reader: BitReader) {
-        let extensions = reader.readU64()
-        if extensions == 0 { return }
-        var totalBits: UInt64 = 0
-        for i in 0..<64 where (extensions & (UInt64(1) << UInt64(i))) != 0 {
-            totalBits &+= reader.readU64()
-        }
-        reader.skip(Int(totalBits))
     }
 
     static func skipAnimationHeader(_ reader: BitReader) {
