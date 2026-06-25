@@ -25,8 +25,8 @@ enum CustomTransformData {
         if (customWeightsMask & 0x4) != 0 {
             for _ in 0..<210 { _ = reader.readF16() }
         }
-
-        reader.skipExtensions()
+        // NOTE: libjxl's CustomTransformData::VisitFields has no extensions field;
+        // it ends after the weight tables.
     }
 
     private static func skipOpsinInverseMatrix(_ reader: BitReader) {
