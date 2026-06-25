@@ -64,10 +64,11 @@ extension BitReader {
         }
     }
 
-    /// `Enum()` — small enumerated value (ISO/IEC 18181-1 §C.2.5):
-    /// `U32(Val(0), Val(1), Val(2), BitsOffset(6, 3))`. Values 0...63.
+    /// `Enum()` — small enumerated value. Per libjxl `Visitor::Enum`
+    /// (lib/jxl/fields.h) this is `U32(Val(0), Val(1), BitsOffset(4, 2),
+    /// BitsOffset(6, 18))`: values 0, 1, 2...17, then 18...81.
     public func readEnum() -> UInt32 {
-        readU32(.value(0), .value(1), .value(2), .bits(6, offset: 3))
+        readU32(.value(0), .value(1), .bits(4, offset: 2), .bits(6, offset: 18))
     }
 
     /// `F16()` — IEEE-754 binary16 stored little-endian in the bitstream,

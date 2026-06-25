@@ -17,7 +17,7 @@ codestream itself begins with `FF 0A` and is structured as:
 ```
 codestream
 ├── SizeHeader            image dimensions                         [M1 ✅]
-├── ImageMetadata         bit depth, channels, color, animation…   [M2 partial]
+├── ImageMetadata         bit depth, channels, color, animation…   [M2 ✅]
 └── frames…
     └── FrameHeader + TOC
         ├── LfGlobal       (incl. Modular global, patches, splines, noise)
@@ -48,8 +48,7 @@ Sources/JXLCore/
     Container.swift     ISOBMFF box demux + codestream reassembly  [M1 ✅]
   Headers/
     SizeHeader.swift    image dimensions                           [M1 ✅]
-    ImageMetadata.swift basic info: BitDepth, channels, color      [M2 partial]
-    ColorEncoding.swift color space signaling / ICC                [M2]
+    ImageMetadata.swift BitDepth, channels, full ColorEncoding     [M2 ✅]
   Entropy/
     PrefixCode.swift    canonical prefix (Huffman) codes           [M3]
     ANS.swift           rANS alias-method decoder                  [M3]
@@ -84,7 +83,7 @@ Sources/JXLCore/
 | #  | Milestone | Deliverable | Status |
 |----|-----------|-------------|--------|
 | M1 | Foundation | container demux, dimensions, CLI, oracle harness | ✅ done |
-| M2 | Image metadata | `jxl info` pixel format matching `jxlinfo` (depth, channels, color model, alpha) | partial |
+| M2 | Image metadata | full `ImageMetadata` bit-exact vs libjxl (depth, channels, full color encoding) | ✅ done |
 | M3 | Entropy coding | prefix + ANS + LZ77 + context modeling | |
 | M4 | Frame layer | FrameHeader, TOC, group/pass model | |
 | M5 | **Modular mode** | first real pixels: lossless `.jxl` → RGBA | |
@@ -97,17 +96,19 @@ Sources/JXLCore/
 Cross-cutting, ongoing: conformance corpus from the libjxl test suite, fuzzing,
 and SIMD/performance once correctness is locked per stage.
 
-**M2 status (in progress).** Bit depth (integer/float incl. exponent bits),
-color model (RGB/Gray), channel counts, and alpha are parsed and validated
-against libjxl across the fixture matrix — `jxl info`'s pixel-format string is
-byte-identical to `jxlinfo`'s. Deferred to a later milestone (and not yet
-bit-exact): the *tail* of ColorEncoding (white point, primaries, transfer
-function, rendering intent) and the trailing ImageMetadata fields (tone mapping,
-extensions). Differential testing showed our model of that tail does not yet
-reproduce libjxl's resolved values, so the parser deliberately stops at
-`color_space` rather than advance the bit reader by an unverified amount; nothing
-exposed today depends on the bits past that point. The orientation/animation
-(`extra_fields`) path is implemented but not yet covered by a fixture.
+**M2 status (done).** The entire `ImageMetadata` bundle is now parsed
+bit-exactly — a faithful port of libjxl v0.11.2's `VisitFields` (the field
+layout was reverse-engineered against the libjxl source after differential
+testing flagged a bug). This includes bit depth (integer/float + exponent
+bits), the full `ColorEncoding` (color space, white point, primaries, gamma /
+transfer function, rendering intent, custom chromaticities), extra channels,
+tone mapping, and extensions. Validation: across the 25-fixture matrix, our
+white point / primaries / transfer / intent values match a libjxl-backed C
+oracle 25/25, and `jxl info`'s pixel-format line is byte-identical to
+`jxlinfo`'s. The root-cause bug was a wrong `Enum` distribution
+(`U32(Val(0), Val(1), BitsOffset(4, 2), BitsOffset(6, 18))`, not what we first
+had). Implemented but not yet fixture-covered: the orientation/animation/preview
+(`extra_fields`) path and named extra channels.
 
 ## Validation strategy
 

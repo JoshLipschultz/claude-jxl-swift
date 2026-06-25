@@ -61,6 +61,15 @@ do {
             ? "\(colorSpace)+Alpha"
             : colorSpace
         print("\(info.width) x \(info.height)  \(sampleKind) \(channels)  (\(kind))")
+        let ce = info.colorEncoding
+        if ce.wantICC {
+            print("color: ICC profile")
+        } else {
+            let transfer = ce.hasGamma ? "gamma(\(ce.gamma))" : "tf=\(ce.transferFunction)"
+            print(
+                "color: \(colorSpace) white_point=\(ce.whitePoint) primaries=\(ce.primaries) \(transfer) intent=\(ce.renderingIntent)"
+            )
+        }
         if !info.boxTypes.isEmpty {
             print("boxes: \(info.boxTypes.joined(separator: ", "))")
         }

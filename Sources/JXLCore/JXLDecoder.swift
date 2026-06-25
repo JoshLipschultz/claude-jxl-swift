@@ -14,6 +14,7 @@ public struct JXLImageInfo: Equatable {
     public let height: UInt32
     public let bitDepth: JXLBitDepth
     public let colorSpace: JXLColorSpace
+    public let colorEncoding: JXLColorEncoding
     public let colorChannelCount: Int
     public let extraChannelCount: Int
     public let hasAlpha: Bool
@@ -48,6 +49,7 @@ public enum JXL {
             height: size.height,
             bitDepth: metadata.bitDepth,
             colorSpace: metadata.colorSpace,
+            colorEncoding: metadata.colorEncoding,
             colorChannelCount: metadata.colorChannelCount,
             extraChannelCount: metadata.extraChannelCount,
             hasAlpha: metadata.hasAlpha,

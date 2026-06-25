@@ -1,44 +1,63 @@
 // ImageMetadata.swift
 //
-// Basic JPEG XL image metadata parsing (ISO/IEC 18181-1 §D.3). This is the
-// M2 structural layer: it reads enough of ImageMetadata to expose channel count,
-// bit depth, floating-point samples, alpha, orientation, and animation presence.
-// It intentionally stops before frame parsing.
+// JPEG XL ImageMetadata / basic info (ISO/IEC 18181-1 §D.3). Field layout is a
+// faithful port of libjxl v0.11.2 `ImageMetadata::VisitFields` (image_metadata.cc)
+// and the nested bundles (BitDepth, ExtraChannelInfo, ColorEncoding,
+// CustomTransferFunction, Customxy, ToneMapping, AnimationHeader, PreviewHeader).
+// The whole structure is consumed bit-exactly so the reader ends precisely at
+// the start of the frame data (required from M4 onward).
 
 import Foundation
 
-public struct JXLBitDepth: Equatable {
+public struct JXLBitDepth: Equatable, Sendable {
     public let bitsPerSample: UInt32
     public let exponentBitsPerSample: UInt32
 
     public var isFloatingPoint: Bool { exponentBitsPerSample > 0 }
 }
 
-public enum JXLColorSpace: UInt32, Equatable {
+public enum JXLColorSpace: UInt32, Equatable, Sendable {
     case rgb = 0
     case grayscale = 1
     case xyb = 2
     case unknown = 3
 }
 
+/// The serialized color encoding (everything signaled in the codestream's
+/// ColorEncoding bundle). Enum-valued fields use the raw codestream values,
+/// matching libjxl's public `JxlColorEncoding`.
+public struct JXLColorEncoding: Equatable, Sendable {
+    public let wantICC: Bool
+    public let colorSpace: JXLColorSpace
+    /// 1=D65, 2=Custom, 10=E, 11=DCI. 0 when not signaled (ICC or XYB).
+    public let whitePoint: UInt32
+    /// 1=sRGB, 2=Custom, 9=2100, 11=P3. 0 when not signaled (gray/XYB/ICC).
+    public let primaries: UInt32
+    public let hasGamma: Bool
+    /// gamma × 1e7, valid only when `hasGamma`.
+    public let gamma: UInt32
+    /// 1=709, 2=Unknown, 8=Linear, 13=sRGB, 16=PQ, 17=DCI, 18=HLG. 0 when ICC.
+    public let transferFunction: UInt32
+    /// 0=Perceptual, 1=Relative, 2=Saturation, 3=Absolute. 0 when ICC.
+    public let renderingIntent: UInt32
+}
+
 public struct JXLImageMetadata: Equatable {
     public let bitDepth: JXLBitDepth
-    public let colorSpace: JXLColorSpace
+    public let colorEncoding: JXLColorEncoding
     public let extraChannelCount: Int
     public let hasAlpha: Bool
     public let orientation: UInt32
     public let hasAnimation: Bool
 
-    public var colorChannelCount: Int {
-        colorSpace == .grayscale ? 1 : 3
-    }
+    public var colorSpace: JXLColorSpace { colorEncoding.colorSpace }
+    public var colorChannelCount: Int { colorSpace == .grayscale ? 1 : 3 }
 
     public init(_ reader: BitReader) {
         let allDefault = reader.readBool()
-
         if allDefault {
             self.bitDepth = JXLBitDepth(bitsPerSample: 8, exponentBitsPerSample: 0)
-            self.colorSpace = .rgb
+            self.colorEncoding = ImageMetadataFields.defaultSRGB
             self.extraChannelCount = 0
             self.hasAlpha = false
             self.orientation = 1
@@ -48,60 +67,44 @@ public struct JXLImageMetadata: Equatable {
 
         let extraFields = reader.readBool()
 
-        let parsedOrientation: UInt32
-        let parsedHasAnimation: Bool
+        var parsedOrientation: UInt32 = 1
+        var parsedHasAnimation = false
         if extraFields {
-            parsedOrientation = ImageMetadataFields.readOrientation(reader)
-
-            if reader.readBool() {
-                _ = SizeHeader(reader)  // intrinsic size
+            parsedOrientation = UInt32(reader.read(3)) + 1
+            if reader.readBool() {  // have_intrinsic_size
+                _ = SizeHeader(reader)
             }
-            if reader.readBool() {
+            if reader.readBool() {  // have_preview
                 ImageMetadataFields.skipPreviewHeader(reader)
             }
-            if reader.readBool() {
+            if reader.readBool() {  // have_animation
                 parsedHasAnimation = true
                 ImageMetadataFields.skipAnimationHeader(reader)
-            } else {
-                parsedHasAnimation = false
             }
-        } else {
-            parsedOrientation = 1
-            parsedHasAnimation = false
         }
 
         let parsedBitDepth = ImageMetadataFields.readBitDepth(reader)
-
         _ = reader.readBool()  // modular_16bit_buffers
 
         let numExtraChannels = Int(
-            reader.readU32(
-                .value(0),
-                .value(1),
-                .bits(4, offset: 2),
-                .bits(12, offset: 18)
-            ))
+            reader.readU32(.value(0), .value(1), .bits(4, offset: 2), .bits(12, offset: 1)))
 
         var alpha = false
         for _ in 0..<numExtraChannels {
-            let info = ImageMetadataFields.readExtraChannelInfo(reader, extraFields: extraFields)
-            if info.type == 0 { alpha = true }
+            let type = ImageMetadataFields.readExtraChannelInfo(reader)
+            if type == 0 { alpha = true }  // kAlpha
         }
 
         _ = reader.readBool()  // xyb_encoded
         let parsedColor = ImageMetadataFields.readColorEncoding(reader)
 
-        // NOTE: We deliberately stop parsing here. `JXLImageMetadata` exposes only
-        // fields that are fully determined at or before `color_space` (all of
-        // which are validated against libjxl). The remainder of ColorEncoding
-        // (white point, primaries, transfer function, rendering intent) and the
-        // trailing ImageMetadata fields (tone mapping, extensions) require
-        // bit-exact consumption that is not yet pinned down — see the comment on
-        // `readColorEncoding`. They become necessary only when frame parsing
-        // begins (M4), and will be nailed down then.
+        if extraFields {
+            ImageMetadataFields.skipToneMapping(reader)
+        }
+        ImageMetadataFields.skipExtensions(reader)
 
         self.bitDepth = parsedBitDepth
-        self.colorSpace = parsedColor
+        self.colorEncoding = parsedColor
         self.extraChannelCount = numExtraChannels
         self.hasAlpha = alpha
         self.orientation = parsedOrientation
@@ -110,122 +113,166 @@ public struct JXLImageMetadata: Equatable {
 }
 
 private enum ImageMetadataFields {
-    struct ExtraChannelInfo {
-        let type: UInt32
-    }
+    static let defaultSRGB = JXLColorEncoding(
+        wantICC: false, colorSpace: .rgb, whitePoint: 1, primaries: 1,
+        hasGamma: false, gamma: 0, transferFunction: 13, renderingIntent: 1)
+
+    // MARK: BitDepth
 
     static func readBitDepth(_ reader: BitReader) -> JXLBitDepth {
-        if reader.readBool() {
-            let bits = reader.readU32(
-                .value(32),
-                .value(16),
-                .bits(4, offset: 1),
-                .bits(6, offset: 1)
-            )
+        let floatingPoint = reader.readBool()
+        if !floatingPoint {
+            let bits = reader.readU32(.value(8), .value(10), .value(12), .bits(6, offset: 1))
+            return JXLBitDepth(bitsPerSample: bits, exponentBitsPerSample: 0)
+        } else {
+            let bits = reader.readU32(.value(32), .value(16), .value(24), .bits(6, offset: 1))
+            // Encoded value is (exponent_bits - 1) in 4 bits; range [1, 8].
             let exponentBits = UInt32(reader.read(4)) + 1
             return JXLBitDepth(bitsPerSample: bits, exponentBitsPerSample: exponentBits)
-        } else {
-            let bits = reader.readU32(
-                .value(8),
-                .value(10),
-                .value(12),
-                .bits(6, offset: 1)
-            )
-            return JXLBitDepth(bitsPerSample: bits, exponentBitsPerSample: 0)
         }
     }
 
-    static func readOrientation(_ reader: BitReader) -> UInt32 {
-        reader.readU32(
-            .value(1),
-            .value(2),
-            .value(3),
-            .bits(3, offset: 4)
-        )
-    }
+    // MARK: ExtraChannelInfo (returns the channel type)
 
-    static func readExtraChannelInfo(_ reader: BitReader, extraFields: Bool) -> ExtraChannelInfo {
-        let allDefault = reader.readBool()
-        if allDefault {
-            return ExtraChannelInfo(type: 0)  // alpha
+    static func readExtraChannelInfo(_ reader: BitReader) -> UInt32 {
+        if reader.readBool() {  // all_default
+            return 0  // kAlpha
         }
-
         let type = reader.readEnum()
         _ = readBitDepth(reader)
-        _ = reader.readU32(
-            .value(0),
-            .value(3),
-            .bits(2, offset: 1),
-            .bits(3, offset: 1)
-        )  // dim_shift
+        _ = reader.readU32(.value(0), .value(3), .value(4), .bits(3, offset: 1))  // dim_shift
+        skipNameString(reader)
 
-        let nameLength = Int(
-            reader.readU32(
-                .value(0),
-                .bits(4, offset: 1),
-                .bits(5, offset: 17),
-                .bits(10, offset: 49)
-            ))
-        if nameLength > 0 {
-            reader.alignToByte()
-            reader.skip(nameLength * 8)
-        }
-
-        if type == 0 {
+        if type == 0 {  // kAlpha
             _ = reader.readBool()  // alpha_associated
         }
-
-        if extraFields {
-            if type == 2 {  // spot color
-                _ = reader.readF16()
-                _ = reader.readF16()
-                _ = reader.readF16()
-                _ = reader.readF16()
-            }
-            if type == 4 {  // CFA
-                _ = reader.readU32(.bits(2), .bits(4), .bits(8), .bits(16))
-            }
+        if type == 2 {  // kSpotColor
+            for _ in 0..<4 { _ = reader.readF16() }
         }
-
-        return ExtraChannelInfo(type: type)
+        if type == 5 {  // kCFA
+            _ = reader.readU32(.value(1), .bits(2), .bits(4, offset: 3), .bits(8, offset: 19))
+        }
+        return type
     }
 
-    /// Reads `ColorEncoding` (ISO/IEC 18181-1 §D.3.3) only as far as the color
-    /// space, which is all this metadata layer exposes.
-    ///
-    /// The fields after `color_space` — white point, primaries, transfer
-    /// function, rendering intent — are intentionally not consumed. In
-    /// differential testing against libjxl, the encoded form of these for the
-    /// default-grayscale case did not reproduce libjxl's reported values
-    /// (transfer=sRGB/intent=Relative) at any plausible offset or Enum grammar,
-    /// meaning our model of this tail is still incomplete. Rather than advance
-    /// the bit reader by an unverified amount, we stop at `color_space`. This is
-    /// safe because nothing downstream of `JXLImageMetadata.init` depends on the
-    /// reader position. Full, bit-exact ColorEncoding consumption is required
-    /// only once frame parsing begins (M4); it will be resolved against the
-    /// libjxl source / spec text at that point.
-    static func readColorEncoding(_ reader: BitReader) -> JXLColorSpace {
-        let allDefault = reader.readBool()
-        if allDefault {
-            return .rgb  // default color encoding is sRGB
+    /// Per libjxl `VisitNameString`: length = U32(Val(0), Bits(4),
+    /// BitsOffset(5, 16), BitsOffset(10, 48)), then `length` bytes of u(8).
+    static func skipNameString(_ reader: BitReader) {
+        let length = Int(
+            reader.readU32(.value(0), .bits(4), .bits(5, offset: 16), .bits(10, offset: 48)))
+        for _ in 0..<length { _ = reader.read(8) }
+    }
+
+    // MARK: ColorEncoding
+
+    static func readColorEncoding(_ reader: BitReader) -> JXLColorEncoding {
+        if reader.readBool() {  // all_default
+            return defaultSRGB
         }
-        _ = reader.readBool()  // want_icc
+
+        let wantICC = reader.readBool()
         let rawColorSpace = reader.readEnum()
-        return JXLColorSpace(rawValue: rawColorSpace) ?? .unknown
+        let colorSpace = JXLColorSpace(rawValue: rawColorSpace) ?? .unknown
+
+        var whitePoint: UInt32 = 0
+        var primaries: UInt32 = 0
+        var hasGamma = false
+        var gamma: UInt32 = 0
+        var transferFunction: UInt32 = 0
+        var renderingIntent: UInt32 = 0
+
+        if !wantICC {
+            // White point — read unless the color space implies it (XYB).
+            if colorSpace != .xyb {
+                whitePoint = reader.readEnum()
+                if whitePoint == 2 {  // kCustom
+                    readCustomxy(reader)
+                }
+            }
+            // Primaries — only when the color space has them (not gray, not XYB).
+            if colorSpace != .grayscale && colorSpace != .xyb {
+                primaries = reader.readEnum()
+                if primaries == 2 {  // kCustom
+                    readCustomxy(reader)  // red
+                    readCustomxy(reader)  // green
+                    readCustomxy(reader)  // blue
+                }
+            }
+            // CustomTransferFunction — implicit (skipped) for XYB.
+            if colorSpace != .xyb {
+                hasGamma = reader.readBool()
+                if hasGamma {
+                    gamma = UInt32(reader.read(24))
+                } else {
+                    transferFunction = reader.readEnum()
+                }
+            }
+            renderingIntent = reader.readEnum()
+        }
+
+        return JXLColorEncoding(
+            wantICC: wantICC, colorSpace: colorSpace, whitePoint: whitePoint,
+            primaries: primaries, hasGamma: hasGamma, gamma: gamma,
+            transferFunction: transferFunction, renderingIntent: renderingIntent)
     }
 
-    static func skipPreviewHeader(_ reader: BitReader) {
-        _ = SizeHeader(reader)
+    /// Customxy: two coordinates, each U32(Bits(19), BitsOffset(19, 524288),
+    /// BitsOffset(20, 1048576), BitsOffset(21, 2097152)) holding a packed signed
+    /// value. We only need to consume the bits.
+    static func readCustomxy(_ reader: BitReader) {
+        for _ in 0..<2 {
+            _ = reader.readU32(
+                .bits(19), .bits(19, offset: 524288), .bits(20, offset: 1_048_576),
+                .bits(21, offset: 2_097_152))
+        }
+    }
+
+    // MARK: Optional sub-headers (consumed, values not exposed yet)
+
+    static func skipToneMapping(_ reader: BitReader) {
+        if reader.readBool() { return }  // all_default
+        _ = reader.readF16()  // intensity_target
+        _ = reader.readF16()  // min_nits
+        _ = reader.readBool()  // relative_to_max_display
+        _ = reader.readF16()  // linear_below
+    }
+
+    static func skipExtensions(_ reader: BitReader) {
+        let extensions = reader.readU64()
+        if extensions == 0 { return }
+        var totalBits: UInt64 = 0
+        for i in 0..<64 where (extensions & (UInt64(1) << UInt64(i))) != 0 {
+            totalBits &+= reader.readU64()
+        }
+        reader.skip(Int(totalBits))
     }
 
     static func skipAnimationHeader(_ reader: BitReader) {
-        _ = reader.readU32(
-            .bits(0, offset: 100), .bits(0, offset: 1000), .bits(10, offset: 1),
-            .bits(30, offset: 1))
-        _ = reader.readU32(
-            .bits(0, offset: 1), .bits(0, offset: 1001), .bits(8, offset: 1), .bits(10, offset: 1))
+        _ = reader.readU32(.value(100), .value(1000), .bits(10, offset: 1), .bits(30, offset: 1))  // tps_numerator
+        _ = reader.readU32(.value(1), .value(1001), .bits(8, offset: 1), .bits(10, offset: 1))  // tps_denominator
+        _ = reader.readU32(.value(0), .bits(3), .bits(16), .bits(32))  // num_loops
         _ = reader.readBool()  // have_timecodes
-        _ = reader.readU32(
-            .value(0), .bits(3, offset: 1), .bits(16, offset: 1), .bits(32, offset: 1))
+    }
+
+    /// PreviewHeader (headers.cc) — its own size encoding, not a SizeHeader.
+    static func skipPreviewHeader(_ reader: BitReader) {
+        let div8 = reader.readBool()
+        if div8 {
+            _ = reader.readU32(.value(16), .value(32), .bits(5, offset: 1), .bits(9, offset: 33))
+        } else {
+            _ = reader.readU32(
+                .bits(6, offset: 1), .bits(8, offset: 65), .bits(10, offset: 321),
+                .bits(12, offset: 1345))
+        }
+        let ratio = reader.read(3)
+        if ratio == 0 {
+            if div8 {
+                _ = reader.readU32(.value(16), .value(32), .bits(5, offset: 1), .bits(9, offset: 33))
+            } else {
+                _ = reader.readU32(
+                    .bits(6, offset: 1), .bits(8, offset: 65), .bits(10, offset: 321),
+                    .bits(12, offset: 1345))
+            }
+        }
     }
 }

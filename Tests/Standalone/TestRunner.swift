@@ -129,15 +129,18 @@ struct TestRunner {
     // MARK: - Metadata
 
     static func metadata() {
+        // Expected values cross-checked against the libjxl C oracle
+        // (white point / primaries / transfer / intent are codestream enum values).
         let cases:
             [(
                 name: String, bits: UInt32, exponentBits: UInt32, colorSpace: JXLColorSpace,
-                alpha: Bool, extra: Int
+                alpha: Bool, extra: Int, whitePoint: UInt32, primaries: UInt32,
+                transfer: UInt32, intent: UInt32
             )] = [
-                ("40x30_gray8.jxl", 8, 0, .grayscale, false, 0),
-                ("40x30_rgba8.jxl", 8, 0, .rgb, true, 1),
-                ("40x30_rgb16.jxl", 16, 0, .rgb, false, 0),
-                ("40x30_rgbf32.jxl", 32, 8, .rgb, false, 0),
+                ("40x30_gray8.jxl", 8, 0, .grayscale, false, 0, 1, 0, 13, 1),
+                ("40x30_rgba8.jxl", 8, 0, .rgb, true, 1, 1, 1, 13, 1),
+                ("40x30_rgb16.jxl", 16, 0, .rgb, false, 0, 1, 1, 13, 1),
+                ("40x30_rgbf32.jxl", 32, 8, .rgb, false, 0, 1, 1, 13, 1),
             ]
 
         let dir = fixturesDir()
@@ -157,6 +160,10 @@ struct TestRunner {
                 eq(info.colorSpace, c.colorSpace, "\(c.name) color space")
                 eq(info.hasAlpha, c.alpha, "\(c.name) alpha")
                 eq(info.extraChannelCount, c.extra, "\(c.name) extra channels")
+                eq(info.colorEncoding.whitePoint, c.whitePoint, "\(c.name) white point")
+                eq(info.colorEncoding.primaries, c.primaries, "\(c.name) primaries")
+                eq(info.colorEncoding.transferFunction, c.transfer, "\(c.name) transfer function")
+                eq(info.colorEncoding.renderingIntent, c.intent, "\(c.name) rendering intent")
             } catch {
                 check(false, "\(c.name) metadata threw \(error)")
             }
