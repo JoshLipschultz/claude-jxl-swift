@@ -86,6 +86,17 @@ private func sectionRole(
     return .acGroup(pass: acIndex / numGroups, group: acIndex % numGroups)
 }
 
+/// A decoded raster image: one Int32 plane per channel (color channels first,
+/// then extra channels such as alpha), each `width * height` row-major.
+public struct JXLDecodedImage {
+    public let width: Int
+    public let height: Int
+    public let colorChannels: Int  // 1 (grayscale) or 3 (RGB)
+    public let extraChannels: Int
+    public let bitsPerSample: Int
+    public let planes: [[Int32]]
+}
+
 public enum JXL {
     /// Reads structural information (dimensions, container layout) from a JPEG XL file.
     public static func readInfo(from data: [UInt8]) throws -> JXLImageInfo {
@@ -190,6 +201,85 @@ public enum JXL {
 
     public static func readFrameInfo(from data: Data) throws -> JXLFrameInfo {
         try readFrameInfo(from: [UInt8](data))
+    }
+
+    /// Decodes a JPEG XL image to pixel planes. Currently supports the lossless
+    /// Modular subset: a single regular frame, one group, integer samples, and
+    /// only RCT (or no) transforms. Throws `.unsupported` otherwise.
+    public static func decodeImage(from data: [UInt8]) throws -> JXLDecodedImage {
+        let parsed = try JXLContainer.parse(data)
+        guard parsed.codestream.count >= 2,
+            parsed.codestream[0] == 0xFF, parsed.codestream[1] == 0x0A
+        else { throw JXLError.invalidSignature }
+
+        let reader = BitReader(parsed.codestream)
+        reader.skip(16)
+        let size = SizeHeader(reader)
+        let metadata = JXLImageMetadata(reader)
+        CustomTransformData.skip(reader, xybEncoded: metadata.xybEncoded)
+        if metadata.colorEncoding.wantICC { throw JXLError.unsupported("embedded ICC profile") }
+        reader.alignToByte()
+
+        let ctx = FrameContext(metadata: metadata, width: size.width, height: size.height)
+        let frameHeader = FrameHeader(reader: reader, context: ctx)
+        guard frameHeader.isModular else { throw JXLError.unsupported("VarDCT (lossy) frames") }
+        guard frameHeader.frameType == .regular, frameHeader.flags == 0 else {
+            throw JXLError.unsupported("non-regular or feature-flagged frames")
+        }
+        if metadata.bitDepth.isFloatingPoint { throw JXLError.unsupported("floating-point samples") }
+
+        let dim = frameHeader.frameDimensions(ctx)
+        guard dim.numGroups == 1 else { throw JXLError.unsupported("multi-group frames") }
+
+        let entries = numTocEntries(
+            numGroups: dim.numGroups, numDCGroups: dim.numDCGroups, numPasses: Int(frameHeader.numPasses))
+        guard readGroupOffsets(reader, tocEntries: entries) != nil else {
+            throw JXLError.malformed("could not read TOC")
+        }
+        // The reader is now byte-aligned at the start of section 0 (LfGlobal).
+
+        // LfGlobal preamble: DequantMatrices.DecodeDC.
+        if reader.read(1) == 0 {
+            for _ in 0..<3 { _ = reader.readF16() }
+        }
+
+        var globalTree: [MATreeNode]? = nil
+        var globalCode: ANSCode? = nil
+        var globalCtxMap: [UInt8]? = nil
+        if reader.read(1) == 1 {  // has_tree
+            guard let tree = decodeMATree(reader, treeSizeLimit: 1 << 22),
+                let (code, ctxMap) = decodeHistograms(
+                    reader, numContexts: (tree.count + 1) / 2, disallowLZ77: false)
+            else { throw JXLError.malformed("could not read global modular tree") }
+            globalTree = tree
+            globalCode = code
+            globalCtxMap = ctxMap
+        }
+
+        let isGray = metadata.colorSpace == .grayscale && frameHeader.colorTransform == .none
+        let colorChannels = isGray ? 1 : 3
+        let extra = metadata.extraChannelCount
+        let image = ModularImage(
+            w: dim.xsize, h: dim.ysize, bitdepth: Int(metadata.bitDepth.bitsPerSample),
+            channelCount: colorChannels + extra)
+
+        let header = try modularDecode(
+            reader, image: image, groupID: 0, globalTree: globalTree, globalCode: globalCode,
+            globalCtxMap: globalCtxMap)
+        try undoTransforms(image, transforms: header.transforms)
+
+        return JXLDecodedImage(
+            width: dim.xsize, height: dim.ysize, colorChannels: colorChannels,
+            extraChannels: extra, bitsPerSample: Int(metadata.bitDepth.bitsPerSample),
+            planes: image.channels.map { $0.pixels })
+    }
+
+    public static func decodeImage(from data: Data) throws -> JXLDecodedImage {
+        try decodeImage(from: [UInt8](data))
+    }
+
+    public static func decodeImage(contentsOf url: URL) throws -> JXLDecodedImage {
+        try decodeImage(from: try Data(contentsOf: url))
     }
 
     public static func readFrameInfo(contentsOf url: URL) throws -> JXLFrameInfo {

@@ -26,8 +26,9 @@ func usage() -> Never {
         jxl — pure-Swift JPEG XL tools
 
         USAGE:
-          jxl info  <file.jxl>    Print dimensions and container layout
-          jxl boxes <file.jxl>    List ISOBMFF container boxes
+          jxl info   <file.jxl>            Print dimensions and container layout
+          jxl boxes  <file.jxl>            List ISOBMFF container boxes
+          jxl decode <file.jxl> <out.pnm>  Decode lossless image to PGM/PPM
 
         """
     FileHandle.standardError.write(Data(text.utf8))
@@ -88,9 +89,45 @@ do {
             }
         }
 
+    case "decode":
+        guard args.count >= 4 else { usage() }
+        let image = try JXL.decodeImage(from: bytes)
+        let out = encodePNM(image)
+        do {
+            try Data(out).write(to: URL(fileURLWithPath: args[3]))
+            print("decoded \(image.width) x \(image.height) -> \(args[3])")
+        } catch {
+            fail("error: cannot write \(args[3]): \(error)")
+        }
+
     default:
         usage()
     }
 } catch {
     fail("error: \(error)")
+}
+
+/// Encodes a decoded image as a binary PNM: P5 (grayscale) or P6 (RGB), 8- or
+/// 16-bit. Extra channels (e.g. alpha) are not represented in PNM and dropped.
+func encodePNM(_ image: JXLDecodedImage) -> [UInt8] {
+    let isGray = image.colorChannels == 1
+    let maxval = (1 << image.bitsPerSample) - 1
+    let magic = isGray ? "P5" : "P6"
+    var out = [UInt8]("\(magic)\n\(image.width) \(image.height)\n\(maxval)\n".utf8)
+    let channelCount = isGray ? 1 : 3
+    let twoBytes = image.bitsPerSample > 8
+    for y in 0..<image.height {
+        for x in 0..<image.width {
+            for c in 0..<channelCount {
+                let v = UInt32(bitPattern: image.planes[c][y * image.width + x])
+                if twoBytes {
+                    out.append(UInt8((v >> 8) & 0xFF))  // PNM is big-endian
+                    out.append(UInt8(v & 0xFF))
+                } else {
+                    out.append(UInt8(v & 0xFF))
+                }
+            }
+        }
+    }
+    return out
 }

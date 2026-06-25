@@ -4,21 +4,27 @@ A from-scratch implementation of a [JPEG XL](https://jpeg.org/jpegxl/)
 (ISO/IEC 18181) decoder in Swift, for use in macOS applications and a Quick Look
 extension. No dependency on libjxl; libjxl is used only as a test oracle.
 
-> **Status: early.** Milestone 1 (container demux + image dimensions + CLI +
-> oracle-validated test harness) is complete and verified against `jxlinfo` on a
-> matrix of fixtures. The full decode pipeline is being built stage by stage —
-> see [ARCHITECTURE.md](ARCHITECTURE.md) for the design and roadmap.
+> **Status: decoding pixels.** The full container → headers → entropy (ANS /
+> prefix / LZ77) → frame/TOC → Modular pipeline is implemented and validated
+> against libjxl. Lossless images using RCT (or no transform) decode
+> **byte-exact vs `djxl`** — grayscale-less RGB/RGBA/16-bit so far. Palette,
+> Squeeze, multi-group, and VarDCT (lossy) are next. See
+> [ARCHITECTURE.md](ARCHITECTURE.md) for the design and milestone status.
 
 ## What works today
 
 ```
-$ jxl info  image.jxl     # dimensions + basic metadata + container layout
-1024 x 768  8-bit RGB  (bare codestream)
+$ jxl info  image.jxl                 # dimensions + metadata + container layout
+640 x 480  8-bit RGB  (bare codestream)
+color: RGB white_point=1 primaries=1 tf=13 intent=1
 
-$ jxl boxes image.jxl     # ISOBMFF box listing
+$ jxl boxes image.jxl                 # ISOBMFF box listing
 'JXL '  12 bytes  (payload 4)
 'ftyp'  20 bytes  (payload 12)
 'jxlc'  7952 bytes  (payload 7944)
+
+$ jxl decode image.jxl out.ppm        # decode lossless image -> PGM/PPM
+decoded 640 x 480 -> out.ppm
 ```
 
 Library:
@@ -26,8 +32,9 @@ Library:
 ```swift
 import JXLCore
 
-let info = try JXL.readInfo(contentsOf: url)
-print(info.width, info.height, info.bitDepth.bitsPerSample, info.colorSpace, info.hasAlpha)
+let info = try JXL.readInfo(contentsOf: url)        // metadata only
+let image = try JXL.decodeImage(contentsOf: url)    // pixel planes (lossless subset)
+print(image.width, image.height, image.colorChannels, image.planes.count)
 ```
 
 ## Building & testing
