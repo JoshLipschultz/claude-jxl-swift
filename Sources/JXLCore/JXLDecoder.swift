@@ -228,28 +228,36 @@ public enum JXL {
         }
         if metadata.bitDepth.isFloatingPoint { throw JXLError.unsupported("floating-point samples") }
 
+        guard frameHeader.numPasses == 1 else {
+            throw JXLError.unsupported("progressive (multi-pass) frames")
+        }
         let dim = frameHeader.frameDimensions(ctx)
-        guard dim.numGroups == 1 else { throw JXLError.unsupported("multi-group frames") }
 
         let entries = numTocEntries(
             numGroups: dim.numGroups, numDCGroups: dim.numDCGroups, numPasses: Int(frameHeader.numPasses))
-        guard readGroupOffsets(reader, tocEntries: entries) != nil else {
+        guard let toc = readGroupOffsets(reader, tocEntries: entries) else {
             throw JXLError.malformed("could not read TOC")
         }
-        // The reader is now byte-aligned at the start of section 0 (LfGlobal).
-
-        // LfGlobal preamble: DequantMatrices.DecodeDC.
-        if reader.read(1) == 0 {
-            for _ in 0..<3 { _ = reader.readF16() }
+        let dataStart = reader.bitPosition / 8
+        let cs = parsed.codestream
+        func sectionReader(_ logicalIndex: Int) -> BitReader {
+            let start = dataStart + toc.offsets[logicalIndex]
+            return BitReader(Array(cs[start..<(start + Int(toc.sizes[logicalIndex]))]))
         }
 
+        // Global modular (section 0 = LfGlobal): DequantMatrices.DecodeDC, then
+        // has_tree / the global MA tree + code, then the global modular stream.
+        let r0 = sectionReader(0)
+        if r0.read(1) == 0 {
+            for _ in 0..<3 { _ = r0.readF16() }
+        }
         var globalTree: [MATreeNode]? = nil
         var globalCode: ANSCode? = nil
         var globalCtxMap: [UInt8]? = nil
-        if reader.read(1) == 1 {  // has_tree
-            guard let tree = decodeMATree(reader, treeSizeLimit: 1 << 22),
+        if r0.read(1) == 1 {  // has_tree
+            guard let tree = decodeMATree(r0, treeSizeLimit: 1 << 22),
                 let (code, ctxMap) = decodeHistograms(
-                    reader, numContexts: (tree.count + 1) / 2, disallowLZ77: false)
+                    r0, numContexts: (tree.count + 1) / 2, disallowLZ77: false)
             else { throw JXLError.malformed("could not read global modular tree") }
             globalTree = tree
             globalCode = code
@@ -259,19 +267,36 @@ public enum JXL {
         let isGray = metadata.colorSpace == .grayscale && frameHeader.colorTransform == .none
         let colorChannels = isGray ? 1 : 3
         let extra = metadata.extraChannelCount
-        let image = ModularImage(
+        let fullImage = ModularImage(
             w: dim.xsize, h: dim.ysize, bitdepth: Int(metadata.bitDepth.bitsPerSample),
             channelCount: colorChannels + extra)
 
-        let header = try modularDecode(
-            reader, image: image, groupID: 0, globalTree: globalTree, globalCode: globalCode,
-            globalCtxMap: globalCtxMap)
-        try undoTransforms(image, transforms: header.transforms)
+        // For a single group the global stream carries every channel; otherwise
+        // large channels are decoded per AC group.
+        let maxChan = dim.numGroups == 1 ? Int.max : dim.groupDim
+        let globalHeader = try modularDecode(
+            r0, image: fullImage, groupID: 0, globalTree: globalTree, globalCode: globalCode,
+            globalCtxMap: globalCtxMap, maxChanSize: maxChan)
+
+        if dim.numGroups > 1 {
+            for g in 0..<dim.numGroups {
+                let section = acGroupIndex(
+                    pass: 0, group: g, numGroups: dim.numGroups, numDCGroups: dim.numDCGroups)
+                // ModularStreamId::ModularAC(g, pass 0).ID  (kNumQuantTables = 17)
+                let streamID = 1 + 3 * dim.numDCGroups + 17 + g
+                try decodeModularGroup(
+                    sectionReader(section), fullImage: fullImage, group: g, dim: dim,
+                    globalTree: globalTree, globalCode: globalCode, globalCtxMap: globalCtxMap,
+                    streamID: streamID)
+            }
+        }
+
+        try undoTransforms(fullImage, transforms: globalHeader.transforms)
 
         return JXLDecodedImage(
             width: dim.xsize, height: dim.ysize, colorChannels: colorChannels,
             extraChannels: extra, bitsPerSample: Int(metadata.bitDepth.bitsPerSample),
-            planes: image.channels.map { $0.pixels })
+            planes: fullImage.channels.map { $0.pixels })
     }
 
     public static func decodeImage(from data: Data) throws -> JXLDecodedImage {

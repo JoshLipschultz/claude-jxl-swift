@@ -95,7 +95,7 @@ Sources/JXLCore/
 | M2 | Image metadata | full `ImageMetadata` bit-exact vs libjxl (depth, channels, full color encoding) | ✅ done |
 | M3 | Entropy coding | prefix + ANS + LZ77 + context modeling | ✅ done — validated on real codestream data via the MA tree |
 | M4 | Frame layer | FrameHeader, TOC, role-aware sections | ✅ structural parser done |
-| M5 | **Modular mode** | first real pixels: lossless `.jxl` → RGBA | 🟢 **all 13 single-group lossless fixtures byte-exact vs djxl** (RCT + Palette, gray/RGB/RGBA/8/16-bit); multi-group, Squeeze, float remain |
+| M5 | **Modular mode** | lossless `.jxl` → pixels | 🟢 **all 17 lossless fixtures byte-exact vs djxl** — single + multi-group, RCT + Palette, gray/RGB/RGBA/8/16-bit. Float, Squeeze, progressive remain |
 | M6 | VarDCT mode | lossy photographic `.jxl` → pixels | |
 | M7 | Restoration | Gaborish + EPF + upsampling | |
 | M8 | Color pipeline | XYB→sRGB, ICC, alpha, 8/16-bit/float output | |

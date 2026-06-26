@@ -207,7 +207,8 @@ enum ModularDecodeError: Error { case unsupportedTransform, badGroupHeader, badT
 @discardableResult
 func modularDecode(
     _ br: BitReader, image: ModularImage, groupID: Int,
-    globalTree: [MATreeNode]?, globalCode: ANSCode?, globalCtxMap: [UInt8]?
+    globalTree: [MATreeNode]?, globalCode: ANSCode?, globalCtxMap: [UInt8]?,
+    maxChanSize: Int = Int.max
 ) throws -> GroupHeader {
     guard let header = readGroupHeader(br) else { throw ModularDecodeError.badGroupHeader }
     // RCT and an empty transform list keep the channel layout unchanged; other
@@ -239,11 +240,30 @@ func modularDecode(
         ctxMap = lm
     }
 
-    let distanceMultiplier = image.channels.map { $0.w }.max() ?? 0
+    // Count decodable channels. Channels larger than `maxChanSize` (and not
+    // meta channels) are left for per-group decoding.
+    func isSkippedLargeChannel(_ index: Int) -> Bool {
+        let ch = image.channels[index]
+        return index >= image.nbMetaChannels && (ch.w > maxChanSize || ch.h > maxChanSize)
+    }
+    var numChans = 0
+    var distanceMultiplier = 0
+    for c in 0..<image.channels.count {
+        let ch = image.channels[c]
+        if ch.w == 0 || ch.h == 0 { continue }
+        if isSkippedLargeChannel(c) { break }
+        distanceMultiplier = max(distanceMultiplier, ch.w)
+        numChans += 1
+    }
+    if numChans == 0 { return header }
+
     let reader = ANSSymbolReader(code: code, reader: br, distanceMultiplier: distanceMultiplier)
     let propCount = numProps(for: tree)
 
     for c in 0..<image.channels.count {
+        let ch = image.channels[c]
+        if ch.w == 0 || ch.h == 0 { continue }
+        if isSkippedLargeChannel(c) { break }
         decodeChannel(
             br, reader, contextMap: ctxMap, tree: tree, wpHeader: header.wpHeader,
             chan: c, groupID: groupID, image: image, propCount: propCount)
@@ -252,4 +272,61 @@ func modularDecode(
 
     if !reader.checkANSFinalState() { throw ModularDecodeError.finalState }
     return header
+}
+
+/// Decodes one AC group's large channels into `fullImage` at the group's rect
+/// (libjxl ModularFrameDecoder::DecodeGroup, the use_full_image path). Single
+/// pass => shift bracket [0, 2].
+func decodeModularGroup(
+    _ br: BitReader, fullImage: ModularImage, group g: Int, dim: FrameDimensions,
+    globalTree: [MATreeNode]?, globalCode: ANSCode?, globalCtxMap: [UInt8]?, streamID: Int
+) throws {
+    let minShift = 0
+    let maxShift = 2
+    let groupDim = dim.groupDim
+    let rx0 = (g % dim.xsizeGroups) * groupDim
+    let ry0 = (g / dim.xsizeGroups) * groupDim
+    let rectW = min(groupDim, dim.xsize - rx0)
+    let rectH = min(groupDim, dim.ysize - ry0)
+
+    // Skip meta + small (<= group_dim) channels, which were decoded globally.
+    var beginC = fullImage.nbMetaChannels
+    while beginC < fullImage.channels.count {
+        let fc = fullImage.channels[beginC]
+        if fc.w > groupDim || fc.h > groupDim { break }
+        beginC += 1
+    }
+
+    let gi = ModularImage(w: rectW, h: rectH, bitdepth: fullImage.bitdepth, channelCount: 0)
+    gi.channels = []
+    var mapping: [(fullC: Int, x: Int, y: Int, w: Int, h: Int)] = []
+    for c in beginC..<fullImage.channels.count {
+        let fc = fullImage.channels[c]
+        let shift = min(fc.hshift, fc.vshift)
+        if shift > maxShift || shift < minShift { continue }
+        let rx = rx0 >> fc.hshift
+        let ry = ry0 >> fc.vshift
+        let rw = min(rectW >> fc.hshift, fc.w - rx)
+        let rh = min(rectH >> fc.vshift, fc.h - ry)
+        if rw <= 0 || rh <= 0 { continue }
+        gi.channels.append(ModularChannel(w: rw, h: rh, hshift: fc.hshift, vshift: fc.vshift))
+        mapping.append((c, rx, ry, rw, rh))
+    }
+    if gi.channels.isEmpty { return }
+
+    let header = try modularDecode(
+        br, image: gi, groupID: streamID, globalTree: globalTree, globalCode: globalCode,
+        globalCtxMap: globalCtxMap)
+    try undoTransforms(gi, transforms: header.transforms)
+
+    for (gic, m) in mapping.enumerated() {
+        let src = gi.channels[gic]
+        var dst = fullImage.channels[m.fullC]
+        for yy in 0..<m.h {
+            let dstBase = (m.y + yy) * dst.w + m.x
+            let srcBase = yy * src.w
+            for xx in 0..<m.w { dst.pixels[dstBase + xx] = src.pixels[srcBase + xx] }
+        }
+        fullImage.channels[m.fullC] = dst
+    }
 }

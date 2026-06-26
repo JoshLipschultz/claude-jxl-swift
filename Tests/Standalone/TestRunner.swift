@@ -59,6 +59,7 @@ struct TestRunner {
         entropy()
         frame()
         modular()
+        decodeAPI()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -381,6 +382,59 @@ struct TestRunner {
         } else {
             check(false, "flat histogram failed to parse")
         }
+    }
+
+    // MARK: - Public decode API (M5: single + multi group)
+
+    /// Decodes every lossless fixture through the public `JXL.decodeImage` API
+    /// and checks the pixels against their generator formula (byte-exact).
+    static func decodeAPI() {
+        let dir = fixturesDir()
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else {
+            check(false, "list fixtures for decodeAPI test")
+            return
+        }
+        var verified = 0
+        for f in files.sorted() where f.hasSuffix(".jxl") {
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent(f)),
+                let img = try? JXL.decodeImage(from: [UInt8](data))
+            else { continue }
+            let w = img.width
+            let h = img.height
+            func allMatch(_ e: (Int, Int) -> [Int32]) -> Bool {
+                for y in 0..<h {
+                    for x in 0..<w {
+                        let ex = e(x, y)
+                        for c in 0..<ex.count where img.planes[c][y * w + x] != ex[c] { return false }
+                    }
+                }
+                return true
+            }
+            let base = (f as NSString).deletingPathExtension
+            var ok: Bool? = nil
+            if f == "40x30_gray8.jxl" {
+                ok = allMatch { x, y in [Int32((x * 7 + y * 5) & 255)] }
+            } else if f == "40x30_rgba8.jxl" {
+                ok = allMatch { x, y in
+                    [Int32((x * 37) & 255), Int32((y * 53) & 255), Int32(((x + y) * 29) & 255), Int32((x * 3) & 255)]
+                }
+            } else if f == "40x30_rgb16.jxl" {
+                ok = allMatch { x, y in
+                    [Int32((x * 1600) & 0xFFFF), Int32((y * 2100) & 0xFFFF), Int32(((x + y) * 900) & 0xFFFF)]
+                }
+            } else if base.hasSuffix("_lossless") || base.hasSuffix("_container") {
+                ok = allMatch { x, y in
+                    [Int32((x * 37) & 255), Int32((y * 53) & 255), Int32(((x + y) * 29) & 255)]
+                }
+            }
+            if let ok = ok {
+                check(ok, "\(f) decodeImage pixels byte-exact")
+                if ok { verified += 1 }
+            }
+        }
+        FileHandle.standardError.write(
+            Data("  [decodeImage] byte-exact lossless images=\(verified)\n".utf8))
+        check(verified >= 17, "decodeImage byte-exact for >=17 lossless fixtures (single + multi group)")
     }
 
     // MARK: - Frame layer (M4)
