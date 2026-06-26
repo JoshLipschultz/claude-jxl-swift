@@ -94,6 +94,9 @@ public struct JXLDecodedImage {
     public let colorChannels: Int  // 1 (grayscale) or 3 (RGB)
     public let extraChannels: Int
     public let bitsPerSample: Int
+    /// When true, each Int32 sample is the IEEE-754 binary32 bit pattern of the
+    /// pixel value (read via `Float(bitPattern: UInt32(bitPattern: sample))`).
+    public let isFloat: Bool
     public let planes: [[Int32]]
 }
 
