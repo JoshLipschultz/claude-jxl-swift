@@ -207,8 +207,9 @@ public enum JXL {
     }
 
     /// Decodes a JPEG XL image to pixel planes. Currently supports the lossless
-    /// Modular subset: a single regular frame, one group, integer samples, and
-    /// only RCT (or no) transforms. Throws `.unsupported` otherwise.
+    /// Modular subset: a single regular frame and only RCT/Palette (or no)
+    /// transforms. Integer samples are returned as sample values; 32-bit float
+    /// samples are returned as their IEEE-754 binary32 bit patterns.
     public static func decodeImage(from data: [UInt8]) throws -> JXLDecodedImage {
         let parsed = try JXLContainer.parse(data)
         guard parsed.codestream.count >= 2,
@@ -229,7 +230,9 @@ public enum JXL {
         guard frameHeader.frameType == .regular, frameHeader.flags == 0 else {
             throw JXLError.unsupported("non-regular or feature-flagged frames")
         }
-        if metadata.bitDepth.isFloatingPoint { throw JXLError.unsupported("floating-point samples") }
+        if metadata.bitDepth.isFloatingPoint && metadata.bitDepth.bitsPerSample != 32 {
+            throw JXLError.unsupported("non-binary32 floating-point samples")
+        }
 
         guard frameHeader.numPasses == 1 else {
             throw JXLError.unsupported("progressive (multi-pass) frames")
@@ -237,7 +240,8 @@ public enum JXL {
         let dim = frameHeader.frameDimensions(ctx)
 
         let entries = numTocEntries(
-            numGroups: dim.numGroups, numDCGroups: dim.numDCGroups, numPasses: Int(frameHeader.numPasses))
+            numGroups: dim.numGroups, numDCGroups: dim.numDCGroups,
+            numPasses: Int(frameHeader.numPasses))
         guard let toc = readGroupOffsets(reader, tocEntries: entries) else {
             throw JXLError.malformed("could not read TOC")
         }
@@ -299,6 +303,7 @@ public enum JXL {
         return JXLDecodedImage(
             width: dim.xsize, height: dim.ysize, colorChannels: colorChannels,
             extraChannels: extra, bitsPerSample: Int(metadata.bitDepth.bitsPerSample),
+            isFloat: metadata.bitDepth.isFloatingPoint,
             planes: fullImage.channels.map { $0.pixels })
     }
 
@@ -355,6 +360,39 @@ public enum JXL {
         -> BitReader
     {
         try readFrameSectionReader(from: try Data(contentsOf: url), sectionIndex: sectionIndex)
+    }
+
+    /// Parses the currently implemented VarDCT global metadata without decoding
+    /// pixels. This is an incremental preflight API for the lossy path: DC-global
+    /// metadata is parsed from section 0, and AC-global metadata is parsed when it
+    /// is in a distinct TOC section. Single-section VarDCT frames return `nil` for
+    /// `acGlobal` because DC groups precede AC-global inside the same section.
+    public static func readVarDCTInfo(from data: [UInt8]) throws -> JXLVarDCTInfo {
+        let frame = try readFrameInfo(from: data)
+        guard !frame.isModular else { throw JXLError.unsupported("Modular frame is not VarDCT") }
+
+        let dcGlobal = try readVarDCTDCGlobalInfo(
+            readFrameSectionReader(from: data, sectionIndex: 0))
+        let acGlobalIndex =
+            frame.numGroups == 1 && frame.numPasses == 1 ? nil : frame.numDCGroups + 1
+        let acGlobal: VarDCTACGlobalInfo?
+        if let acGlobalIndex {
+            acGlobal = try readVarDCTACGlobalInfo(
+                readFrameSectionReader(from: data, sectionIndex: acGlobalIndex),
+                frame: frame,
+                blockContextMap: dcGlobal.blockContextMap)
+        } else {
+            acGlobal = nil
+        }
+        return JXLVarDCTInfo(frame: frame, dcGlobal: dcGlobal, acGlobal: acGlobal)
+    }
+
+    public static func readVarDCTInfo(from data: Data) throws -> JXLVarDCTInfo {
+        try readVarDCTInfo(from: [UInt8](data))
+    }
+
+    public static func readVarDCTInfo(contentsOf url: URL) throws -> JXLVarDCTInfo {
+        try readVarDCTInfo(from: try Data(contentsOf: url))
     }
 
     /// Convenience overload reading a file from disk.

@@ -11,7 +11,7 @@ import Foundation
 ///
 /// `.value(c)` is the spec's `Val(c)` (zero extra bits); `.bits(n, offset:)` is
 /// the spec's `BitsOffset(n, offset)` (and plain `Bits(n)` when `offset == 0`).
-public struct U32Choice {
+public struct U32Choice: Sendable {
     public let offset: UInt32
     public let bitCount: Int
 
@@ -26,7 +26,9 @@ public struct U32Choice {
 
 extension BitReader {
     /// `U32(c0, c1, c2, c3)` — a 2-bit selector picks an alternative.
-    public func readU32(_ c0: U32Choice, _ c1: U32Choice, _ c2: U32Choice, _ c3: U32Choice) -> UInt32 {
+    public func readU32(_ c0: U32Choice, _ c1: U32Choice, _ c2: U32Choice, _ c3: U32Choice)
+        -> UInt32
+    {
         let selector = Int(read(2))
         let choice: U32Choice
         switch selector {
@@ -35,7 +37,8 @@ extension BitReader {
         case 2: choice = c2
         default: choice = c3
         }
-        let extra: UInt32 = choice.bitCount > 0 ? UInt32(truncatingIfNeeded: read(choice.bitCount)) : 0
+        let extra: UInt32 =
+            choice.bitCount > 0 ? UInt32(truncatingIfNeeded: read(choice.bitCount)) : 0
         return choice.offset &+ extra
     }
 

@@ -432,8 +432,19 @@ struct TestRunner {
                 if ok { verified += 1 }
             }
         }
+        // 32-bit float: the generator's blue channel is a constant 0.5, which is
+        // orientation-independent and exercises float decode + RCT undo.
+        if let data = try? Data(contentsOf: dir.appendingPathComponent("40x30_rgbf32.jxl")),
+            let img = try? JXL.decodeImage(from: [UInt8](data)) {
+            check(img.isFloat, "rgbf32 decodes as float")
+            let half = Int32(bitPattern: Float(0.5).bitPattern)
+            check(img.planes[2].allSatisfy { $0 == half }, "rgbf32 blue channel is constant 0.5")
+        } else {
+            check(false, "rgbf32 failed to decode")
+        }
+
         FileHandle.standardError.write(
-            Data("  [decodeImage] byte-exact lossless images=\(verified)\n".utf8))
+            Data("  [decodeImage] byte-exact lossless images=\(verified) (+ float)\n".utf8))
         check(verified >= 17, "decodeImage byte-exact for >=17 lossless fixtures (single + multi group)")
     }
 
