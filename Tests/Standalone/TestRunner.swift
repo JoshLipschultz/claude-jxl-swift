@@ -62,6 +62,7 @@ struct TestRunner {
         decodeAPI()
         vardctDC()
         vardctACMeta()
+        vardctACGlobal()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -532,6 +533,44 @@ struct TestRunner {
         }
         FileHandle.standardError.write(
             Data("  [vardct-acmeta] AC metadata decoded=\(decoded) (incl. varied block sizes)\n".utf8))
+    }
+
+    /// Decodes the AC-global layer (coefficient orders + AC histograms). The
+    /// coefficient-order ANS stream has its own final-state check, so a clean
+    /// decode is bit-exact proof of this layer.
+    static func vardctACGlobal() {
+        let dir = fixturesDir()
+        var decoded = 0
+        for name in ["64x48_lossy.jxl", "513x257_lossy.jxl", "640x480_lossy.jxl"] {
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent(name)),
+                let (_, acg) = try? decodeVarDCTACGlobalForFrame(from: [UInt8](data))
+            else {
+                check(false, "\(name) decodeVarDCTACGlobalForFrame")
+                continue
+            }
+            check(acg.codes.count == 1, "\(name) single pass")
+            check(acg.numHistograms >= 1, "\(name) histograms present")
+            // DCT8 order set: 64 entries per channel, all a permutation of 0..63.
+            for c in 0..<3 {
+                let ord = acg.orders[0][c]
+                check(ord.count == 64, "\(name) DCT8 order c\(c) size")
+                check(Set(ord) == Set(0..<64), "\(name) DCT8 order c\(c) is a permutation")
+            }
+            decoded += 1
+        }
+        // Varied block sizes: multiple order buckets are populated.
+        if let data = try? Data(
+            contentsOf: dir.appendingPathComponent("256x256_varblocks_lossy.jxl")),
+            let (_, acg) = try? decodeVarDCTACGlobalForFrame(from: [UInt8](data))
+        {
+            let buckets = Set((0..<(3 * 13)).filter { !acg.orders[0][$0].isEmpty }.map { $0 / 3 })
+            check(buckets.count >= 4, "varblocks AC global uses multiple order buckets (\(buckets.count))")
+            decoded += 1
+        } else {
+            check(false, "256x256_varblocks_lossy decodeVarDCTACGlobalForFrame")
+        }
+        FileHandle.standardError.write(
+            Data("  [vardct-acglobal] AC global decoded=\(decoded)\n".utf8))
     }
 
     // MARK: - Frame layer (M4)

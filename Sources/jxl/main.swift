@@ -34,6 +34,7 @@ func usage() -> Never {
           jxl vardct <file.jxl>            Preflight VarDCT global metadata
           jxl vardct-dc <file.jxl> [dump]  Decode VarDCT XYB DC image (lossy)
           jxl vardct-acmeta <file.jxl>     Decode VarDCT AC metadata (strategy/quant)
+          jxl vardct-acglobal <file.jxl>   Decode VarDCT AC global (coeff orders)
 
         """
     FileHandle.standardError.write(Data(text.utf8))
@@ -155,6 +156,16 @@ do {
         for q in m.quantField { qlo = min(qlo, q); qhi = max(qhi, q) }
         print("  quant field: [\(qlo), \(qhi)] over \(covered)/\(m.widthBlocks * m.heightBlocks) blocks")
         print("  color tiles: \(m.colorTileWidth) x \(m.colorTileHeight)")
+
+    case "vardct-acglobal":
+        let (meta, acg) = try decodeVarDCTACGlobalForFrame(from: bytes)
+        print("VarDCT AC global: histograms=\(acg.numHistograms), passes=\(acg.codes.count)")
+        print("  used ACs mask: 0x\(String(meta.usedACs, radix: 16))")
+        for (p, passOrders) in acg.orders.enumerated() {
+            let usedBuckets = passOrders.enumerated().filter { !$0.element.isEmpty }
+                .map { "b\($0.offset / 3)c\($0.offset % 3)(\($0.element.count))" }
+            print("  pass \(p): orders \(usedBuckets.joined(separator: " "))")
+        }
 
     case "vardct-dc":
         let dc = try decodeVarDCTDCImage(from: bytes)

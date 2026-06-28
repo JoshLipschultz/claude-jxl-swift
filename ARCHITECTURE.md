@@ -96,7 +96,7 @@ Sources/JXLCore/
 | M3 | Entropy coding | prefix + ANS + LZ77 + context modeling | ✅ done — validated on real codestream data via the MA tree |
 | M4 | Frame layer | FrameHeader, TOC, role-aware sections | ✅ structural parser done |
 | M5 | **Modular mode** | lossless `.jxl` → pixels | 🟢 **all 17 lossless fixtures byte-exact vs djxl** — single + multi-group, RCT + Palette, gray/RGB/RGBA/8/16-bit. Float, Squeeze, progressive remain |
-| M6 | VarDCT mode | lossy photographic `.jxl` → pixels | 🟡 **DC image + AC metadata done** — XYB DC matches djxl per-block means <1% MAD; AC strategy/quant/EPF/CfL fields tile exactly (incl. varied DCT sizes). AC coeff entropy decode, IDCT, dequant matrices remain |
+| M6 | VarDCT mode | lossy photographic `.jxl` → pixels | 🟡 **DC + AC metadata + AC global done** — XYB DC <1% MAD vs djxl; AC strategy/quant/CfL tile exactly; coeff orders + AC histograms decode (ANS final-state verified). AC coeff decode, dequant matrices, IDCT remain |
 | M7 | Restoration | Gaborish + EPF + upsampling | |
 | M8 | Color pipeline | XYB→sRGB, ICC, alpha, 8/16-bit/float output | |
 | M9 | Advanced | patches, splines, noise, animation, extra channels, JPEG recon | |
@@ -142,6 +142,20 @@ also a bit-exactness proof of the DC stream. A dedicated fixture
 identity, …): 578 varblocks tile its 1024 blocks exactly. The remaining AC work
 is the coefficient entropy decode, the dequant weight matrices, and the inverse
 DCTs.
+
+**M6 status (AC global).** `ProcessACGlobal` is decoded
+(`decodeVarDCTACGlobalForFrame`): the per-pass coefficient orders and AC
+histograms. Each AC strategy's coefficients are read in a "natural" (zigzag-like)
+frequency order, optionally Lehmer-permuted; `decodeVarDCTACGlobal` reproduces
+`DecodeCoeffOrders` (natural-order generation, `ReadPermutation`,
+`DecodeLehmerCode`, the order-bucket map) and the histogram decode. The
+coefficient-order ANS stream carries its own final-state check, so a clean
+decode is bit-exact: it passes on every fixture, including
+`256x256_varblocks_lossy` whose custom orders span DCT8/16/32/16×8/32×8 (sizes
+64/256/1024/128/512). Note: the `kOrderEnc` field encoding is
+`U32Enc(Val(0x5F), Val(0x13), Val(0), Bits(13))` (an earlier preflight constant
+was wrong). Dequant weight-matrix computation (`EnsureComputed`) is deferred to
+the coefficient-dequant step.
 
 **M4 status (partial).** The first-frame structural layer now consumes the full
 codestream header prefix (`SizeHeader`, `ImageMetadata`, `CustomTransformData`,
