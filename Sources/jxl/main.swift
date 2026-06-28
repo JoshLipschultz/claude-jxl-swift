@@ -35,6 +35,7 @@ func usage() -> Never {
           jxl vardct-dc <file.jxl> [dump]  Decode VarDCT XYB DC image (lossy)
           jxl vardct-acmeta <file.jxl>     Decode VarDCT AC metadata (strategy/quant)
           jxl vardct-acglobal <file.jxl>   Decode VarDCT AC global (coeff orders)
+          jxl vardct-ac <file.jxl>         Decode VarDCT AC coefficients (entropy)
 
         """
     FileHandle.standardError.write(Data(text.utf8))
@@ -166,6 +167,21 @@ do {
                 .map { "b\($0.offset / 3)c\($0.offset % 3)(\($0.element.count))" }
             print("  pass \(p): orders \(usedBuckets.joined(separator: " "))")
         }
+
+    case "vardct-ac":
+        let coeffs = try decodeVarDCTCoefficients(from: bytes)
+        var byStrategy = [Int: Int]()
+        for b in coeffs.blocks { byStrategy[Int(b.strategy), default: 0] += 1 }
+        print("VarDCT AC coefficients: \(coeffs.blocks.count) varblocks decoded")
+        print("  total nonzeros: \(coeffs.totalNonZeros)")
+        let names = [
+            "DCT8", "ID", "DCT2", "DCT4", "DCT16", "DCT32", "DCT16x8", "DCT8x16", "DCT32x8",
+            "DCT8x32", "DCT32x16", "DCT16x32", "DCT4x8", "DCT8x4", "AFV0", "AFV1", "AFV2", "AFV3",
+            "DCT64", "DCT64x32", "DCT32x64", "DCT128", "DCT128x64", "DCT64x128", "DCT256",
+            "DCT256x128", "DCT128x256",
+        ]
+        let bs = byStrategy.sorted { $0.key < $1.key }.map { "\(names[$0.key])=\($0.value)" }
+        print("  by strategy: \(bs.joined(separator: " "))")
 
     case "vardct-dc":
         let dc = try decodeVarDCTDCImage(from: bytes)

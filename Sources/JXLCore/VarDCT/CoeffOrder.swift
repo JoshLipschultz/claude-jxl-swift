@@ -20,7 +20,7 @@ private let kPermutationContexts = 8
 private let kDCTBlockSize = 64
 
 // AcStrategyType -> coefficient-order bucket (ac_strategy.cc kStrategyOrder).
-private let kStrategyOrder: [Int] = [
+let kStrategyOrder: [Int] = [
     0, 1, 1, 1, 2, 3, 4, 4, 5, 5, 6, 6, 1, 1, 1, 1, 1, 1, 7, 8, 8, 9, 10, 10, 11, 12, 12,
 ]
 

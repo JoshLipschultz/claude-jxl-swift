@@ -96,7 +96,7 @@ Sources/JXLCore/
 | M3 | Entropy coding | prefix + ANS + LZ77 + context modeling | ✅ done — validated on real codestream data via the MA tree |
 | M4 | Frame layer | FrameHeader, TOC, role-aware sections | ✅ structural parser done |
 | M5 | **Modular mode** | lossless `.jxl` → pixels | 🟢 **all 17 lossless fixtures byte-exact vs djxl** — single + multi-group, RCT + Palette, gray/RGB/RGBA/8/16-bit. Float, Squeeze, progressive remain |
-| M6 | VarDCT mode | lossy photographic `.jxl` → pixels | 🟡 **DC + AC metadata + AC global done** — XYB DC <1% MAD vs djxl; AC strategy/quant/CfL tile exactly; coeff orders + AC histograms decode (ANS final-state verified). AC coeff decode, dequant matrices, IDCT remain |
+| M6 | VarDCT mode | lossy photographic `.jxl` → pixels | 🟡 **entropy decode complete** — DC <1% MAD vs djxl; AC metadata tiles exactly; coeff orders, AC histograms, and all AC coefficients decode (ANS final-state verified, incl. mixed block sizes). Remaining is arithmetic: dequant matrices, IDCT, CfL, XYB→RGB |
 | M7 | Restoration | Gaborish + EPF + upsampling | |
 | M8 | Color pipeline | XYB→sRGB, ICC, alpha, 8/16-bit/float output | |
 | M9 | Advanced | patches, splines, noise, animation, extra channels, JPEG recon | |
@@ -156,6 +156,21 @@ decode is bit-exact: it passes on every fixture, including
 `U32Enc(Val(0x5F), Val(0x13), Val(0), Bits(13))` (an earlier preflight constant
 was wrong). Dequant weight-matrix computation (`EnsureComputed`) is deferred to
 the coefficient-dequant step.
+
+**M6 status (AC coefficients).** The per-group AC coefficient entropy decode is
+implemented (`decodeVarDCTCoefficients`, libjxl `DecodeGroupImpl` +
+`DecodeACVarBlock`): for each varblock, for each channel in Y/X/B order, it reads
+the non-zero count (predicted from neighbouring blocks) then the coefficients in
+the block's frequency scan, using the block-context map, non-zero and
+zero-density contexts. This is the last entropy-coded stage of VarDCT — every
+group ends with an ANS final-state check, and it **passes on all fixtures**
+(64×48 … 640×480 and the mixed-block-size `256x256_varblocks`, ~388k
+coefficients in the largest). Because a single wrong entropy context desyncs the
+ANS state, this is a complete bit-exact validation of the AC entropy decode. The
+output is per-varblock quantized coefficient buffers; what remains is purely
+arithmetic with no further bitstream reads: the dequant weight matrices, the
+inverse DCTs, chroma-from-luma, DC insertion, restoration filters (M7), and
+XYB→sRGB (M8).
 
 **M4 status (partial).** The first-frame structural layer now consumes the full
 codestream header prefix (`SizeHeader`, `ImageMetadata`, `CustomTransformData`,

@@ -63,6 +63,7 @@ struct TestRunner {
         vardctDC()
         vardctACMeta()
         vardctACGlobal()
+        vardctAC()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -571,6 +572,42 @@ struct TestRunner {
         }
         FileHandle.standardError.write(
             Data("  [vardct-acglobal] AC global decoded=\(decoded)\n".utf8))
+    }
+
+    /// Decodes all AC coefficients of the lossy fixtures. Each group ends with
+    /// an ANS final-state check, so a clean decode across hundreds of thousands
+    /// of coefficients is a complete bit-exact validation of the entropy decode.
+    static func vardctAC() {
+        let dir = fixturesDir()
+        var decoded = 0
+        for (name, varblocks) in [
+            ("64x48_lossy.jxl", 48), ("100x100_lossy.jxl", 169), ("513x257_lossy.jxl", 2145),
+            ("640x480_lossy.jxl", 4800),
+        ] {
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent(name)),
+                let coeffs = try? decodeVarDCTCoefficients(from: [UInt8](data))
+            else {
+                check(false, "\(name) decodeVarDCTCoefficients")
+                continue
+            }
+            check(coeffs.blocks.count == varblocks, "\(name) varblock count")
+            check(coeffs.totalNonZeros > 0, "\(name) has nonzero AC coefficients")
+            decoded += 1
+        }
+        // Mixed block sizes also pass the ANS final-state check.
+        if let data = try? Data(
+            contentsOf: dir.appendingPathComponent("256x256_varblocks_lossy.jxl")),
+            let coeffs = try? decodeVarDCTCoefficients(from: [UInt8](data))
+        {
+            check(coeffs.blocks.count == 578, "varblocks AC varblock count")
+            let strategies = Set(coeffs.blocks.map { $0.strategy })
+            check(strategies.count >= 5, "varblocks AC mixed strategies (\(strategies.count))")
+            decoded += 1
+        } else {
+            check(false, "256x256_varblocks_lossy decodeVarDCTCoefficients")
+        }
+        FileHandle.standardError.write(
+            Data("  [vardct-ac] AC coefficient sets decoded=\(decoded) (ANS-verified)\n".utf8))
     }
 
     // MARK: - Frame layer (M4)
