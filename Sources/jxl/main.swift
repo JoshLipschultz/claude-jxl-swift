@@ -33,6 +33,7 @@ func usage() -> Never {
           jxl decode <file.jxl> <out.pnm>  Decode lossless image to PGM/PPM
           jxl vardct <file.jxl>            Preflight VarDCT global metadata
           jxl vardct-dc <file.jxl> [dump]  Decode VarDCT XYB DC image (lossy)
+          jxl vardct-acmeta <file.jxl>     Decode VarDCT AC metadata (strategy/quant)
 
         """
     FileHandle.standardError.write(Data(text.utf8))
@@ -131,6 +132,29 @@ do {
         } else {
             print("AC global: coalesced in single section (not preflighted yet)")
         }
+
+    case "vardct-acmeta":
+        let m = try decodeVarDCTACMetadata(from: bytes)
+        var hist = [Int](repeating: 0, count: 27)
+        var covered = 0
+        for i in 0..<(m.widthBlocks * m.heightBlocks) {
+            if m.isFirstBlock[i] { hist[Int(m.strategy[i])] += 1 }
+        }
+        for q in m.quantField where q > 0 { covered += 1 }
+        let names = [
+            "DCT8", "ID", "DCT2", "DCT4", "DCT16", "DCT32", "DCT16x8", "DCT8x16", "DCT32x8",
+            "DCT8x32", "DCT32x16", "DCT16x32", "DCT4x8", "DCT8x4", "AFV0", "AFV1", "AFV2", "AFV3",
+            "DCT64", "DCT64x32", "DCT32x64", "DCT128", "DCT128x64", "DCT64x128", "DCT256",
+            "DCT256x128", "DCT128x256",
+        ]
+        print("VarDCT AC metadata: \(m.widthBlocks) x \(m.heightBlocks) blocks, \(m.varblockCount) varblocks")
+        let used = hist.enumerated().filter { $0.element > 0 }
+            .map { "\(names[$0.offset])=\($0.element)" }
+        print("  strategies: \(used.joined(separator: " "))")
+        var qlo = Int32.max, qhi = Int32.min
+        for q in m.quantField { qlo = min(qlo, q); qhi = max(qhi, q) }
+        print("  quant field: [\(qlo), \(qhi)] over \(covered)/\(m.widthBlocks * m.heightBlocks) blocks")
+        print("  color tiles: \(m.colorTileWidth) x \(m.colorTileHeight)")
 
     case "vardct-dc":
         let dc = try decodeVarDCTDCImage(from: bytes)

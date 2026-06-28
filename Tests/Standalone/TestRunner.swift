@@ -61,6 +61,7 @@ struct TestRunner {
         modular()
         decodeAPI()
         vardctDC()
+        vardctACMeta()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -481,6 +482,56 @@ struct TestRunner {
         check(multiGroupSeen, "multi-group VarDCT DC decoded")
         FileHandle.standardError.write(
             Data("  [vardct-dc] XYB DC images decoded=\(decoded)\n".utf8))
+    }
+
+    /// Decodes the AC metadata (strategy field, quant field, EPF, CfL maps) of
+    /// the lossy fixtures. The decoder enforces exact varblock tiling (num ==
+    /// count, no overlap/overflow), so a clean decode is itself bit-exact proof
+    /// of both the AcMetadata and the VarDCTDC stream that precedes it.
+    static func vardctACMeta() {
+        let dir = fixturesDir()
+        var decoded = 0
+        for name in [
+            "17x1_lossy.jxl", "64x48_lossy.jxl", "100x100_lossy.jxl", "513x257_lossy.jxl",
+            "640x480_lossy.jxl",
+        ] {
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent(name)),
+                let m = try? decodeVarDCTACMetadata(from: [UInt8](data))
+            else {
+                check(false, "\(name) decodeVarDCTACMetadata")
+                continue
+            }
+            // Single-block strategies: every block is its own varblock.
+            check(
+                m.varblockCount == m.widthBlocks * m.heightBlocks,
+                "\(name) all-DCT8 tiling: varblocks == blocks")
+            let firsts = m.isFirstBlock.lazy.filter { $0 }.count
+            check(firsts == m.varblockCount, "\(name) first-block count == varblockCount")
+            decoded += 1
+        }
+
+        // The varblocks fixture exercises multiple DCT sizes (DCT8/16/32, AFV,
+        // …), so varblocks cover multiple blocks each and tile exactly.
+        if let data = try? Data(
+            contentsOf: dir.appendingPathComponent("256x256_varblocks_lossy.jxl")),
+            let m = try? decodeVarDCTACMetadata(from: [UInt8](data))
+        {
+            let total = m.widthBlocks * m.heightBlocks
+            check(m.varblockCount < total, "varblocks fixture has multi-block strategies")
+            let distinct = Set(
+                (0..<total).filter { m.isFirstBlock[$0] }.map { m.strategy[$0] })
+            check(distinct.count >= 5, "varblocks fixture uses varied strategies (\(distinct.count))")
+            // Exact tiling: every block must be covered (quantField set on first
+            // blocks; covered blocks share the varblock). Recompute coverage.
+            var covered = 0
+            for i in 0..<total where m.quantField[i] > 0 { covered += 1 }
+            check(covered == m.varblockCount, "varblocks fixture quant set per varblock")
+            decoded += 1
+        } else {
+            check(false, "256x256_varblocks_lossy decodeVarDCTACMetadata")
+        }
+        FileHandle.standardError.write(
+            Data("  [vardct-acmeta] AC metadata decoded=\(decoded) (incl. varied block sizes)\n".utf8))
     }
 
     // MARK: - Frame layer (M4)

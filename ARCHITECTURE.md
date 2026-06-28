@@ -96,7 +96,7 @@ Sources/JXLCore/
 | M3 | Entropy coding | prefix + ANS + LZ77 + context modeling | ✅ done — validated on real codestream data via the MA tree |
 | M4 | Frame layer | FrameHeader, TOC, role-aware sections | ✅ structural parser done |
 | M5 | **Modular mode** | lossless `.jxl` → pixels | 🟢 **all 17 lossless fixtures byte-exact vs djxl** — single + multi-group, RCT + Palette, gray/RGB/RGBA/8/16-bit. Float, Squeeze, progressive remain |
-| M6 | VarDCT mode | lossy photographic `.jxl` → pixels | 🟡 **DC image decode done** — dequantized XYB DC matches djxl per-block means <1% MAD (all lossy fixtures, single + multi-group). AC coeffs, IDCT, CfL remain |
+| M6 | VarDCT mode | lossy photographic `.jxl` → pixels | 🟡 **DC image + AC metadata done** — XYB DC matches djxl per-block means <1% MAD; AC strategy/quant/EPF/CfL fields tile exactly (incl. varied DCT sizes). AC coeff entropy decode, IDCT, dequant matrices remain |
 | M7 | Restoration | Gaborish + EPF + upsampling | |
 | M8 | Color pipeline | XYB→sRGB, ICC, alpha, 8/16-bit/float output | |
 | M9 | Advanced | patches, splines, noise, animation, extra channels, JPEG recon | |
@@ -129,6 +129,19 @@ pixels while libjxl's DC includes block-edge padding.) Restricted to 4:4:4,
 single-pass, default/library quant tables, flags == 0; the next steps are the AC
 coefficient decode, the per-block inverse DCT, chroma-from-luma, restoration
 filters (M7), and XYB→sRGB color (M8) to reach full lossy pixels.
+
+**M6 status (AC metadata).** The per-DC-group `AcMetadata` stream is decoded
+(`decodeVarDCTACMetadata`, libjxl `DecodeAcMetadata`): the AC strategy field
+(which variable-size DCT — 2×2…256×256, plus AFV/identity — tiles each block),
+the raw quant field, EPF sharpness, and the per-color-tile chroma-from-luma
+maps. It is validated by *exact tiling*: every block is covered exactly once and
+`num == count` varblocks, which — because a DC group is one bounded TOC section
+holding `VarDCTDC` then `AcMetadata` behind a single ANS final-state check — is
+also a bit-exactness proof of the DC stream. A dedicated fixture
+(`256x256_varblocks_lossy.jxl`) exercises mixed block sizes (DCT8/16/32, AFV,
+identity, …): 578 varblocks tile its 1024 blocks exactly. The remaining AC work
+is the coefficient entropy decode, the dequant weight matrices, and the inverse
+DCTs.
 
 **M4 status (partial).** The first-frame structural layer now consumes the full
 codestream header prefix (`SizeHeader`, `ImageMetadata`, `CustomTransformData`,
