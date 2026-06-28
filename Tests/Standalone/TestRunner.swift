@@ -60,6 +60,7 @@ struct TestRunner {
         frame()
         modular()
         decodeAPI()
+        vardctDC()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -446,6 +447,40 @@ struct TestRunner {
         FileHandle.standardError.write(
             Data("  [decodeImage] byte-exact lossless images=\(verified) (+ float)\n".utf8))
         check(verified >= 17, "decodeImage byte-exact for >=17 lossless fixtures (single + multi group)")
+    }
+
+    // MARK: - VarDCT DC image (M6)
+
+    /// Decodes the dequantized XYB DC of every lossy fixture and checks it is
+    /// finite and in a physically plausible range. The rigorous oracle check
+    /// (DC vs djxl per-block XYB means, <1% MAD) lives in Scripts/cmp_dc.py.
+    static func vardctDC() {
+        let dir = fixturesDir()
+        var decoded = 0
+        var multiGroupSeen = false
+        for (name, blocks) in [
+            ("17x1_lossy.jxl", 3), ("64x48_lossy.jxl", 48), ("100x100_lossy.jxl", 169),
+            ("513x257_lossy.jxl", 65 * 33), ("640x480_lossy.jxl", 80 * 60),
+        ] {
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent(name)),
+                let dc = try? decodeVarDCTDCImage(from: [UInt8](data))
+            else {
+                check(false, "\(name) decodeVarDCTDCImage")
+                continue
+            }
+            check(dc.widthBlocks * dc.heightBlocks == blocks, "\(name) DC block count")
+            let finite = dc.x.allSatisfy(\.isFinite) && dc.y.allSatisfy(\.isFinite)
+                && dc.b.allSatisfy(\.isFinite)
+            check(finite, "\(name) DC values finite")
+            // Luma DC mean of these photographic fixtures sits near 0.4–0.55 XYB.
+            let meanY = dc.y.reduce(0, +) / Float(dc.y.count)
+            check(meanY > 0.15 && meanY < 0.65, "\(name) DC luma mean plausible (\(meanY))")
+            if name == "640x480_lossy.jxl" { multiGroupSeen = true }  // 6 AC groups
+            decoded += 1
+        }
+        check(multiGroupSeen, "multi-group VarDCT DC decoded")
+        FileHandle.standardError.write(
+            Data("  [vardct-dc] XYB DC images decoded=\(decoded)\n".utf8))
     }
 
     // MARK: - Frame layer (M4)

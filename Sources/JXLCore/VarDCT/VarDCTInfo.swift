@@ -99,7 +99,20 @@ public struct JXLVarDCTInfo {
     public let acGlobal: VarDCTACGlobalInfo?
 }
 
-func readVarDCTDCGlobalInfo(_ br: BitReader) throws -> VarDCTDCGlobalInfo {
+/// The parsed DC-global metadata together with the decoded global modular tree
+/// and entropy code, which the DC-image decode needs to continue reading.
+struct VarDCTDCGlobalDecoded {
+    let info: VarDCTDCGlobalInfo
+    let tree: [MATreeNode]?
+    let code: ANSCode?
+    let ctxMap: [UInt8]?
+}
+
+/// Reads `ProcessDCGlobal` for a VarDCT frame (flags == 0: no patches/splines/
+/// noise), capturing the global modular tree/code so the DC groups can use it.
+/// Mirrors `DequantMatrices::DecodeDC` + `DecodeGlobalDCInfo` +
+/// `ModularFrameDecoder::DecodeGlobalInfo` (the empty-global-image path).
+func readVarDCTDCGlobal(_ br: BitReader) throws -> VarDCTDCGlobalDecoded {
     let dcQuantIsDefault = br.read(1) == 1
     var dcQuant: [Float] = []
     if !dcQuantIsDefault {
@@ -118,15 +131,25 @@ func readVarDCTDCGlobalInfo(_ br: BitReader) throws -> VarDCTDCGlobalInfo {
     let colorCorrelation = readColorCorrelationDC(br)
     let modularGlobalHasTree = br.read(1) == 1
     var modularGlobalTreeNodeCount = 0
+    var tree: [MATreeNode]? = nil
+    var code: ANSCode? = nil
+    var ctxMap: [UInt8]? = nil
     if modularGlobalHasTree {
-        guard let tree = decodeMATree(br, treeSizeLimit: 1 << 22),
-            decodeHistograms(br, numContexts: (tree.count + 1) / 2, disallowLZ77: false) != nil
+        guard let t = decodeMATree(br, treeSizeLimit: 1 << 22),
+            let (c, m) = decodeHistograms(
+                br, numContexts: (t.count + 1) / 2, disallowLZ77: false)
         else { throw JXLError.malformed("could not read VarDCT global modular tree") }
-        modularGlobalTreeNodeCount = tree.count
+        tree = t
+        code = c
+        ctxMap = m
+        modularGlobalTreeNodeCount = t.count
     }
+    // For a VarDCT frame with no extra channels the global modular image has
+    // zero channels, so ModularDecode returns immediately and reads no group
+    // header here (libjxl `if (image.channel.empty()) return true;`).
 
     try br.ensureInBounds("VarDCT DC global")
-    return VarDCTDCGlobalInfo(
+    let info = VarDCTDCGlobalInfo(
         dcQuantIsDefault: dcQuantIsDefault,
         dcQuant: dcQuant,
         quantizer: quantizer,
@@ -134,6 +157,11 @@ func readVarDCTDCGlobalInfo(_ br: BitReader) throws -> VarDCTDCGlobalInfo {
         colorCorrelation: colorCorrelation,
         modularGlobalHasTree: modularGlobalHasTree,
         modularGlobalTreeNodeCount: modularGlobalTreeNodeCount)
+    return VarDCTDCGlobalDecoded(info: info, tree: tree, code: code, ctxMap: ctxMap)
+}
+
+func readVarDCTDCGlobalInfo(_ br: BitReader) throws -> VarDCTDCGlobalInfo {
+    try readVarDCTDCGlobal(br).info
 }
 
 func readVarDCTACGlobalInfo(

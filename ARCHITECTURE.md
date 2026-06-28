@@ -96,7 +96,7 @@ Sources/JXLCore/
 | M3 | Entropy coding | prefix + ANS + LZ77 + context modeling | ✅ done — validated on real codestream data via the MA tree |
 | M4 | Frame layer | FrameHeader, TOC, role-aware sections | ✅ structural parser done |
 | M5 | **Modular mode** | lossless `.jxl` → pixels | 🟢 **all 17 lossless fixtures byte-exact vs djxl** — single + multi-group, RCT + Palette, gray/RGB/RGBA/8/16-bit. Float, Squeeze, progressive remain |
-| M6 | VarDCT mode | lossy photographic `.jxl` → pixels | |
+| M6 | VarDCT mode | lossy photographic `.jxl` → pixels | 🟡 **DC image decode done** — dequantized XYB DC matches djxl per-block means <1% MAD (all lossy fixtures, single + multi-group). AC coeffs, IDCT, CfL remain |
 | M7 | Restoration | Gaborish + EPF + upsampling | |
 | M8 | Color pipeline | XYB→sRGB, ICC, alpha, 8/16-bit/float output | |
 | M9 | Advanced | patches, splines, noise, animation, extra channels, JPEG recon | |
@@ -115,6 +115,20 @@ its distribution exactly across all 4096 slots** (the trickiest component),
 flat-histogram/population-count math, inverse-MTF, and simple/flat histogram
 decode. End-to-end validation against real ANS-coded bytes arrives at M4, the
 first point a frame's entropy-coded data can actually be reached.
+
+**M6 status (DC image).** The first VarDCT pixel stage is implemented and
+oracle-validated: `decodeVarDCTDCImage` reproduces libjxl's `ProcessDCGlobal` +
+`DecodeVarDCTDC` + `DequantDC` + `AdaptiveDCSmoothing` to produce the
+dequantized XYB DC planes (one sample per 8×8 block). Because each block's DC
+equals that block's XYB mean, validation decodes every lossy fixture with `djxl`,
+converts its sRGB output back to XYB, averages each 8×8 block, and compares: the
+per-block mean-absolute-difference is <1% of the plane range (~0.0006–0.004 on
+Y/B, ~0.0001 on X) across grayscale/RGB and single/multi-group frames — see
+`Scripts/cmp_dc.py`. (Sub-8px images differ only because the check averages real
+pixels while libjxl's DC includes block-edge padding.) Restricted to 4:4:4,
+single-pass, default/library quant tables, flags == 0; the next steps are the AC
+coefficient decode, the per-block inverse DCT, chroma-from-luma, restoration
+filters (M7), and XYB→sRGB color (M8) to reach full lossy pixels.
 
 **M4 status (partial).** The first-frame structural layer now consumes the full
 codestream header prefix (`SizeHeader`, `ImageMetadata`, `CustomTransformData`,

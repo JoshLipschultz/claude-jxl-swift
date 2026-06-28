@@ -32,6 +32,7 @@ func usage() -> Never {
           jxl boxes  <file.jxl>            List ISOBMFF container boxes
           jxl decode <file.jxl> <out.pnm>  Decode lossless image to PGM/PPM
           jxl vardct <file.jxl>            Preflight VarDCT global metadata
+          jxl vardct-dc <file.jxl> [dump]  Decode VarDCT XYB DC image (lossy)
 
         """
     FileHandle.standardError.write(Data(text.utf8))
@@ -129,6 +130,38 @@ do {
             )
         } else {
             print("AC global: coalesced in single section (not preflighted yet)")
+        }
+
+    case "vardct-dc":
+        let dc = try decodeVarDCTDCImage(from: bytes)
+        func stats(_ p: [Float]) -> String {
+            var lo = Float.infinity, hi = -Float.infinity, sum: Float = 0
+            var finite = true
+            for v in p {
+                if !v.isFinite { finite = false }
+                lo = min(lo, v); hi = max(hi, v); sum += v
+            }
+            let mean = sum / Float(p.count)
+            return String(
+                format: "[%.5f, %.5f] mean=%.5f%@", lo, hi, mean, finite ? "" : " (NON-FINITE!)")
+        }
+        print("VarDCT DC image: \(dc.widthBlocks) x \(dc.heightBlocks) blocks")
+        print("  X \(stats(dc.x))")
+        print("  Y \(stats(dc.y))")
+        print("  B \(stats(dc.b))")
+        if args.count >= 4 {
+            // Raw dump: "w h\n" header then w*h*3 little-endian float32 (x,y,b).
+            var out = [UInt8]("\(dc.widthBlocks) \(dc.heightBlocks)\n".utf8)
+            func emit(_ f: Float) {
+                let bits = f.bitPattern
+                out.append(UInt8(bits & 0xFF)); out.append(UInt8((bits >> 8) & 0xFF))
+                out.append(UInt8((bits >> 16) & 0xFF)); out.append(UInt8((bits >> 24) & 0xFF))
+            }
+            for i in 0..<(dc.widthBlocks * dc.heightBlocks) {
+                emit(dc.x[i]); emit(dc.y[i]); emit(dc.b[i])
+            }
+            try Data(out).write(to: URL(fileURLWithPath: args[3]))
+            print("  wrote DC dump -> \(args[3])")
         }
 
     default:
