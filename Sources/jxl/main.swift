@@ -36,6 +36,7 @@ func usage() -> Never {
           jxl vardct-acmeta <file.jxl>     Decode VarDCT AC metadata (strategy/quant)
           jxl vardct-acglobal <file.jxl>   Decode VarDCT AC global (coeff orders)
           jxl vardct-ac <file.jxl>         Decode VarDCT AC coefficients (entropy)
+          jxl vardct-decode <f.jxl> <ppm>  Reconstruct DCT8 lossy image to sRGB PPM
 
         """
     FileHandle.standardError.write(Data(text.utf8))
@@ -182,6 +183,14 @@ do {
         ]
         let bs = byStrategy.sorted { $0.key < $1.key }.map { "\(names[$0.key])=\($0.value)" }
         print("  by strategy: \(bs.joined(separator: " "))")
+
+    case "vardct-decode":
+        guard args.count >= 4 else { usage() }
+        let (w, h, rgb) = try reconstructVarDCTImage(from: bytes)
+        var out = [UInt8]("P6\n\(w) \(h)\n255\n".utf8)
+        out.append(contentsOf: rgb)
+        try Data(out).write(to: URL(fileURLWithPath: args[3]))
+        print("reconstructed \(w) x \(h) -> \(args[3])")
 
     case "vardct-dc":
         let dc = try decodeVarDCTDCImage(from: bytes)

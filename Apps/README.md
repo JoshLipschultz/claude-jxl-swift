@@ -1,14 +1,41 @@
 # macOS app & Quick Look extension (Milestone 10)
 
-This directory holds the macOS-integration sources. They are **not** built by the
-SwiftPM scripts — a Quick Look appex needs **full Xcode** for packaging and
-codesigning. The core decoder (`Sources/JXLCore`) stays toolchain-light on
-purpose so it builds and tests without Xcode.
+This directory holds the macOS-integration sources. The core decoder
+(`Sources/JXLCore`) stays toolchain-light on purpose so it builds and tests
+without Xcode.
+
+## `JXLViewer` — standalone viewer app (no Xcode needed)
+
+[`JXLViewer/`](JXLViewer/) is a small AppKit application that opens a `.jxl`
+file and displays the decoded pixels. It's primarily a **testing harness** for
+the decoder: point it at a fixture and eyeball the result. It links `JXLCore`
+and is packaged into a `.app` bundle by `swiftc` directly, so it builds with the
+Command Line Tools alone (same approach as `Scripts/build.sh`).
+
+```
+sh Scripts/build-viewer.sh              # -> .build/viewer/JXLViewer.app
+sh Scripts/build-viewer.sh --run FILE   # build and launch, opening FILE
+```
+
+Features: File ▸ Open (⌘O), drag-and-drop, a command-line path argument, a
+checkerboard behind transparent images, and a status bar showing dimensions /
+channels / bit depth. Decoding runs off the main thread. Lossless Modular images
+render today; lossy (VarDCT) files show the decoder's "unsupported" error in the
+status bar until that path lands. Conversion to a `CGImage` lives in
+[`JXLViewer/JXLImageConverter.swift`](JXLViewer/JXLImageConverter.swift), the one
+spot that knows the plane layout — reuse it from the Quick Look provider below
+once you want real thumbnails.
+
+## Quick Look extension (needs full Xcode)
+
+A Quick Look appex needs **full Xcode** for packaging and codesigning, so the
+files below are added to an Xcode project rather than built by the scripts.
 
 ## When full Xcode is installed
 
 1. Create an Xcode project/workspace with:
-   - a host **macOS app** target (`JXLViewer`), and
+   - a host **macOS app** target (the standalone `JXLViewer` above can serve as
+     this, or add a minimal host), and
    - a **Quick Look Extension** target (`JXLQuickLook`).
 2. Add the local SwiftPM package (this repo) as a package dependency and link the
    `JXLCore` library product into both targets.

@@ -96,7 +96,7 @@ Sources/JXLCore/
 | M3 | Entropy coding | prefix + ANS + LZ77 + context modeling | ✅ done — validated on real codestream data via the MA tree |
 | M4 | Frame layer | FrameHeader, TOC, role-aware sections | ✅ structural parser done |
 | M5 | **Modular mode** | lossless `.jxl` → pixels | 🟢 **all 17 lossless fixtures byte-exact vs djxl** — single + multi-group, RCT + Palette, gray/RGB/RGBA/8/16-bit. Float, Squeeze, progressive remain |
-| M6 | VarDCT mode | lossy photographic `.jxl` → pixels | 🟡 **entropy decode complete** — DC <1% MAD vs djxl; AC metadata tiles exactly; coeff orders, AC histograms, and all AC coefficients decode (ANS final-state verified, incl. mixed block sizes). Remaining is arithmetic: dequant matrices, IDCT, CfL, XYB→RGB |
+| M6 | VarDCT mode | lossy photographic `.jxl` → pixels | 🟢 **DCT8 lossy → pixels at ~54 dB vs djxl** — full pipeline (entropy → dequant → IDCT → CfL → XYB→sRGB); residual is only the not-yet-applied Gaborish/EPF (M7). Larger DCT sizes (16/32/AFV) remain |
 | M7 | Restoration | Gaborish + EPF + upsampling | |
 | M8 | Color pipeline | XYB→sRGB, ICC, alpha, 8/16-bit/float output | |
 | M9 | Advanced | patches, splines, noise, animation, extra channels, JPEG recon | |
@@ -171,6 +171,19 @@ output is per-varblock quantized coefficient buffers; what remains is purely
 arithmetic with no further bitstream reads: the dequant weight matrices, the
 inverse DCTs, chroma-from-luma, DC insertion, restoration filters (M7), and
 XYB→sRGB (M8).
+
+**M6 status (DCT8 pixels).** The full VarDCT reconstruction runs for DCT8
+(plain 8×8) blocks (`reconstructVarDCTImage`): AC dequant with chroma-from-luma
+(the library DCT8 quant weights via `GetQuantWeights`, `AdjustQuantBias`), DC
+insertion, a direct separable inverse DCT-III, then XYB→linear→sRGB. The IDCT is
+implemented from its definition (not libjxl's recursive butterfly) and pinned by
+DC=mean, then verified against `djxl`: **PSNR ≈ 54 dB, mean|Δ| ≈ 0.23/channel**
+on all DCT8 fixtures (`Scripts/cmp_ppm.py`). Bugs found and fixed along the way:
+the XYB→RGB gamma bias sign (`opsin_biases_cbrt = cbrt(−bias)`), the DCT AC
+scale (`w(u>0)=√2`, from the 2-point butterfly), and a coefficient-block
+transpose relative to the pixel layout. The remaining ≈54 dB gap is exactly the
+Gaborish + edge-preserving filter (M7), which libjxl applies and we don't yet;
+larger transforms (DCT16/32/…, AFV) are the other remaining piece.
 
 **M4 status (partial).** The first-frame structural layer now consumes the full
 codestream header prefix (`SizeHeader`, `ImageMetadata`, `CustomTransformData`,

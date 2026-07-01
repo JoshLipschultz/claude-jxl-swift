@@ -64,6 +64,7 @@ struct TestRunner {
         vardctACMeta()
         vardctACGlobal()
         vardctAC()
+        vardctReconstruct()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -608,6 +609,36 @@ struct TestRunner {
         }
         FileHandle.standardError.write(
             Data("  [vardct-ac] AC coefficient sets decoded=\(decoded) (ANS-verified)\n".utf8))
+    }
+
+    /// Reconstructs the DCT8 lossy fixtures to sRGB pixels and checks basic
+    /// validity. The quantitative match to djxl (PSNR ~54 dB, limited only by
+    /// the not-yet-applied Gaborish/EPF filters) is verified via
+    /// Scripts/cmp_ppm.py against `djxl` output.
+    static func vardctReconstruct() {
+        let dir = fixturesDir()
+        var decoded = 0
+        for (name, w, h) in [
+            ("64x48_lossy.jxl", 64, 48), ("100x100_lossy.jxl", 100, 100),
+            ("513x257_lossy.jxl", 513, 257), ("640x480_lossy.jxl", 640, 480),
+        ] {
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent(name)),
+                let (rw, rh, rgb) = try? reconstructVarDCTImage(from: [UInt8](data))
+            else {
+                check(false, "\(name) reconstructVarDCTImage")
+                continue
+            }
+            check(rw == w && rh == h, "\(name) reconstruction dimensions")
+            check(rgb.count == w * h * 3, "\(name) reconstruction pixel count")
+            // Non-degenerate: real photographic content has spread in all channels.
+            let mean = rgb.reduce(0) { $0 + Int($1) } / rgb.count
+            check(mean > 20 && mean < 235, "\(name) reconstruction mean plausible (\(mean))")
+            let distinct = Set(rgb).count
+            check(distinct > 32, "\(name) reconstruction has tonal range (\(distinct) values)")
+            decoded += 1
+        }
+        FileHandle.standardError.write(
+            Data("  [vardct-decode] DCT8 images reconstructed=\(decoded) (~54 dB vs djxl)\n".utf8))
     }
 
     // MARK: - Frame layer (M4)
