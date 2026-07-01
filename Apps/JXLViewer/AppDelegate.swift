@@ -9,6 +9,7 @@ import Foundation
 import JXLCore
 import UniformTypeIdentifiers
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var window: NSWindow!
@@ -112,9 +113,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let jxlType = UTType(filenameExtension: "jxl") {
             panel.allowedContentTypes = [jxlType]
         }
-        panel.begin { [weak self] response in
-            guard response == .OK, let url = panel.url else { return }
-            self?.open(url)
+        // Synchronous modal keeps this on the main actor and sidesteps the
+        // non-Sendable completion-handler dance under Swift 6 concurrency.
+        if panel.runModal() == .OK, let url = panel.url {
+            open(url)
         }
     }
 
@@ -135,35 +137,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.title = "JXL Viewer — \(url.lastPathComponent)"
         setStatus("Decoding \(url.lastPathComponent)…")
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let result = Self.decode(url)
-            DispatchQueue.main.async {
-                guard let self, generation == self.decodeGeneration else { return }
-                switch result {
-                case .success(let (cg, summary)):
-                    self.canvas.setImage(cg)
-                    self.setStatus(summary)
-                case .failure(let error):
-                    self.canvas.setImage(nil)
-                    self.setStatus("✗ \(url.lastPathComponent): \(error)")
-                }
-            }
+        // The Task body inherits the main actor (this method is main-actor
+        // isolated); the heavy decode runs off-actor in a detached task and its
+        // Sendable result is delivered back here for the UI update.
+        Task { [weak self] in
+            let outcome = await Task.detached(priority: .userInitiated) {
+                Self.decode(url)
+            }.value
+            guard let self, generation == self.decodeGeneration else { return }
+            self.canvas.setImage(outcome.image)
+            self.setStatus(outcome.status)
         }
     }
 
-    private static func decode(_ url: URL) -> Result<(CGImage, String), DecodeFailure> {
+    private nonisolated static func decode(_ url: URL) -> DecodeOutcome {
         do {
             let data = try Data(contentsOf: url)
             let info = try JXL.readInfo(from: data)
             let decoded = try JXL.decodeImage(from: data)
             let cg = try JXLImageConverter.makeCGImage(from: decoded, orientation: info.orientation)
-            return .success((cg, summary(url: url, info: info, image: decoded)))
+            return DecodeOutcome(image: cg, status: summary(url: url, info: info, image: decoded))
         } catch {
-            return .failure(DecodeFailure(underlying: error))
+            let reason = (error as? JXLError).map(String.init(describing:))
+                ?? error.localizedDescription
+            return DecodeOutcome(image: nil, status: "✗ \(url.lastPathComponent): \(reason)")
         }
     }
 
-    private static func summary(url: URL, info: JXLImageInfo, image: JXLDecodedImage) -> String {
+    private nonisolated static func summary(url: URL, info: JXLImageInfo, image: JXLDecodedImage)
+        -> String
+    {
         let color = image.colorChannels == 1 ? "Gray" : "RGB"
         let alpha = image.extraChannels > 0 ? "+A" : ""
         let sample =
@@ -177,11 +180,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-/// Wraps a decode error so we can pretty-print it in the status bar.
-struct DecodeFailure: Error, CustomStringConvertible {
-    let underlying: Error
-    var description: String {
-        if let jxl = underlying as? JXLError { return String(describing: jxl) }
-        return underlying.localizedDescription
-    }
+/// Result of a background decode, handed from the detached task back to the main
+/// actor. `@unchecked Sendable` is sound because `CGImage` is immutable and the
+/// value is only read after crossing the actor boundary.
+private struct DecodeOutcome: @unchecked Sendable {
+    /// The decoded image, or `nil` if decoding failed.
+    let image: CGImage?
+    /// A one-line summary (on success) or an error message (on failure).
+    let status: String
 }

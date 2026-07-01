@@ -8,9 +8,26 @@ without Xcode.
 
 [`JXLViewer/`](JXLViewer/) is a small AppKit application that opens a `.jxl`
 file and displays the decoded pixels. It's primarily a **testing harness** for
-the decoder: point it at a fixture and eyeball the result. It links `JXLCore`
-and is packaged into a `.app` bundle by `swiftc` directly, so it builds with the
-Command Line Tools alone (same approach as `Scripts/build.sh`).
+the decoder: point it at a fixture and eyeball the result. It links `JXLCore` (as a local Swift package).
+
+**Build & run in Xcode (recommended):** the project is generated with
+[XcodeGen](https://github.com/yonaskolb/XcodeGen) from
+[`project.yml`](../project.yml) at the repo root, which references the existing
+`Package.swift`, so `JXLCore` stays the single source of truth (no duplicated
+file lists).
+
+```
+brew install xcodegen        # once
+xcodegen generate            # writes JXLViewer.xcodeproj (git-ignored, disposable)
+open JXLViewer.xcodeproj     # ⌘R to build & run the JXLViewer scheme
+```
+
+Edit `project.yml`, not the generated `.xcodeproj`. Full Xcode is required to
+build the project (the Command Line Tools' SwiftPM build service is broken — see
+the top-level README); the app itself targets macOS 13+.
+
+**Build without Xcode (CLI-only):** `swiftc` packages a `.app` bundle directly,
+matching `Scripts/build.sh`:
 
 ```
 sh Scripts/build-viewer.sh              # -> .build/viewer/JXLViewer.app

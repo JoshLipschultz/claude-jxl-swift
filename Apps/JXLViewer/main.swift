@@ -8,18 +8,23 @@
 import AppKit
 import Foundation
 
-let app = NSApplication.shared
-app.setActivationPolicy(.regular)
+// Program entry runs on the main thread; assert that to the concurrency model so
+// this compiles both under Xcode (top-level main.swift is inferred @MainActor)
+// and under bare `swiftc` (where it is nonisolated).
+MainActor.assumeIsolated {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
 
-let delegate = AppDelegate()
+    let delegate = AppDelegate()
 
-// Pick up a file path argument (skip flags and the executable path itself).
-if let path = CommandLine.arguments.dropFirst().first(where: { !$0.hasPrefix("-") }) {
-    let url = URL(fileURLWithPath: path)
-    if FileManager.default.fileExists(atPath: url.path) {
-        delegate.pendingLaunchURL = url
+    // Pick up a file path argument (skip flags and the executable path itself).
+    if let path = CommandLine.arguments.dropFirst().first(where: { !$0.hasPrefix("-") }) {
+        let url = URL(fileURLWithPath: path)
+        if FileManager.default.fileExists(atPath: url.path) {
+            delegate.pendingLaunchURL = url
+        }
     }
-}
 
-app.delegate = delegate
-app.run()
+    app.delegate = delegate
+    app.run()
+}

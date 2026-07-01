@@ -97,7 +97,7 @@ Sources/JXLCore/
 | M4 | Frame layer | FrameHeader, TOC, role-aware sections | ✅ structural parser done |
 | M5 | **Modular mode** | lossless `.jxl` → pixels | 🟢 **all 17 lossless fixtures byte-exact vs djxl** — single + multi-group, RCT + Palette, gray/RGB/RGBA/8/16-bit. Float, Squeeze, progressive remain |
 | M6 | VarDCT mode | lossy photographic `.jxl` → pixels | 🟢 **DCT8 lossy → pixels at ~54 dB vs djxl** — full pipeline (entropy → dequant → IDCT → CfL → XYB→sRGB); residual is only the not-yet-applied Gaborish/EPF (M7). Larger DCT sizes (16/32/AFV) remain |
-| M7 | Restoration | Gaborish + EPF + upsampling | |
+| M7 | Restoration | Gaborish + EPF + upsampling | 🟡 Gaborish + EPF1 implemented (faithful ports); near-identity on the current DCT8 corpus (encoder leaves them off/weak), so full validation waits on images that use them. Upsampling remains |
 | M8 | Color pipeline | XYB→sRGB, ICC, alpha, 8/16-bit/float output | |
 | M9 | Advanced | patches, splines, noise, animation, extra channels, JPEG recon | |
 | M10 | macOS integration | `CGImage` bridge + Quick Look thumbnail/preview appex | |

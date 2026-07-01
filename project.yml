@@ -1,0 +1,56 @@
+# XcodeGen spec for the JXL Viewer macOS app.
+#
+# Generates JXLViewer.xcodeproj from this file plus the existing Sources/JXLCore
+# Swift package (referenced as a local package, so the decoder stays the single
+# source of truth — no duplicated file lists).
+#
+#   xcodegen generate       # regenerate JXLViewer.xcodeproj
+#   open JXLViewer.xcodeproj # build & run the JXLViewer scheme in Xcode
+#
+# The generated .xcodeproj is disposable; edit this file, not the project.
+
+name: JXLViewer
+
+options:
+  bundleIdPrefix: org.jpeg.jxl
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+
+# The decoder lives in the local Swift package at the repo root.
+packages:
+  JXL:
+    path: .
+
+targets:
+  JXLViewer:
+    type: application
+    platform: macOS
+    sources:
+      - path: Apps/JXLViewer
+        excludes:
+          - Info.plist
+    dependencies:
+      - package: JXL
+        product: JXLCore
+    settings:
+      base:
+        PRODUCT_NAME: JXLViewer
+        PRODUCT_BUNDLE_IDENTIFIER: org.jpeg.jxl.viewer
+        INFOPLIST_FILE: Apps/JXLViewer/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "6.0"
+        # Sign to run locally without requiring a development team.
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        DEVELOPMENT_TEAM: ""
+
+schemes:
+  JXLViewer:
+    build:
+      targets:
+        JXLViewer: all
+    run:
+      config: Debug

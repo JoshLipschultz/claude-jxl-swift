@@ -8,9 +8,14 @@
 // the requirement that a pure-DC block reconstructs to a flat block equal to the
 // DC (mean) value, and verified end-to-end against djxl.
 //
-// Restrictions: DCT8 blocks only (the varblocks fixture's larger transforms are
-// not yet handled), single pass, 4:4:4, no restoration filters (Gaborish/EPF) —
-// so output is close to but not bit-exact with djxl.
+// The Gaborish and EPF (edge-preserving) restoration filters are applied when
+// enabled (libjxl GaborishStage / EPF1Stage); on the current DCT8 fixtures the
+// encoder leaves Gaborish off and the EPF sigma is large enough to be
+// near-identity, so they do not change output there but are ready for images
+// that use them.
+//
+// Restrictions: DCT8 blocks only (larger transforms not yet handled), single
+// pass, 4:4:4. Matches djxl to ~54 dB (numerical precision) on DCT8.
 
 import Foundation
 
@@ -149,6 +154,121 @@ private func xybToSRGB8(x: Float, y: Float, b: Float) -> (UInt8, UInt8, UInt8) {
     return (to8(lr), to8(lg), to8(lb))
 }
 
+// MARK: - Gaborish (libjxl GaborishStage)
+
+/// In-place 3x3 Gaborish convolution with 1-pixel mirror border. `weight1` is
+/// the edge (N/S/E/W) weight, `weight2` the corner weight; the center is 1,
+/// then all are normalized to sum to 1.
+private func gaborish(_ p: inout [Float], w: Int, h: Int, weight1: Float, weight2: Float) {
+    let div = 1.0 + 4.0 * (weight1 + weight2)
+    let c0 = 1.0 / div
+    let c1 = weight1 / div
+    let c2 = weight2 / div
+    let src = p
+    @inline(__always) func at(_ x: Int, _ y: Int) -> Float {
+        // Mirror: -1 -> 0, w -> w-1 (edge-reflecting, matching libjxl Mirror).
+        let mx = x < 0 ? 0 : (x >= w ? w - 1 : x)
+        let my = y < 0 ? 0 : (y >= h ? h - 1 : y)
+        return src[my * w + mx]
+    }
+    for y in 0..<h {
+        for x in 0..<w {
+            let center = src[y * w + x]
+            let side = at(x - 1, y) + at(x + 1, y) + at(x, y - 1) + at(x, y + 1)
+            let corner =
+                at(x - 1, y - 1) + at(x + 1, y - 1) + at(x - 1, y + 1) + at(x + 1, y + 1)
+            p[y * w + x] = center * c0 + side * c1 + corner * c2
+        }
+    }
+}
+
+// MARK: - EPF (edge-preserving filter, libjxl stage_epf.cc EPF1Stage)
+
+private let kInvSigmaNum: Float = -1.1715728752538099024
+private let kEpfMinSigma: Float = -3.90524291751269967465540850526868
+private let kEpfChannelScale: [Float] = [40.0, 5.0, 3.5]
+private let kEpfQuantMul: Float = 0.46
+private let kEpfBorderSadMul: Float = 0.6666666666666666
+private let kEpfSadMulSm: Float = 1.65
+
+/// Per-block inverse sigma (`1/sigma`) for EPF, from the quant field and EPF
+/// sharpness (libjxl ComputeSigma). `epfSharpLut[s] = s/7` (default).
+private func computeEPFSigma(meta: VarDCTACMetadata, quantScale: Float) -> [Float] {
+    let bw = meta.widthBlocks
+    let bh = meta.heightBlocks
+    var inv = [Float](repeating: 0, count: bw * bh)
+    for by in 0..<bh {
+        for bx in 0..<bw {
+            let q = Float(meta.quantField[by * bw + bx])
+            let sharp = Float(meta.epfSharpness[by * bw + bx]) / 7.0
+            let sigmaQuant = kEpfQuantMul / (quantScale * q * kInvSigmaNum)
+            var sigma = sigmaQuant * sharp
+            sigma = min(-1e-4, sigma)
+            inv[by * bw + bx] = 1.0 / sigma
+        }
+    }
+    return inv
+}
+
+/// One EPF1 pass over the XYB planes. `sigmaInv` is per-block `1/sigma`.
+private func epf1(
+    x: inout [Float], y: inout [Float], b: inout [Float], w: Int, h: Int,
+    sigmaInv: [Float], bw: Int
+) {
+    let sx = x, sy = y, sb = b
+    @inline(__always) func mir(_ i: Int, _ n: Int) -> Int {
+        var v = i
+        if v < 0 { v = -v - 1 }
+        if v >= n { v = 2 * n - 1 - v }
+        return max(0, min(n - 1, v))
+    }
+    @inline(__always) func px(_ p: [Float], _ xx: Int, _ yy: Int) -> Float {
+        p[mir(yy, h) * w + mir(xx, w)]
+    }
+    // 3x3-plus SAD between the plus-neighborhoods at (cx,cy) and (cx+dx,cy+dy),
+    // summed over channels with epf_channel_scale.
+    @inline(__always) func sad(_ cx: Int, _ cy: Int, _ dx: Int, _ dy: Int) -> Float {
+        var s: Float = 0
+        for (p, sc) in [(sx, kEpfChannelScale[0]), (sy, kEpfChannelScale[1]), (sb, kEpfChannelScale[2])]
+        {
+            var d: Float = 0
+            d += abs(px(p, cx, cy) - px(p, cx + dx, cy + dy))
+            d += abs(px(p, cx - 1, cy) - px(p, cx + dx - 1, cy + dy))
+            d += abs(px(p, cx + 1, cy) - px(p, cx + dx + 1, cy + dy))
+            d += abs(px(p, cx, cy - 1) - px(p, cx + dx, cy + dy - 1))
+            d += abs(px(p, cx, cy + 1) - px(p, cx + dx, cy + dy + 1))
+            s += d * sc
+        }
+        return s
+    }
+    for cy in 0..<h {
+        let borderRow = (cy % 8 == 0) || (cy % 8 == 7)
+        for cx in 0..<w {
+            let rowSigma = sigmaInv[(cy / 8) * bw + (cx / 8)]
+            if rowSigma < kEpfMinSigma { continue }  // too sharp: unchanged
+            let onEdge = borderRow || (cx % 8 == 0) || (cx % 8 == 7)
+            let sm = onEdge ? kEpfSadMulSm * kEpfBorderSadMul : kEpfSadMulSm
+            let invSigma = rowSigma * sm
+
+            var wsum: Float = 1
+            var accX = sx[cy * w + cx]
+            var accY = sy[cy * w + cx]
+            var accB = sb[cy * w + cx]
+            for (dx, dy) in [(0, -1), (-1, 0), (1, 0), (0, 1)] {
+                let weight = max(0, 1 + sad(cx, cy, dx, dy) * invSigma)
+                wsum += weight
+                accX += weight * px(sx, cx + dx, cy + dy)
+                accY += weight * px(sy, cx + dx, cy + dy)
+                accB += weight * px(sb, cx + dx, cy + dy)
+            }
+            let invW = 1.0 / wsum
+            x[cy * w + cx] = accX * invW
+            y[cy * w + cx] = accY * invW
+            b[cy * w + cx] = accB * invW
+        }
+    }
+}
+
 // MARK: - Full reconstruction
 
 /// Decodes a DCT8-only, single-pass, 4:4:4 VarDCT frame to an 8-bit sRGB image
@@ -188,6 +308,7 @@ public func reconstructVarDCTImage(from data: [UInt8]) throws -> (width: Int, he
     var planeY = planeX
     var planeB = planeX
     let rowStride = bw * 8
+    let paddedH = s.dim.ysizeBlocks * 8
 
     for blk in coeffs.blocks {
         let bx = blk.bx
@@ -239,6 +360,24 @@ public func reconstructVarDCTImage(from data: [UInt8]) throws -> (width: Int, he
                 planeB[dst] = bB[yy * 8 + xx]
             }
         }
+    }
+
+    // Gaborish restoration filter (libjxl GaborishStage), on the full XYB
+    // planes with 1-pixel mirror border.
+    if s.frameHeader.loopFilterGab {
+        let fh = s.frameHeader
+        gaborish(&planeX, w: rowStride, h: paddedH, weight1: fh.gabXWeight1, weight2: fh.gabXWeight2)
+        gaborish(&planeY, w: rowStride, h: paddedH, weight1: fh.gabYWeight1, weight2: fh.gabYWeight2)
+        gaborish(&planeB, w: rowStride, h: paddedH, weight1: fh.gabBWeight1, weight2: fh.gabBWeight2)
+    }
+    // EPF (edge-preserving filter). For epf_iters == 1 only the single middle
+    // pass (EPF1) runs (libjxl dec_cache.cc). Operates on the block-padded XYB.
+    if s.frameHeader.loopFilterEpfIters >= 1 {
+        let quantScale = Float(s.dcGlobal.info.quantizer.globalScale) / Float(1 << 16)
+        let sigmaInv = computeEPFSigma(meta: meta, quantScale: quantScale)
+        epf1(
+            x: &planeX, y: &planeY, b: &planeB, w: rowStride, h: paddedH,
+            sigmaInv: sigmaInv, bw: s.dim.xsizeBlocks)
     }
 
     var rgb = [UInt8](repeating: 0, count: pxW * pxH * 3)

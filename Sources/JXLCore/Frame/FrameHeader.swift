@@ -53,6 +53,16 @@ public struct FrameHeader {
     public var name = ""
     public var chromaChannelMode: [UInt32] = [0, 0, 0]
 
+    // Loop filter (defaults per libjxl LoopFilter::VisitFields).
+    public var loopFilterGab = true
+    public var loopFilterEpfIters: UInt32 = 2
+    public var gabXWeight1: Float = 1.1 * 0.104699568
+    public var gabXWeight2: Float = 1.1 * 0.055680538
+    public var gabYWeight1: Float = 1.1 * 0.104699568
+    public var gabYWeight2: Float = 1.1 * 0.055680538
+    public var gabBWeight1: Float = 1.1 * 0.104699568
+    public var gabBWeight2: Float = 1.1 * 0.055680538
+
     public var isModular: Bool { encoding == .modular }
 
     private var chromaMaxHShift: Int {
@@ -212,16 +222,18 @@ public struct FrameHeader {
         }
     }
 
-    private func parseLoopFilter(_ r: BitReader, isModular: Bool) {
-        if r.readBool() { return }  // all_default
-        let gab = r.readBool()  // default true
-        if gab {
+    private mutating func parseLoopFilter(_ r: BitReader, isModular: Bool) {
+        if r.readBool() { return }  // all_default (keeps the defaults above)
+        loopFilterGab = r.readBool()
+        if loopFilterGab {
             if r.readBool() {  // gab_custom
-                for _ in 0..<6 { _ = r.readF16() }
+                gabXWeight1 = r.readF16(); gabXWeight2 = r.readF16()
+                gabYWeight1 = r.readF16(); gabYWeight2 = r.readF16()
+                gabBWeight1 = r.readF16(); gabBWeight2 = r.readF16()
             }
         }
-        let epfIters = r.read(2)  // default 2
-        if epfIters > 0 {
+        loopFilterEpfIters = UInt32(r.read(2))
+        if loopFilterEpfIters > 0 {
             if !isModular {
                 if r.readBool() {  // epf_sharp_custom
                     for _ in 0..<kEpfSharpEntries { _ = r.readF16() }
