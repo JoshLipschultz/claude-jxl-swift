@@ -4,11 +4,16 @@ This directory holds the macOS-integration sources. The core decoder
 (`Sources/JXLCore`) stays toolchain-light on purpose so it builds and tests
 without Xcode.
 
-## `JXLViewer` — standalone viewer app (no Xcode needed)
+## `JXLViewer` — macOS viewer app
 
-[`JXLViewer/`](JXLViewer/) is a small AppKit application that opens a `.jxl`
-file and displays the decoded pixels. It's primarily a **testing harness** for
-the decoder: point it at a fixture and eyeball the result. It links `JXLCore` (as a local Swift package).
+[`JXLViewer/`](JXLViewer/) is a **document-based** AppKit application that opens
+`.jxl` files and displays the decoded pixels. It's primarily a **testing
+harness** for the decoder: point it at a fixture and eyeball the result. It links
+`JXLCore` (as a local Swift package).
+
+Because it's built on `NSDocument`/`NSDocumentController`, each file opens in its
+**own window**, and Open Recent, drag-to-open, and window management come for
+free.
 
 **Build & run in Xcode (recommended):** the project is generated with
 [XcodeGen](https://github.com/yonaskolb/XcodeGen) from
@@ -34,14 +39,31 @@ sh Scripts/build-viewer.sh              # -> .build/viewer/JXLViewer.app
 sh Scripts/build-viewer.sh --run FILE   # build and launch, opening FILE
 ```
 
-Features: File ▸ Open (⌘O), drag-and-drop, a command-line path argument, a
-checkerboard behind transparent images, and a status bar showing dimensions /
-channels / bit depth. Decoding runs off the main thread. Lossless Modular images
-render today; lossy (VarDCT) files show the decoder's "unsupported" error in the
-status bar until that path lands. Conversion to a `CGImage` lives in
-[`JXLViewer/JXLImageConverter.swift`](JXLViewer/JXLImageConverter.swift), the one
-spot that knows the plane layout — reuse it from the Quick Look provider below
-once you want real thumbnails.
+Any file paths passed on the command line each open in their own window
+(`build-viewer.sh --run a.jxl b.jxl`), which is handy for exercising the
+multi-window behaviour from the terminal.
+
+**Features**
+
+- **Multi-window**, one document per file (`NSDocument`); Open (⌘O), Open Recent,
+  Close (⌘W), and drag-and-drop.
+- **Zoom & pan** via a scroll view: Actual Size (⌘0), Zoom In/Out (⌘+/⌘−), Zoom
+  to Fit (⌘9), plus trackpad pinch. Pixels stay crisp (nearest-neighbour) when
+  magnified.
+- **Pixel inspector**: the status bar shows the native sample values (R/G/B/A or
+  grayscale, in the file's bit depth) under the cursor.
+- **Metadata inspector** (⌘I): a side panel mirroring `jxl info` / `jxl vardct`
+  — image metadata, colour encoding, container boxes, frame + TOC layout, and
+  VarDCT globals for lossy frames.
+- **Checkerboard** behind transparent images; a background thread does the decode.
+
+Lossless Modular images render today; lossy (VarDCT) files still show the
+decoder's error in the status bar but their **metadata panel is fully populated**,
+so the app is already useful for inspecting them. Decode + conversion live in
+[`DecodePipeline.swift`](JXLViewer/DecodePipeline.swift) and
+[`JXLImageConverter.swift`](JXLViewer/JXLImageConverter.swift) (the one spot that
+knows the plane layout) — reuse them from the Quick Look provider below once you
+want real thumbnails.
 
 ## Quick Look extension (needs full Xcode)
 

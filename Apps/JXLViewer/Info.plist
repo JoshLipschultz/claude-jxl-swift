@@ -36,6 +36,8 @@
 			</array>
 			<key>LSHandlerRank</key>
 			<string>Alternate</string>
+			<key>NSDocumentClass</key>
+			<string>JXLDocument</string>
 		</dict>
 	</array>
 	<key>UTImportedTypeDeclarations</key>

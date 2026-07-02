@@ -1,123 +1,151 @@
 // AppDelegate.swift
 //
-// Owns the window, the menu, and the open -> decode -> display flow. Decoding
-// runs off the main thread so the UI stays responsive on large images; the
-// resulting CGImage and a metadata summary are handed back to the main thread.
+// Application delegate for the document-based JXL Viewer. It builds the main menu
+// and handles launch behaviour; opening files, per-file windows, Open Recent, and
+// drag-to-open are all handled by NSDocumentController and the document machinery.
 
 import AppKit
 import Foundation
-import JXLCore
 import UniformTypeIdentifiers
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
-    private var window: NSWindow!
-    private var canvas: ImageCanvasView!
-    private var statusLabel: NSTextField!
-    private var decodeGeneration = 0
+    /// File paths passed on the command line, each opened once launching finishes.
+    /// Handy for driving the app from the terminal or the build script.
+    var pendingLaunchURLs: [URL] = []
 
-    /// A file passed on the command line, opened once the app finishes launching.
-    var pendingLaunchURL: URL?
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        buildMenu()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        buildMenu()
-        buildWindow()
         NSApp.activate(ignoringOtherApps: true)
 
-        if let url = pendingLaunchURL {
-            open(url)
-        } else {
-            setStatus("Open a .jxl file  (⌘O)  or drop one here")
+        if !pendingLaunchURLs.isEmpty {
+            for url in pendingLaunchURLs {
+                NSDocumentController.shared.openDocument(
+                    withContentsOf: url, display: true) { _, _, _ in }
+            }
+            return
+        }
+
+        // If nothing was opened during launch (no file argument, no Finder open),
+        // present the Open panel so the user has an obvious next step.
+        DispatchQueue.main.async {
+            if NSDocumentController.shared.documents.isEmpty {
+                NSDocumentController.shared.openDocument(nil)
+            }
         }
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    // Viewer has no concept of a blank document, so don't create one on launch.
+    func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool { false }
 
-    // Finder "Open With" / double-click routing.
-    func application(_ application: NSApplication, open urls: [URL]) {
-        if let url = urls.first { open(url) }
-    }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
-    // MARK: - UI construction
-
-    private func buildWindow() {
-        let frame = NSRect(x: 0, y: 0, width: 900, height: 640)
-        window = NSWindow(
-            contentRect: frame,
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered, defer: false)
-        window.title = "JXL Viewer"
-        window.center()
-        window.setFrameAutosaveName("JXLViewerMainWindow")
-
-        let container = NSView(frame: frame)
-        container.autoresizingMask = [.width, .height]
-
-        canvas = ImageCanvasView(frame: NSRect(x: 0, y: 28, width: frame.width, height: frame.height - 28))
-        canvas.autoresizingMask = [.width, .height]
-        canvas.onDropFile = { [weak self] url in self?.open(url) }
-        container.addSubview(canvas)
-
-        let statusBar = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: frame.width, height: 28))
-        statusBar.autoresizingMask = [.width]
-        statusBar.material = .titlebar
-        statusBar.blendingMode = .withinWindow
-
-        statusLabel = NSTextField(labelWithString: "")
-        statusLabel.frame = NSRect(x: 10, y: 4, width: frame.width - 20, height: 18)
-        statusLabel.autoresizingMask = [.width]
-        statusLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        statusLabel.textColor = .secondaryLabelColor
-        statusLabel.lineBreakMode = .byTruncatingMiddle
-        statusBar.addSubview(statusLabel)
-        container.addSubview(statusBar)
-
-        window.contentView = container
-        window.makeKeyAndOrderFront(nil)
-    }
+    // MARK: - Menu
 
     private func buildMenu() {
         let mainMenu = NSMenu()
-
-        let appMenuItem = NSMenuItem()
-        mainMenu.addItem(appMenuItem)
-        let appMenu = NSMenu()
-        appMenu.addItem(
-            withTitle: "About JXL Viewer", action: #selector(showAbout), keyEquivalent: "")
-        appMenu.addItem(.separator())
-        appMenu.addItem(
-            withTitle: "Quit JXL Viewer", action: #selector(NSApplication.terminate(_:)),
-            keyEquivalent: "q")
-        appMenuItem.submenu = appMenu
-
-        let fileMenuItem = NSMenuItem()
-        mainMenu.addItem(fileMenuItem)
-        let fileMenu = NSMenu(title: "File")
-        fileMenu.addItem(
-            withTitle: "Open…", action: #selector(openDocument), keyEquivalent: "o")
-        fileMenu.addItem(.separator())
-        fileMenu.addItem(
-            withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
-        fileMenuItem.submenu = fileMenu
-
+        mainMenu.addItem(appMenuItem())
+        mainMenu.addItem(fileMenuItem())
+        mainMenu.addItem(viewMenuItem())
+        mainMenu.addItem(goMenuItem())
+        mainMenu.addItem(windowMenuItem())
         NSApp.mainMenu = mainMenu
     }
 
-    // MARK: - Actions
+    private func appMenuItem() -> NSMenuItem {
+        let item = NSMenuItem()
+        let menu = NSMenu()
+        menu.addItem(withTitle: "About JXL Viewer", action: #selector(showAbout), keyEquivalent: "")
+            .target = self
+        menu.addItem(.separator())
+        menu.addItem(
+            withTitle: "Quit JXL Viewer", action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q")
+        item.submenu = menu
+        return item
+    }
 
-    @objc private func openDocument() {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        if let jxlType = UTType(filenameExtension: "jxl") {
-            panel.allowedContentTypes = [jxlType]
-        }
-        // Synchronous modal keeps this on the main actor and sidesteps the
-        // non-Sendable completion-handler dance under Swift 6 concurrency.
-        if panel.runModal() == .OK, let url = panel.url {
-            open(url)
-        }
+    private func fileMenuItem() -> NSMenuItem {
+        let item = NSMenuItem()
+        let menu = NSMenu(title: "File")
+        menu.addItem(
+            withTitle: "Open…", action: #selector(NSDocumentController.openDocument(_:)),
+            keyEquivalent: "o")
+
+        let recentItem = NSMenuItem(title: "Open Recent", action: nil, keyEquivalent: "")
+        let recentMenu = NSMenu(title: "Open Recent")
+        // AppKit auto-populates a menu containing this action with recent files.
+        recentMenu.addItem(
+            withTitle: "Clear Menu",
+            action: #selector(NSDocumentController.clearRecentDocuments(_:)), keyEquivalent: "")
+        recentItem.submenu = recentMenu
+        menu.addItem(recentItem)
+
+        menu.addItem(.separator())
+        menu.addItem(
+            withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        item.submenu = menu
+        return item
+    }
+
+    private func viewMenuItem() -> NSMenuItem {
+        let item = NSMenuItem()
+        let menu = NSMenu(title: "View")
+        menu.addItem(
+            withTitle: "Show Metadata Inspector",
+            action: #selector(DocumentWindowController.toggleInspector(_:)), keyEquivalent: "i")
+        menu.addItem(.separator())
+        menu.addItem(
+            withTitle: "Actual Size",
+            action: #selector(DocumentWindowController.actualSize(_:)), keyEquivalent: "0")
+        menu.addItem(
+            withTitle: "Zoom In",
+            action: #selector(DocumentWindowController.zoomImageIn(_:)), keyEquivalent: "+")
+        menu.addItem(
+            withTitle: "Zoom Out",
+            action: #selector(DocumentWindowController.zoomImageOut(_:)), keyEquivalent: "-")
+        menu.addItem(
+            withTitle: "Zoom to Fit",
+            action: #selector(DocumentWindowController.zoomImageToFit(_:)), keyEquivalent: "9")
+        item.submenu = menu
+        return item
+    }
+
+    private func goMenuItem() -> NSMenuItem {
+        let item = NSMenuItem()
+        let menu = NSMenu(title: "Go")
+        let next = menu.addItem(
+            withTitle: "Next Image",
+            action: #selector(DocumentWindowController.nextImage(_:)),
+            keyEquivalent: String(UnicodeScalar(NSRightArrowFunctionKey)!))
+        next.keyEquivalentModifierMask = .command
+        let prev = menu.addItem(
+            withTitle: "Previous Image",
+            action: #selector(DocumentWindowController.previousImage(_:)),
+            keyEquivalent: String(UnicodeScalar(NSLeftArrowFunctionKey)!))
+        prev.keyEquivalentModifierMask = .command
+        item.submenu = menu
+        return item
+    }
+
+    private func windowMenuItem() -> NSMenuItem {
+        let item = NSMenuItem()
+        let menu = NSMenu(title: "Window")
+        menu.addItem(
+            withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)),
+            keyEquivalent: "m")
+        menu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        menu.addItem(.separator())
+        menu.addItem(
+            withTitle: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)),
+            keyEquivalent: "")
+        item.submenu = menu
+        NSApp.windowsMenu = menu
+        return item
     }
 
     @objc private func showAbout() {
@@ -128,64 +156,4 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             + "Lossless Modular images decode today; lossy (VarDCT) support is in progress."
         alert.runModal()
     }
-
-    // MARK: - Decode pipeline
-
-    private func open(_ url: URL) {
-        decodeGeneration += 1
-        let generation = decodeGeneration
-        window.title = "JXL Viewer — \(url.lastPathComponent)"
-        setStatus("Decoding \(url.lastPathComponent)…")
-
-        // The Task body inherits the main actor (this method is main-actor
-        // isolated); the heavy decode runs off-actor in a detached task and its
-        // Sendable result is delivered back here for the UI update.
-        Task { [weak self] in
-            let outcome = await Task.detached(priority: .userInitiated) {
-                Self.decode(url)
-            }.value
-            guard let self, generation == self.decodeGeneration else { return }
-            self.canvas.setImage(outcome.image)
-            self.setStatus(outcome.status)
-        }
-    }
-
-    private nonisolated static func decode(_ url: URL) -> DecodeOutcome {
-        do {
-            let data = try Data(contentsOf: url)
-            let info = try JXL.readInfo(from: data)
-            let decoded = try JXL.decodeImage(from: data)
-            let cg = try JXLImageConverter.makeCGImage(from: decoded, orientation: info.orientation)
-            return DecodeOutcome(image: cg, status: summary(url: url, info: info, image: decoded))
-        } catch {
-            let reason = (error as? JXLError).map(String.init(describing:))
-                ?? error.localizedDescription
-            return DecodeOutcome(image: nil, status: "✗ \(url.lastPathComponent): \(reason)")
-        }
-    }
-
-    private nonisolated static func summary(url: URL, info: JXLImageInfo, image: JXLDecodedImage)
-        -> String
-    {
-        let color = image.colorChannels == 1 ? "Gray" : "RGB"
-        let alpha = image.extraChannels > 0 ? "+A" : ""
-        let sample =
-            image.isFloat ? "\(image.bitsPerSample)-bit float" : "\(image.bitsPerSample)-bit"
-        let kind = info.isContainer ? "container" : "bare codestream"
-        return "\(image.width)×\(image.height)  \(color)\(alpha)  \(sample)  (\(kind))"
-    }
-
-    private func setStatus(_ text: String) {
-        statusLabel.stringValue = text
-    }
-}
-
-/// Result of a background decode, handed from the detached task back to the main
-/// actor. `@unchecked Sendable` is sound because `CGImage` is immutable and the
-/// value is only read after crossing the actor boundary.
-private struct DecodeOutcome: @unchecked Sendable {
-    /// The decoded image, or `nil` if decoding failed.
-    let image: CGImage?
-    /// A one-line summary (on success) or an error message (on failure).
-    let status: String
 }

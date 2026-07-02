@@ -17,13 +17,13 @@ MainActor.assumeIsolated {
 
     let delegate = AppDelegate()
 
-    // Pick up a file path argument (skip flags and the executable path itself).
-    if let path = CommandLine.arguments.dropFirst().first(where: { !$0.hasPrefix("-") }) {
-        let url = URL(fileURLWithPath: path)
-        if FileManager.default.fileExists(atPath: url.path) {
-            delegate.pendingLaunchURL = url
-        }
-    }
+    // Pick up file path arguments (skip flags and the executable path itself);
+    // each existing file opens in its own document window. Handy for driving the
+    // app — and its multi-window behaviour — from the terminal or build script.
+    delegate.pendingLaunchURLs = CommandLine.arguments.dropFirst()
+        .filter { !$0.hasPrefix("-") }
+        .map { URL(fileURLWithPath: $0) }
+        .filter { FileManager.default.fileExists(atPath: $0.path) }
 
     app.delegate = delegate
     app.run()

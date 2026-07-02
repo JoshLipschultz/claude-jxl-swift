@@ -27,7 +27,9 @@ final class DocumentWindowController: NSWindowController, NSMenuItemValidation {
             contentRect: NSRect(x: 0, y: 0, width: 980, height: 680),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false)
-        window.tabbingMode = .preferred
+        // Each document gets its own window (the default). Tabbing stays at the
+        // system default rather than being forced on.
+        window.tabbingMode = .automatic
         window.minSize = NSSize(width: 480, height: 320)
         super.init(window: window)
         shouldCascadeWindows = true
