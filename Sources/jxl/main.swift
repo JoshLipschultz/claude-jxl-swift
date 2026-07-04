@@ -36,7 +36,7 @@ func usage() -> Never {
           jxl vardct-acmeta <file.jxl>     Decode VarDCT AC metadata (strategy/quant)
           jxl vardct-acglobal <file.jxl>   Decode VarDCT AC global (coeff orders)
           jxl vardct-ac <file.jxl>         Decode VarDCT AC coefficients (entropy)
-          jxl vardct-decode <f.jxl> <ppm>  Reconstruct DCT8 lossy image to sRGB PPM
+          jxl vardct-decode <f.jxl> <ppm>  Reconstruct lossy VarDCT image to sRGB PPM
 
         """
     FileHandle.standardError.write(Data(text.utf8))
@@ -158,6 +158,16 @@ do {
         for q in m.quantField { qlo = min(qlo, q); qhi = max(qhi, q) }
         print("  quant field: [\(qlo), \(qhi)] over \(covered)/\(m.widthBlocks * m.heightBlocks) blocks")
         print("  color tiles: \(m.colorTileWidth) x \(m.colorTileHeight)")
+        if args.count > 3 {
+            var out = ""
+            for by in 0..<m.heightBlocks {
+                for bx in 0..<m.widthBlocks {
+                    let i = by * m.widthBlocks + bx
+                    if m.isFirstBlock[i] { out += "\(bx) \(by) \(m.strategy[i])\n" }
+                }
+            }
+            try out.write(toFile: args[3], atomically: true, encoding: .utf8)
+        }
 
     case "vardct-acglobal":
         let (meta, acg) = try decodeVarDCTACGlobalForFrame(from: bytes)

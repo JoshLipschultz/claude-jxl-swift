@@ -233,8 +233,15 @@ private func decodeAcMetadataGroup(
                     meta.isFirstBlock[pos] = (dx | dy) == 0
                 }
             }
+            // The quant value covers the whole varblock (libjxl fills every
+            // covered row); EPF sigma reads it per 8x8 cell.
             let qf = Int(acsRow[qfRow0 + num])
-            meta.quantField[y * bw + x] = Int32(1 + max(0, min(kQuantMax - 1, qf)))
+            let quant = Int32(1 + max(0, min(kQuantMax - 1, qf)))
+            for dy in 0..<cby {
+                for dx in 0..<cbx {
+                    meta.quantField[(y + dy) * bw + (x + dx)] = quant
+                }
+            }
             num += 1
         }
     }

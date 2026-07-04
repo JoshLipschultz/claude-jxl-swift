@@ -71,14 +71,15 @@ Sources/JXLCore/
     ModularDecoder.swift GroupHeader, transforms, channel decode   [M5 ✅ decode]
     Transforms.swift    inverse RCT ✅ + Palette ✅ (Squeeze pending) [M5 wip]
   VarDCT/
-    XYB.swift           XYB <-> linear color                       [M6]
-    DCT.swift           separable DCTs for all block sizes         [M6]
-    Quant.swift         adaptive quant field + dequant weights     [M6]
-    ChromaFromLuma.swift                                           [M6]
-    VarDCTDecoder.swift LF/HF assembly, coefficient decode         [M6]
+    VarDCTInfo.swift    DC-global preflight (quantizer, ctx map)   [M6 ✅]
+    DCImage.swift       XYB DC image decode                        [M6 ✅]
+    ACMetadata.swift    block strategies, quant field, CfL maps    [M6 ✅]
+    CoeffOrder.swift    natural orders + permutations              [M6 ✅]
+    PassGroup.swift     AC coefficient entropy decode              [M6 ✅]
+    DequantWeights.swift default dequant matrices per strategy     [M6 ✅]
+    DCTTransforms.swift inverse transforms ≤32x32 + LLF insertion  [M6 ✅]
+    Reconstruct.swift   dequant→transform→filters→sRGB + Gaborish/EPF1 [M6/M7 ✅]
   Restoration/
-    Gaborish.swift      Gabor-like smoothing                       [M7]
-    EPF.swift           edge-preserving filter                     [M7]
     Upsampling.swift                                               [M7]
   Color/
     ColorManagement.swift XYB->linear->display, tone mapping       [M8]
@@ -96,8 +97,8 @@ Sources/JXLCore/
 | M3 | Entropy coding | prefix + ANS + LZ77 + context modeling | ✅ done — validated on real codestream data via the MA tree |
 | M4 | Frame layer | FrameHeader, TOC, role-aware sections | ✅ structural parser done |
 | M5 | **Modular mode** | lossless `.jxl` → pixels | 🟢 **all 17 lossless fixtures byte-exact vs djxl** — single + multi-group, RCT + Palette, gray/RGB/RGBA/8/16-bit. Float, Squeeze, progressive remain |
-| M6 | VarDCT mode | lossy photographic `.jxl` → pixels | 🟢 **DCT8 lossy → pixels at ~54 dB vs djxl** — full pipeline (entropy → dequant → IDCT → CfL → XYB→sRGB); residual is only the not-yet-applied Gaborish/EPF (M7). Larger DCT sizes (16/32/AFV) remain |
-| M7 | Restoration | Gaborish + EPF + upsampling | 🟡 Gaborish + EPF1 implemented (faithful ports); near-identity on the current DCT8 corpus (encoder leaves them off/weak), so full validation waits on images that use them. Upsampling remains |
+| M6 | VarDCT mode | lossy photographic `.jxl` → pixels | 🟢 **all transforms up to 32×32 at ~54 dB vs djxl** — full pipeline (entropy → dequant → LLF-from-DC → inverse transform → CfL → filters → XYB→sRGB) for DCT8/16/32, all rectangular sizes, IDENTITY, DCT2x2/4x4/4x8/8x4, AFV0–3, validated on the mixed-strategy fixture. DCT64+ remains |
+| M7 | Restoration | Gaborish + EPF + upsampling | 🟡 Gaborish + EPF1 validated at ~54 dB on the mixed-strategy fixture (EPF sigma exercised across multi-block varblocks). Upsampling and EPF0/EPF2 (epf_iters ≠ 1) remain |
 | M8 | Color pipeline | XYB→sRGB, ICC, alpha, 8/16-bit/float output | |
 | M9 | Advanced | patches, splines, noise, animation, extra channels, JPEG recon | |
 | M10 | macOS integration | `CGImage` bridge + Quick Look thumbnail/preview appex | |
@@ -181,9 +182,24 @@ DC=mean, then verified against `djxl`: **PSNR ≈ 54 dB, mean|Δ| ≈ 0.23/chann
 on all DCT8 fixtures (`Scripts/cmp_ppm.py`). Bugs found and fixed along the way:
 the XYB→RGB gamma bias sign (`opsin_biases_cbrt = cbrt(−bias)`), the DCT AC
 scale (`w(u>0)=√2`, from the 2-point butterfly), and a coefficient-block
-transpose relative to the pixel layout. The remaining ≈54 dB gap is exactly the
-Gaborish + edge-preserving filter (M7), which libjxl applies and we don't yet;
-larger transforms (DCT16/32/…, AFV) are the other remaining piece.
+transpose relative to the pixel layout.
+
+**M6 status (all transforms ≤ 32×32).** Reconstruction now handles every AC
+strategy up to 32×32: the scaled inverse DCT for all rectangular sizes
+(`DCTTransforms.swift`, with libjxl's min×max coefficient storage and transposed
+layout for tall blocks), the special 8×8 transforms (IDENTITY, DCT2X2, DCT4X4,
+DCT4X8/8X4, AFV0–3 with the 16-basis AFV inverse), LLF-from-DC insertion
+(`ReinterpretingDCT` with the DCT resample scales), and the per-strategy default
+dequant matrices (`DequantWeights.swift`, ports of
+`DequantMatricesLibraryDef` + `ComputeQuantTable`). Validated on the
+mixed-strategy `256x256_varblocks` fixture (14 distinct strategies): **PSNR
+≈ 54.4 dB vs djxl**, the same numerical-precision level as the DCT8 corpus, with
+per-strategy PSNR uniform across strategies. One subtle bug found: the raw quant
+field must be replicated across *all* 8×8 cells a varblock covers (libjxl fills
+whole rows in `dec_group.cc`) — leaving non-first cells at 0 made the EPF sigma
+degenerate there and cost ~27 dB. This fixture also exercises Gaborish + EPF1
+for real (M7). DCT64 and larger remain (rare in practice; encoder emits them
+only at very low quality).
 
 **M4 status (partial).** The first-frame structural layer now consumes the full
 codestream header prefix (`SizeHeader`, `ImageMetadata`, `CustomTransformData`,

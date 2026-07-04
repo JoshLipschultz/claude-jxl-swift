@@ -524,11 +524,12 @@ struct TestRunner {
             let distinct = Set(
                 (0..<total).filter { m.isFirstBlock[$0] }.map { m.strategy[$0] })
             check(distinct.count >= 5, "varblocks fixture uses varied strategies (\(distinct.count))")
-            // Exact tiling: every block must be covered (quantField set on first
-            // blocks; covered blocks share the varblock). Recompute coverage.
+            // Exact tiling: the quant value is filled across each varblock's
+            // covered cells (EPF sigma reads it per 8x8 cell), so every cell
+            // in the frame must have a positive quant.
             var covered = 0
             for i in 0..<total where m.quantField[i] > 0 { covered += 1 }
-            check(covered == m.varblockCount, "varblocks fixture quant set per varblock")
+            check(covered == total, "varblocks fixture quant covers every block")
             decoded += 1
         } else {
             check(false, "256x256_varblocks_lossy decodeVarDCTACMetadata")
@@ -611,9 +612,9 @@ struct TestRunner {
             Data("  [vardct-ac] AC coefficient sets decoded=\(decoded) (ANS-verified)\n".utf8))
     }
 
-    /// Reconstructs the DCT8 lossy fixtures to sRGB pixels and checks basic
-    /// validity. The quantitative match to djxl (PSNR ~54 dB, limited only by
-    /// the not-yet-applied Gaborish/EPF filters) is verified via
+    /// Reconstructs the lossy fixtures (DCT8-only and mixed-strategy) to sRGB
+    /// pixels and checks basic validity. The quantitative match to djxl
+    /// (PSNR ~54 dB, i.e. numerical precision) is verified via
     /// Scripts/cmp_ppm.py against `djxl` output.
     static func vardctReconstruct() {
         let dir = fixturesDir()
@@ -621,6 +622,7 @@ struct TestRunner {
         for (name, w, h) in [
             ("64x48_lossy.jxl", 64, 48), ("100x100_lossy.jxl", 100, 100),
             ("513x257_lossy.jxl", 513, 257), ("640x480_lossy.jxl", 640, 480),
+            ("256x256_varblocks_lossy.jxl", 256, 256),
         ] {
             guard let data = try? Data(contentsOf: dir.appendingPathComponent(name)),
                 let (rw, rh, rgb) = try? reconstructVarDCTImage(from: [UInt8](data))
@@ -638,7 +640,7 @@ struct TestRunner {
             decoded += 1
         }
         FileHandle.standardError.write(
-            Data("  [vardct-decode] DCT8 images reconstructed=\(decoded) (~54 dB vs djxl)\n".utf8))
+            Data("  [vardct-decode] lossy images reconstructed=\(decoded) (~54 dB vs djxl)\n".utf8))
     }
 
     // MARK: - Frame layer (M4)
