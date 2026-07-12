@@ -202,6 +202,23 @@ do {
         try Data(out).write(to: URL(fileURLWithPath: args[3]))
         print("reconstructed \(w) x \(h) -> \(args[3])")
 
+    case "bench":
+        let iters = args.count >= 4 ? (Int(args[3]) ?? 5) : 5
+        let warm = try JXL.decodeImage(from: bytes)  // warmup + dimensions
+        let mp = Double(warm.width * warm.height) / 1e6
+        var best = Double.infinity
+        var total = 0.0
+        for _ in 0..<iters {
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            _ = try JXL.decodeImage(from: bytes)
+            let dt = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9
+            best = min(best, dt)
+            total += dt
+        }
+        print(String(
+            format: "%d x %d (%.2f MP)  best %6.1f ms  avg %6.1f ms  %6.2f MP/s",
+            warm.width, warm.height, mp, best * 1000, total / Double(iters) * 1000, mp / best))
+
     case "vardct-dc":
         let dc = try decodeVarDCTDCImage(from: bytes)
         func stats(_ p: [Float]) -> String {

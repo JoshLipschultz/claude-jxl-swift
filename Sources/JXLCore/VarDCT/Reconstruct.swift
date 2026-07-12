@@ -16,42 +16,59 @@ import Foundation
 
 // MARK: - AdjustQuantBias (libjxl quantizer-inl.h)
 
-private let kDefaultQuantBias: [Float] = [
-    1.0 - 0.05465007330715401, 1.0 - 0.07005449891748593, 1.0 - 0.049935103337343655, 0.145,
-]
+// Scalars, not a [Float]: this runs per coefficient on every worker thread,
+// and a global array would be re-retained (one shared contended refcount) per
+// access.
+private let kQuantBiasX: Float = 1.0 - 0.05465007330715401
+private let kQuantBiasY: Float = 1.0 - 0.07005449891748593
+private let kQuantBiasB: Float = 1.0 - 0.049935103337343655
+private let kQuantBiasNumerator: Float = 0.145
 
+@inline(__always)
+private func quantBias(_ c: Int) -> Float {
+    c == 0 ? kQuantBiasX : (c == 1 ? kQuantBiasY : kQuantBiasB)
+}
+
+@inline(__always)
 private func adjustQuantBias(_ q: Int32, _ c: Int) -> Float {
     if q == 0 { return 0 }
-    if q == 1 { return kDefaultQuantBias[c] }
-    if q == -1 { return -kDefaultQuantBias[c] }
+    if q == 1 { return quantBias(c) }
+    if q == -1 { return -quantBias(c) }
     let qf = Float(q)
-    return qf - kDefaultQuantBias[3] / qf
+    return qf - kQuantBiasNumerator / qf
 }
 
 // MARK: - Gaborish (libjxl GaborishStage)
 
 /// In-place 3x3 Gaborish convolution with 1-pixel mirror border. `weight1` is
 /// the edge (N/S/E/W) weight, `weight2` the corner weight; the center is 1,
-/// then all are normalized to sum to 1.
+/// then all are normalized to sum to 1. Output rows depend only on the input
+/// snapshot, so rows run concurrently.
 private func gaborish(_ p: inout [Float], w: Int, h: Int, weight1: Float, weight2: Float) {
     let div = 1.0 + 4.0 * (weight1 + weight2)
     let c0 = 1.0 / div
     let c1 = weight1 / div
     let c2 = weight2 / div
-    let src = p
-    @inline(__always) func at(_ x: Int, _ y: Int) -> Float {
-        // Mirror: -1 -> 0, w -> w-1 (edge-reflecting, matching libjxl Mirror).
-        let mx = x < 0 ? 0 : (x >= w ? w - 1 : x)
-        let my = y < 0 ? 0 : (y >= h ? h - 1 : y)
-        return src[my * w + mx]
-    }
-    for y in 0..<h {
-        for x in 0..<w {
-            let center = src[y * w + x]
-            let side = at(x - 1, y) + at(x + 1, y) + at(x, y - 1) + at(x, y + 1)
-            let corner =
-                at(x - 1, y - 1) + at(x + 1, y - 1) + at(x - 1, y + 1) + at(x + 1, y + 1)
-            p[y * w + x] = center * c0 + side * c1 + corner * c2
+    let srcCopy = p
+    srcCopy.withUnsafeBufferPointer { srcBuf in
+        p.withUnsafeMutableBufferPointer { dstBuf in
+            nonisolated(unsafe) let src = srcBuf.baseAddress!
+            nonisolated(unsafe) let dst = dstBuf.baseAddress!
+            DispatchQueue.concurrentPerform(iterations: h) { y in
+                @inline(__always) func at(_ x: Int, _ yy: Int) -> Float {
+                    // Mirror: -1 -> 0, w -> w-1 (edge-reflecting, libjxl Mirror).
+                    let mx = x < 0 ? 0 : (x >= w ? w - 1 : x)
+                    let my = yy < 0 ? 0 : (yy >= h ? h - 1 : yy)
+                    return src[my * w + mx]
+                }
+                for x in 0..<w {
+                    let center = src[y * w + x]
+                    let side = at(x - 1, y) + at(x + 1, y) + at(x, y - 1) + at(x, y + 1)
+                    let corner =
+                        at(x - 1, y - 1) + at(x + 1, y - 1) + at(x - 1, y + 1) + at(x + 1, y + 1)
+                    dst[y * w + x] = center * c0 + side * c1 + corner * c2
+                }
+            }
         }
     }
 }
@@ -60,7 +77,9 @@ private func gaborish(_ p: inout [Float], w: Int, h: Int, weight1: Float, weight
 
 private let kInvSigmaNum: Float = -1.1715728752538099024
 private let kEpfMinSigma: Float = -3.90524291751269967465540850526868
-private let kEpfChannelScale: [Float] = [40.0, 5.0, 3.5]
+private let kEpfChannelScaleX: Float = 40.0
+private let kEpfChannelScaleY: Float = 5.0
+private let kEpfChannelScaleB: Float = 3.5
 private let kEpfQuantMul: Float = 0.46
 private let kEpfBorderSadMul: Float = 0.6666666666666666
 private let kEpfSadMulSm: Float = 1.65
@@ -85,65 +104,124 @@ private func computeEPFSigma(meta: VarDCTACMetadata, quantScale: Float) -> [Floa
 }
 
 /// One EPF1 pass over the XYB planes. `sigmaInv` is per-block `1/sigma`.
+/// Output rows depend only on the input snapshots, so rows run concurrently;
+/// the neighborhood SAD is fully scalarized (no per-pixel temporaries).
 private func epf1(
     x: inout [Float], y: inout [Float], b: inout [Float], w: Int, h: Int,
     sigmaInv: [Float], bw: Int
 ) {
-    let sx = x, sy = y, sb = b
-    @inline(__always) func mir(_ i: Int, _ n: Int) -> Int {
-        var v = i
-        if v < 0 { v = -v - 1 }
-        if v >= n { v = 2 * n - 1 - v }
-        return max(0, min(n - 1, v))
-    }
-    @inline(__always) func px(_ p: [Float], _ xx: Int, _ yy: Int) -> Float {
-        p[mir(yy, h) * w + mir(xx, w)]
-    }
-    // 3x3-plus SAD between the plus-neighborhoods at (cx,cy) and (cx+dx,cy+dy),
-    // summed over channels with epf_channel_scale.
-    @inline(__always) func sad(_ cx: Int, _ cy: Int, _ dx: Int, _ dy: Int) -> Float {
-        var s: Float = 0
-        for (p, sc) in [(sx, kEpfChannelScale[0]), (sy, kEpfChannelScale[1]), (sb, kEpfChannelScale[2])]
-        {
-            var d: Float = 0
-            d += abs(px(p, cx, cy) - px(p, cx + dx, cy + dy))
-            d += abs(px(p, cx - 1, cy) - px(p, cx + dx - 1, cy + dy))
-            d += abs(px(p, cx + 1, cy) - px(p, cx + dx + 1, cy + dy))
-            d += abs(px(p, cx, cy - 1) - px(p, cx + dx, cy + dy - 1))
-            d += abs(px(p, cx, cy + 1) - px(p, cx + dx, cy + dy + 1))
-            s += d * sc
-        }
-        return s
-    }
-    for cy in 0..<h {
-        let borderRow = (cy % 8 == 0) || (cy % 8 == 7)
-        for cx in 0..<w {
-            let rowSigma = sigmaInv[(cy / 8) * bw + (cx / 8)]
-            if rowSigma < kEpfMinSigma { continue }  // too sharp: unchanged
-            let onEdge = borderRow || (cx % 8 == 0) || (cx % 8 == 7)
-            let sm = onEdge ? kEpfSadMulSm * kEpfBorderSadMul : kEpfSadMulSm
-            let invSigma = rowSigma * sm
+    let sxCopy = x, syCopy = y, sbCopy = b
+    sxCopy.withUnsafeBufferPointer { sxBuf in
+    syCopy.withUnsafeBufferPointer { syBuf in
+    sbCopy.withUnsafeBufferPointer { sbBuf in
+    sigmaInv.withUnsafeBufferPointer { sigBuf in
+    x.withUnsafeMutableBufferPointer { xBuf in
+    y.withUnsafeMutableBufferPointer { yBuf in
+    b.withUnsafeMutableBufferPointer { bBuf in
+        nonisolated(unsafe) let sx = sxBuf.baseAddress!
+        nonisolated(unsafe) let sy = syBuf.baseAddress!
+        nonisolated(unsafe) let sb = sbBuf.baseAddress!
+        nonisolated(unsafe) let sig = sigBuf.baseAddress!
+        nonisolated(unsafe) let dx_ = xBuf.baseAddress!
+        nonisolated(unsafe) let dy_ = yBuf.baseAddress!
+        nonisolated(unsafe) let db_ = bBuf.baseAddress!
 
-            var wsum: Float = 1
-            var accX = sx[cy * w + cx]
-            var accY = sy[cy * w + cx]
-            var accB = sb[cy * w + cx]
-            for (dx, dy) in [(0, -1), (-1, 0), (1, 0), (0, 1)] {
-                let weight = max(0, 1 + sad(cx, cy, dx, dy) * invSigma)
-                wsum += weight
-                accX += weight * px(sx, cx + dx, cy + dy)
-                accY += weight * px(sy, cx + dx, cy + dy)
-                accB += weight * px(sb, cx + dx, cy + dy)
+        DispatchQueue.concurrentPerform(iterations: h) { cy in
+            @inline(__always) func mir(_ i: Int, _ n: Int) -> Int {
+                var v = i
+                if v < 0 { v = -v - 1 }
+                if v >= n { v = 2 * n - 1 - v }
+                return max(0, min(n - 1, v))
             }
-            let invW = 1.0 / wsum
-            x[cy * w + cx] = accX * invW
-            y[cy * w + cx] = accY * invW
-            b[cy * w + cx] = accB * invW
+            @inline(__always) func px(_ p: UnsafePointer<Float>, _ xx: Int, _ yy: Int) -> Float {
+                p[mir(yy, h) * w + mir(xx, w)]
+            }
+            // Plus-neighborhood SAD between (cx,cy) and (cx+dx,cy+dy) on one plane.
+            @inline(__always) func sadPlane(
+                _ p: UnsafePointer<Float>, _ cx: Int, _ dx: Int, _ dy: Int
+            ) -> Float {
+                var d: Float = 0
+                d += abs(px(p, cx, cy) - px(p, cx + dx, cy + dy))
+                d += abs(px(p, cx - 1, cy) - px(p, cx + dx - 1, cy + dy))
+                d += abs(px(p, cx + 1, cy) - px(p, cx + dx + 1, cy + dy))
+                d += abs(px(p, cx, cy - 1) - px(p, cx + dx, cy + dy - 1))
+                d += abs(px(p, cx, cy + 1) - px(p, cx + dx, cy + dy + 1))
+                return d
+            }
+            // 3-channel SAD with epf_channel_scale weights.
+            @inline(__always) func sad(_ cx: Int, _ dx: Int, _ dy: Int) -> Float {
+                sadPlane(sx, cx, dx, dy) * kEpfChannelScaleX
+                    + sadPlane(sy, cx, dx, dy) * kEpfChannelScaleY
+                    + sadPlane(sb, cx, dx, dy) * kEpfChannelScaleB
+            }
+
+            let borderRow = (cy % 8 == 0) || (cy % 8 == 7)
+            let sigRow = (cy / 8) * bw
+            for cx in 0..<w {
+                let rowSigma = sig[sigRow + (cx / 8)]
+                if rowSigma < kEpfMinSigma { continue }  // too sharp: unchanged
+                let onEdge = borderRow || (cx % 8 == 0) || (cx % 8 == 7)
+                let sm = onEdge ? kEpfSadMulSm * kEpfBorderSadMul : kEpfSadMulSm
+                let invSigma = rowSigma * sm
+
+                var wsum: Float = 1
+                var accX = sx[cy * w + cx]
+                var accY = sy[cy * w + cx]
+                var accB = sb[cy * w + cx]
+                @inline(__always) func tap(_ dx: Int, _ dy: Int) {
+                    let weight = max(0, 1 + sad(cx, dx, dy) * invSigma)
+                    wsum += weight
+                    accX += weight * px(sx, cx + dx, cy + dy)
+                    accY += weight * px(sy, cx + dx, cy + dy)
+                    accB += weight * px(sb, cx + dx, cy + dy)
+                }
+                tap(0, -1)
+                tap(-1, 0)
+                tap(1, 0)
+                tap(0, 1)
+                let invW = 1.0 / wsum
+                dx_[cy * w + cx] = accX * invW
+                dy_[cy * w + cx] = accY * invW
+                db_[cy * w + cx] = accB * invW
+            }
         }
+    }
+    }
+    }
+    }
+    }
+    }
     }
 }
 
 // MARK: - Full reconstruction
+
+/// Dispatches one varblock's inverse transform. Free function with no captures
+/// so the per-block hot loop carries no closure context.
+@inline(__always)
+private func applyInverseTransform(
+    _ strategy: Int, _ buf: UnsafeMutablePointer<Float>, _ out: UnsafeMutablePointer<Float>,
+    stride: Int, tmp: UnsafeMutablePointer<Float>
+) {
+    switch strategy {
+    case 1:
+        identityTransform(buf, pixels: out, stride: stride)
+    case 2:
+        dct2x2Transform(buf, pixels: out, stride: stride)
+    case 3:
+        dct4x4Transform(buf, pixels: out, stride: stride, scratch: tmp)
+    case 12:
+        dct4x8Transform(buf, pixels: out, stride: stride, scratch: tmp)
+    case 13:
+        dct8x4Transform(buf, pixels: out, stride: stride, scratch: tmp)
+    case 14, 15, 16, 17:
+        afvTransform(kind: strategy - 14, buf, pixels: out, stride: stride, scratch: tmp)
+    default:
+        scaledIDCT(
+            buf, h: kStrategyBlockH[strategy], w: kStrategyBlockW[strategy],
+            pixels: out, stride: stride, tmp: tmp)
+    }
+}
 
 extension FrameDecoder {
     /// Reconstructs the frame's XYB planes: dequant + chroma-from-luma, LLF
@@ -187,88 +265,104 @@ extension FrameDecoder {
         var planeY = planeX
         var planeB = planeX
 
-        // Scratch buffers reused across blocks (max transform is 32x32 = 1024).
-        var scratchX = [Float](repeating: 0, count: 1024)
-        var scratchY = [Float](repeating: 0, count: 1024)
-        var scratchB = [Float](repeating: 0, count: 1024)
-        var scratchTmp = [Float](repeating: 0, count: 1024)
+        // Varblocks tile the plane exactly, so every block writes a disjoint
+        // pixel region — any partition of the block list can run concurrently.
+        // Every shared input crosses into the workers as a raw pointer: passing
+        // shared `[Float]`s (DC planes, dequant tables) into per-block calls
+        // costs an atomic retain/release pair per call, and under 10 threads
+        // those refcounts become contended cachelines that dominate the stage.
+        let blocks = coeffs.blocks
+        let workers = max(1, min(blocks.count, ProcessInfo.processInfo.activeProcessorCount))
+
+        // Dequant tables as manually-managed buffers (a few KB total).
+        var tablePtrs = [UnsafePointer<Float>?](repeating: nil, count: dequantTables.count)
+        for (kind, table) in dequantTables.enumerated() where table != nil {
+            let p = UnsafeMutablePointer<Float>.allocate(capacity: table!.count)
+            p.update(from: table!, count: table!.count)
+            tablePtrs[kind] = UnsafePointer(p)
+        }
+        defer { for p in tablePtrs { p.map { UnsafeMutablePointer(mutating: $0).deallocate() } } }
+
+        let dcW = dc.widthBlocks
+        let acMeta = meta
 
         planeX.withUnsafeMutableBufferPointer { pX in
         planeY.withUnsafeMutableBufferPointer { pY in
         planeB.withUnsafeMutableBufferPointer { pB in
-        scratchX.withUnsafeMutableBufferPointer { sXBuf in
-        scratchY.withUnsafeMutableBufferPointer { sYBuf in
-        scratchB.withUnsafeMutableBufferPointer { sBBuf in
-        scratchTmp.withUnsafeMutableBufferPointer { tmpBuf in
-            let bufX = sXBuf.baseAddress!
-            let bufY = sYBuf.baseAddress!
-            let bufB = sBBuf.baseAddress!
-            let tmp = tmpBuf.baseAddress!
+        dc.x.withUnsafeBufferPointer { dcXBuf in
+        dc.y.withUnsafeBufferPointer { dcYBuf in
+        dc.b.withUnsafeBufferPointer { dcBBuf in
+        blocks.withUnsafeBufferPointer { blockBuf in
+            nonisolated(unsafe) let outX = pX.baseAddress!
+            nonisolated(unsafe) let outY = pY.baseAddress!
+            nonisolated(unsafe) let outB = pB.baseAddress!
+            nonisolated(unsafe) let dcX = dcXBuf.baseAddress!
+            nonisolated(unsafe) let dcY = dcYBuf.baseAddress!
+            nonisolated(unsafe) let dcB = dcBBuf.baseAddress!
+            nonisolated(unsafe) let blks = blockBuf
+            nonisolated(unsafe) let tabs = tablePtrs
 
-            for blk in coeffs.blocks {
-                let bx = blk.bx
-                let by = blk.by
-                let strategy = Int(blk.strategy)
-                let size = blk.coveredX * blk.coveredY * 64
-                let quant = Float(meta.quantField[by * bw + bx])
-                let scaledDequant = invGlobalScale / quant
-                let ctX = bx / 8
-                let ctY = by / 8
-                let cmapW = meta.colorTileWidth
-                let xCC = baseX + Float(meta.ytoxMap[ctY * cmapW + ctX]) * colorScale
-                let bCC = baseB + Float(meta.ytobMap[ctY * cmapW + ctX]) * colorScale
-
-                // Dequantize with quant biases + chroma-from-luma (elementwise: the
-                // dequant matrix layout matches the coefficient storage).
-                let table = dequantTables[kStrategyQuantTable[strategy].rawValue]!
-                table.withUnsafeBufferPointer { t in
-                    blk.coeff[0].withUnsafeBufferPointer { cX in
-                    blk.coeff[1].withUnsafeBufferPointer { cY in
-                    blk.coeff[2].withUnsafeBufferPointer { cB in
-                        for k in 0..<size {
-                            let xMul = t[k] * scaledDequant * xDmMul
-                            let yMul = t[size + k] * scaledDequant
-                            let bMul = t[2 * size + k] * scaledDequant * bDmMul
-                            let dqXcc = adjustQuantBias(cX[k], 0) * xMul
-                            let dqY = adjustQuantBias(cY[k], 1) * yMul
-                            let dqBcc = adjustQuantBias(cB[k], 2) * bMul
-                            bufY[k] = dqY
-                            bufX[k] = xCC * dqY + dqXcc
-                            bufB[k] = bCC * dqY + dqBcc
-                        }
-                    }
-                    }
-                    }
+            DispatchQueue.concurrentPerform(iterations: workers) { worker in
+                let lo = blks.count * worker / workers
+                let hi = blks.count * (worker + 1) / workers
+                // Per-worker scratch (max transform is 32x32 = 1024 coefficients).
+                let bufX = UnsafeMutablePointer<Float>.allocate(capacity: 1024)
+                let bufY = UnsafeMutablePointer<Float>.allocate(capacity: 1024)
+                let bufB = UnsafeMutablePointer<Float>.allocate(capacity: 1024)
+                let tmp = UnsafeMutablePointer<Float>.allocate(capacity: 1024)
+                defer {
+                    bufX.deallocate()
+                    bufY.deallocate()
+                    bufB.deallocate()
+                    tmp.deallocate()
                 }
 
-                // Insert the lowest frequencies from the DC image.
-                let dcOrigin = by * dc.widthBlocks + bx
-                insertLLF(bufX, strategy: strategy, dc: dc.x, dcStride: dc.widthBlocks, dcOrigin: dcOrigin)
-                insertLLF(bufY, strategy: strategy, dc: dc.y, dcStride: dc.widthBlocks, dcOrigin: dcOrigin)
-                insertLLF(bufB, strategy: strategy, dc: dc.b, dcStride: dc.widthBlocks, dcOrigin: dcOrigin)
+                for i in lo..<hi {
+                    // One struct copy per block; each block's arrays are
+                    // thread-unique, so their refcounts never contend, and
+                    // plain element reads below don't retain at all.
+                    let blk = blks[i]
+                    let bx = blk.bx
+                    let by = blk.by
+                    let strategy = Int(blk.strategy)
+                    let size = blk.coveredX * blk.coveredY * 64
+                    let quant = Float(acMeta.quantField[by * bw + bx])
+                    let scaledDequant = invGlobalScale / quant
+                    let ctX = bx / 8
+                    let ctY = by / 8
+                    let cmapW = acMeta.colorTileWidth
+                    let xCC = baseX + Float(acMeta.ytoxMap[ctY * cmapW + ctX]) * colorScale
+                    let bCC = baseB + Float(acMeta.ytobMap[ctY * cmapW + ctX]) * colorScale
 
-                // Inverse transform straight into the padded XYB planes.
-                let origin = by * 8 * rowStride + bx * 8
-                for (buf, plane) in [(bufX, pX.baseAddress!), (bufY, pY.baseAddress!), (bufB, pB.baseAddress!)] {
-                    let out = plane + origin
-                    switch strategy {
-                    case 1:
-                        identityTransform(buf, pixels: out, stride: rowStride)
-                    case 2:
-                        dct2x2Transform(buf, pixels: out, stride: rowStride)
-                    case 3:
-                        dct4x4Transform(buf, pixels: out, stride: rowStride, scratch: tmp)
-                    case 12:
-                        dct4x8Transform(buf, pixels: out, stride: rowStride, scratch: tmp)
-                    case 13:
-                        dct8x4Transform(buf, pixels: out, stride: rowStride, scratch: tmp)
-                    case 14, 15, 16, 17:
-                        afvTransform(kind: strategy - 14, buf, pixels: out, stride: rowStride, scratch: tmp)
-                    default:
-                        scaledIDCT(
-                            buf, h: kStrategyBlockH[strategy], w: kStrategyBlockW[strategy],
-                            pixels: out, stride: rowStride, tmp: tmp)
+                    // Dequantize with quant biases + chroma-from-luma (elementwise: the
+                    // dequant matrix layout matches the coefficient storage).
+                    let t = tabs[kStrategyQuantTable[strategy].rawValue]!
+                    let cX = blk.coeff[0]
+                    let cY = blk.coeff[1]
+                    let cB = blk.coeff[2]
+                    for k in 0..<size {
+                        let xMul = t[k] * scaledDequant * xDmMul
+                        let yMul = t[size + k] * scaledDequant
+                        let bMul = t[2 * size + k] * scaledDequant * bDmMul
+                        let dqXcc = adjustQuantBias(cX[k], 0) * xMul
+                        let dqY = adjustQuantBias(cY[k], 1) * yMul
+                        let dqBcc = adjustQuantBias(cB[k], 2) * bMul
+                        bufY[k] = dqY
+                        bufX[k] = xCC * dqY + dqXcc
+                        bufB[k] = bCC * dqY + dqBcc
                     }
+
+                    // Insert the lowest frequencies from the DC image.
+                    let dcOrigin = by * dcW + bx
+                    insertLLF(bufX, strategy: strategy, dc: dcX, dcStride: dcW, dcOrigin: dcOrigin)
+                    insertLLF(bufY, strategy: strategy, dc: dcY, dcStride: dcW, dcOrigin: dcOrigin)
+                    insertLLF(bufB, strategy: strategy, dc: dcB, dcStride: dcW, dcOrigin: dcOrigin)
+
+                    // Inverse transform straight into the padded XYB planes.
+                    let origin = by * 8 * rowStride + bx * 8
+                    applyInverseTransform(strategy, bufX, outX + origin, stride: rowStride, tmp: tmp)
+                    applyInverseTransform(strategy, bufY, outY + origin, stride: rowStride, tmp: tmp)
+                    applyInverseTransform(strategy, bufB, outB + origin, stride: rowStride, tmp: tmp)
                 }
             }
         }

@@ -149,6 +149,44 @@ API, which is now `JXL.*` + the metadata/info types + `BitReader`/fields.
 Cross-cutting, ongoing: conformance corpus from the libjxl test suite, fuzzing,
 and SIMD/performance once correctness is locked per stage.
 
+## Decode performance
+
+Benchmarked on a 6 MP synthetic photographic fixture (`Scripts/gen-bench.sh`,
+`jxl bench <file> [iters]`), Apple Silicon, all 17k+ oracle tests byte-exact /
+54 dB throughout:
+
+| Path | Before | After | |
+|---|---|---|---|
+| VarDCT (lossy, q95 e4) | 360 ms (16.7 MP/s) | **72 ms (~83 MP/s)** | 5.0× |
+| Modular (lossless, e3) | 3585 ms (1.7 MP/s) | **278 ms (~21.5 MP/s)** | 12.9× |
+
+What did it (in impact order): rewriting the weighted predictor on flat
+manually-managed buffers with scalarized 4-wide math, and skipping it entirely
+when the MA tree never observes it (libjxl's `use_wp` gating); decoding
+Modular AC groups concurrently (decode phase parallel, blits serial, and
+in-place blits — the old read-modify-write copied the whole plane per group);
+parallel VarDCT reconstruction, filters (Gaborish/EPF row-parallel,
+scalarized SAD), and color conversion; a threshold-table sRGB8 quantizer that
+is bit-identical to the `powf` reference (asserted by a dense-sweep test); and
+a 64-bit unaligned-load fast path in `BitReader`.
+
+**The lesson that cost the most to learn:** accessing a global or shared
+`[T]` array from inside a `concurrentPerform` worker — returning it, passing
+it as an argument, or `withUnsafeBufferPointer`-ing it per call — takes an
+atomic retain/release on *one shared refcount cacheline*, and under 8–10
+threads that contention can eat the entire parallel speedup (first parallel
+attempt: 268 → 550 ms). Everything crossing into a worker loop must be a raw
+pointer, a scalar, or a thread-unique value: the IDCT basis tables, sRGB
+thresholds, and opsin constants are now process-lifetime `UnsafePointer`s /
+scalars for exactly this reason. Per-pixel closures (even `@Sendable` ones)
+and per-pixel array temporaries are equally forbidden in hot loops.
+
+Next levers, roughly in order: SIMD4 for the weighted predictor's 4-wide
+math (lossless is now WP + entropy bound); flat per-group coefficient pooling
+(drops `VarDCTBlock`'s per-block nested arrays); parallel DC-group decode in
+the LF pass; interior/border splits for Gaborish/EPF mirror handling; a
+buffered refill in the ANS symbol reader.
+
 **M3 status (implemented).** The full entropy substrate is ported from libjxl
 v0.11.2: the hybrid-uint integer coder, canonical prefix codes, the rANS
 alias-method decoder (histogram reading, alias-table construction, 32-bit state

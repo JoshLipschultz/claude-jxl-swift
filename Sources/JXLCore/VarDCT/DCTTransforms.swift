@@ -18,23 +18,27 @@ import Foundation
 private let kSqrt2: Float = 1.41421356237
 
 /// 1D IDCT basis for size N: `basis[x*N + k] = w(k) * cos((2x+1) k pi / 2N)`.
-private func makeIDCTBasis(_ n: Int) -> [Float] {
-    var m = [Float](repeating: 0, count: n * n)
+/// Stored as a manually-managed pointer (never freed — a few KB of process
+/// lifetime tables): returning a global `[Float]` from the per-block hot path
+/// retains/releases one shared refcount from every worker thread, and that
+/// contended cacheline dominated parallel reconstruction.
+private func makeIDCTBasis(_ n: Int) -> UnsafePointer<Float> {
+    let m = UnsafeMutablePointer<Float>.allocate(capacity: n * n)
     for x in 0..<n {
         for k in 0..<n {
             let w: Double = k == 0 ? 1.0 : 2.0.squareRoot()
             m[x * n + k] = Float(w * cos(Double(2 * x + 1) * Double(k) * Double.pi / Double(2 * n)))
         }
     }
-    return m
+    return UnsafePointer(m)
 }
 
-private let idctBasis4 = makeIDCTBasis(4)
-private let idctBasis8 = makeIDCTBasis(8)
-private let idctBasis16 = makeIDCTBasis(16)
-private let idctBasis32 = makeIDCTBasis(32)
+nonisolated(unsafe) private let idctBasis4 = makeIDCTBasis(4)
+nonisolated(unsafe) private let idctBasis8 = makeIDCTBasis(8)
+nonisolated(unsafe) private let idctBasis16 = makeIDCTBasis(16)
+nonisolated(unsafe) private let idctBasis32 = makeIDCTBasis(32)
 
-private func idctBasis(_ n: Int) -> [Float] {
+private func idctBasis(_ n: Int) -> UnsafePointer<Float> {
     switch n {
     case 4: return idctBasis4
     case 8: return idctBasis8
@@ -50,53 +54,49 @@ func scaledIDCT(
     _ coeffs: UnsafeMutablePointer<Float>, h: Int, w: Int,
     pixels: UnsafeMutablePointer<Float>, stride: Int, tmp: UnsafeMutablePointer<Float>
 ) {
-    idctBasis(h).withUnsafeBufferPointer { bhBuf in
-        idctBasis(w).withUnsafeBufferPointer { bwBuf in
-            let bh = bhBuf.baseAddress!
-            let bw = bwBuf.baseAddress!
-            if h >= w {
-                // Transposed storage: S[u*h + v]. Pass 1 inverts the vertical
-                // frequencies of each storage row; pass 2 the horizontal ones.
-                for u in 0..<w {
-                    let row = coeffs + u * h
-                    let out = tmp + u * h
-                    for y in 0..<h {
-                        var s: Float = 0
-                        let basisRow = bh + y * h
-                        for v in 0..<h { s += basisRow[v] * row[v] }
-                        out[y] = s
-                    }
-                }
-                for y in 0..<h {
-                    let dst = pixels + y * stride
-                    for x in 0..<w {
-                        var s: Float = 0
-                        let basisRow = bw + x * w
-                        for u in 0..<w { s += basisRow[u] * tmp[u * h + y] }
-                        dst[x] = s
-                    }
-                }
-            } else {
-                // Natural storage: S[v*w + u].
-                for v in 0..<h {
-                    let row = coeffs + v * w
-                    let out = tmp + v * w
-                    for x in 0..<w {
-                        var s: Float = 0
-                        let basisRow = bw + x * w
-                        for u in 0..<w { s += basisRow[u] * row[u] }
-                        out[x] = s
-                    }
-                }
-                for y in 0..<h {
-                    let dst = pixels + y * stride
-                    let basisRow = bh + y * h
-                    for x in 0..<w {
-                        var s: Float = 0
-                        for v in 0..<h { s += basisRow[v] * tmp[v * w + x] }
-                        dst[x] = s
-                    }
-                }
+    let bh = idctBasis(h)
+    let bw = idctBasis(w)
+    if h >= w {
+        // Transposed storage: S[u*h + v]. Pass 1 inverts the vertical
+        // frequencies of each storage row; pass 2 the horizontal ones.
+        for u in 0..<w {
+            let row = coeffs + u * h
+            let out = tmp + u * h
+            for y in 0..<h {
+                var s: Float = 0
+                let basisRow = bh + y * h
+                for v in 0..<h { s += basisRow[v] * row[v] }
+                out[y] = s
+            }
+        }
+        for y in 0..<h {
+            let dst = pixels + y * stride
+            for x in 0..<w {
+                var s: Float = 0
+                let basisRow = bw + x * w
+                for u in 0..<w { s += basisRow[u] * tmp[u * h + y] }
+                dst[x] = s
+            }
+        }
+    } else {
+        // Natural storage: S[v*w + u].
+        for v in 0..<h {
+            let row = coeffs + v * w
+            let out = tmp + v * w
+            for x in 0..<w {
+                var s: Float = 0
+                let basisRow = bw + x * w
+                for u in 0..<w { s += basisRow[u] * row[u] }
+                out[x] = s
+            }
+        }
+        for y in 0..<h {
+            let dst = pixels + y * stride
+            let basisRow = bh + y * h
+            for x in 0..<w {
+                var s: Float = 0
+                for v in 0..<h { s += basisRow[v] * tmp[v * w + x] }
+                dst[x] = s
             }
         }
     }
@@ -140,7 +140,7 @@ private func forwardScaledDCT(_ input: [Float], _ n: Int) -> [Float] {
 /// this is simply `coeffs[0] = dc`.
 func insertLLF(
     _ coeffs: UnsafeMutablePointer<Float>, strategy: Int,
-    dc: [Float], dcStride: Int, dcOrigin: Int
+    dc: UnsafePointer<Float>, dcStride: Int, dcOrigin: Int
 ) {
     let cx = kCoveredBlocksX[strategy]
     let cy = kCoveredBlocksY[strategy]

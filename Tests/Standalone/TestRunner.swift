@@ -65,9 +65,36 @@ struct TestRunner {
         vardctACGlobal()
         vardctAC()
         vardctReconstruct()
+        colorQuantizer()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
+    }
+
+    // MARK: - Color: sRGB8 quantizer
+
+    /// The threshold-table quantizer must agree with the reference
+    /// `round(srgbEncode(v) * 255)` everywhere: a dense sweep across (and past)
+    /// [0, 1], plus every threshold's exact Float and its neighbors.
+    static func colorQuantizer() {
+        let q = srgb8Quantizer
+        func reference(_ v: Float) -> UInt8 {
+            UInt8(max(0, min(255, (srgbEncode(v) * 255).rounded())))
+        }
+        var mismatches = 0
+        var v: Float = -0.25
+        while v <= 1.25 {
+            if q.encode(v) != reference(v) { mismatches += 1 }
+            v += 1.4e-6
+        }
+        for k in 1...255 {
+            let s = (Double(k) - 0.5) / 255.0
+            let t = Float(s <= 0.0031308 * 12.92 ? s / 12.92 : pow((s + 0.055) / 1.055, 2.4))
+            for cand in [t.nextDown, t, t.nextUp] where q.encode(cand) != reference(cand) {
+                mismatches += 1
+            }
+        }
+        check(mismatches == 0, "sRGB8 quantizer matches reference transfer function (\(mismatches) mismatches)")
     }
 
     // MARK: - Bitstream

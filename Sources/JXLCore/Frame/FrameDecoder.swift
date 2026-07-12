@@ -253,15 +253,41 @@ final class FrameDecoder {
             globalCtxMap: globalCtxMap, maxChanSize: maxChan)
 
         if dim.numGroups > 1 {
-            for g in 0..<dim.numGroups {
-                let section = acGroupIndex(
-                    pass: 0, group: g, numGroups: dim.numGroups, numDCGroups: dim.numDCGroups)
-                // ModularStreamId::ModularAC(g, pass 0).ID  (kNumQuantTables = 17)
-                let streamID = 1 + 3 * dim.numDCGroups + 17 + g
-                try decodeModularGroup(
-                    sectionReader(section), fullImage: fullImage, group: g, dim: dim,
-                    globalTree: globalTree, globalCode: globalCode, globalCtxMap: globalCtxMap,
-                    streamID: streamID)
+            // Groups are independent: decode them concurrently into group-local
+            // sub-images, then blit serially (the decode phase only reads the
+            // full image's channel layout).
+            let codestream = self.codestream
+            let dim = self.dim
+            let sectionRanges = (0..<dim.numGroups).map { g in
+                sectionRange(acGroupIndex(
+                    pass: 0, group: g, numGroups: dim.numGroups, numDCGroups: dim.numDCGroups))
+            }
+            typealias GroupResult = Result<ModularGroupResult?, Error>
+            var results = [GroupResult?](repeating: nil, count: dim.numGroups)
+            results.withUnsafeMutableBufferPointer { slots in
+                // Each iteration writes only its own pre-allocated slot; the
+                // full image is only read (channel layout) during this phase.
+                nonisolated(unsafe) let out = slots
+                nonisolated(unsafe) let full = fullImage
+                let tree = globalTree
+                let code = globalCode
+                let ctxMap = globalCtxMap
+                DispatchQueue.concurrentPerform(iterations: dim.numGroups) { g in
+                    // ModularStreamId::ModularAC(g, pass 0).ID  (kNumQuantTables = 17)
+                    let streamID = 1 + 3 * dim.numDCGroups + 17 + g
+                    out[g] = GroupResult {
+                        try decodeModularGroupImage(
+                            BitReader(codestream, byteRange: sectionRanges[g]),
+                            fullImage: full, group: g, dim: dim,
+                            globalTree: tree, globalCode: code, globalCtxMap: ctxMap,
+                            streamID: streamID)
+                    }
+                }
+            }
+            for result in results {
+                if let groupResult = try result!.get() {
+                    blitModularGroup(groupResult, into: fullImage)
+                }
             }
         }
 

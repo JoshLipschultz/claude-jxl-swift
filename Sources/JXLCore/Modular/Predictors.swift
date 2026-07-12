@@ -83,13 +83,23 @@ extension BitReader {
 
 /// The self-correcting weighted predictor's running state (libjxl
 /// `weighted::State`). Keeps a sliding two-row window of per-predictor errors.
+///
+/// This runs for every pixel of WP-using channels, so the state lives in flat
+/// manually-managed buffers (no per-access COW/exclusivity checks) and the
+/// 4-wide predictor math is fully scalarized (no per-pixel allocations).
 final class WPState {
-    private let header: WPHeader
-    private(set) var prediction = [Int](repeating: 0, count: kNumWPPredictors)
-    private(set) var pred: Int = 0
-    private var predErrors: [[UInt32]]
-    private var error: [Int32]
-    private let xsize: Int
+    private let p1C, p2C, p3Ca, p3Cb, p3Cc, p3Cd, p3Ce: Int
+    private let hw0, hw1, hw2, hw3: UInt32
+    // Last prediction (x8 fixed point) and the four sub-predictions, consumed
+    // by `updateErrors` for the same pixel.
+    private var pred = 0
+    private var pr0 = 0, pr1 = 0, pr2 = 0, pr3 = 0
+    /// Two-row sliding window stride (xsize + 2).
+    private let stride: Int
+    /// 4 planes of `stride * 2` per-predictor errors, contiguous.
+    private let predErrors: UnsafeMutablePointer<UInt32>
+    /// Two rows of `stride` signed prediction errors.
+    private let error: UnsafeMutablePointer<Int32>
 
     private static let divlookup: [UInt32] = [
         16_777_216, 8_388_608, 5_592_405, 4_194_304, 3_355_443, 2_796_202, 2_396_745, 2_097_152,
@@ -103,10 +113,27 @@ final class WPState {
     ]
 
     init(header: WPHeader, xsize: Int, ysize: Int) {
-        self.header = header
-        self.xsize = xsize
-        self.predErrors = (0..<kNumWPPredictors).map { _ in [UInt32](repeating: 0, count: (xsize + 2) * 2) }
-        self.error = [Int32](repeating: 0, count: (xsize + 2) * 2)
+        p1C = header.p1C
+        p2C = header.p2C
+        p3Ca = header.p3Ca
+        p3Cb = header.p3Cb
+        p3Cc = header.p3Cc
+        p3Cd = header.p3Cd
+        p3Ce = header.p3Ce
+        hw0 = header.w[0]
+        hw1 = header.w[1]
+        hw2 = header.w[2]
+        hw3 = header.w[3]
+        stride = xsize + 2
+        predErrors = .allocate(capacity: kNumWPPredictors * stride * 2)
+        predErrors.initialize(repeating: 0, count: kNumWPPredictors * stride * 2)
+        error = .allocate(capacity: stride * 2)
+        error.initialize(repeating: 0, count: stride * 2)
+    }
+
+    deinit {
+        predErrors.deallocate()
+        error.deallocate()
     }
 
     @inline(__always) private func addBits(_ x: Int) -> Int { x << kPredExtraBits }
@@ -119,39 +146,28 @@ final class WPState {
         return UInt32(truncatingIfNeeded: 4 + ((UInt64(maxweight) * lookup) >> UInt64(shift)))
     }
 
-    @inline(__always)
-    private func weightedAverage(_ p: [Int], _ wIn: [UInt32]) -> Int {
-        var w = wIn
-        var weightSum: UInt32 = 0
-        for i in 0..<kNumWPPredictors { weightSum += w[i] }
-        let logWeight = UInt32(floorLog2(UInt64(weightSum)))
-        weightSum = 0
-        for i in 0..<kNumWPPredictors {
-            w[i] >>= (logWeight - 4)
-            weightSum += w[i]
-        }
-        var sum = Int(weightSum >> 1) - 1
-        for i in 0..<kNumWPPredictors { sum += p[i] * Int(w[i]) }
-        return (sum * Int(Self.divlookup[Int(weightSum) - 1])) >> 24
-    }
-
     /// Computes the weighted prediction at (x, y); when `computeProperties` is
     /// set, writes the WP property into `properties[offset]`.
     func predict(
         x: Int, y: Int, xsize: Int, N nIn: Int, W wIn: Int, NE neIn: Int, NW nwIn: Int,
         NN nnIn: Int, computeProperties: Bool, properties: inout [Int32], offset: Int
     ) -> Int {
-        let curRow = (y & 1) != 0 ? 0 : (xsize + 2)
-        let prevRow = (y & 1) != 0 ? (xsize + 2) : 0
+        let curRow = (y & 1) != 0 ? 0 : stride
+        let prevRow = (y & 1) != 0 ? stride : 0
         let posN = prevRow + x
         let posNE = x < xsize - 1 ? posN + 1 : posN
         let posNW = x > 0 ? posN - 1 : posN
+        let planeSize = stride * 2
 
-        var weights = [UInt32](repeating: 0, count: kNumWPPredictors)
-        for i in 0..<kNumWPPredictors {
-            let s = UInt64(predErrors[i][posN]) + UInt64(predErrors[i][posNE]) + UInt64(predErrors[i][posNW])
-            weights[i] = errorWeight(s, header.w[i])
+        @inline(__always) func weight(_ plane: Int, _ maxw: UInt32) -> UInt32 {
+            let base = predErrors + plane * planeSize
+            let s = UInt64(base[posN]) + UInt64(base[posNE]) + UInt64(base[posNW])
+            return errorWeight(s, maxw)
         }
+        let w0In = weight(0, hw0)
+        let w1In = weight(1, hw1)
+        let w2In = weight(2, hw2)
+        let w3In = weight(3, hw3)
 
         let N = addBits(nIn)
         let W = addBits(wIn)
@@ -173,14 +189,25 @@ final class WPState {
             properties[offset] = Int32(truncatingIfNeeded: p)
         }
 
-        prediction[0] = W + NE - N
-        prediction[1] = N - (((sumWN + teNE) * header.p1C) >> 5)
-        prediction[2] = W - (((sumWN + teNW) * header.p2C) >> 5)
-        prediction[3] =
-            N - ((teNW * header.p3Ca + teN * header.p3Cb + teNE * header.p3Cc
-                + (NN - N) * header.p3Cd + (NW - W) * header.p3Ce) >> 5)
+        pr0 = W + NE - N
+        pr1 = N - (((sumWN + teNE) * p1C) >> 5)
+        pr2 = W - (((sumWN + teNW) * p2C) >> 5)
+        pr3 =
+            N - ((teNW * p3Ca + teN * p3Cb + teNE * p3Cc
+                + (NN - N) * p3Cd + (NW - W) * p3Ce) >> 5)
 
-        pred = weightedAverage(prediction, weights)
+        // Weighted average (libjxl weighted::State::Predict), scalarized.
+        var weightSum = w0In + w1In + w2In + w3In
+        let logWeight = UInt32(floorLog2(UInt64(weightSum)))
+        let downShift = logWeight - 4
+        let w0 = w0In >> downShift
+        let w1 = w1In >> downShift
+        let w2 = w2In >> downShift
+        let w3 = w3In >> downShift
+        weightSum = w0 + w1 + w2 + w3
+        var sum = Int(weightSum >> 1) - 1
+        sum += pr0 * Int(w0) + pr1 * Int(w1) + pr2 * Int(w2) + pr3 * Int(w3)
+        pred = (sum * Int(Self.divlookup[Int(weightSum) - 1])) >> 24
 
         if ((teN ^ teW) | (teN ^ teNW)) > 0 {
             return (pred + kPredictionRound) >> kPredExtraBits
@@ -192,14 +219,20 @@ final class WPState {
     }
 
     func updateErrors(_ valIn: Int, x: Int, y: Int, xsize: Int) {
-        let curRow = (y & 1) != 0 ? 0 : (xsize + 2)
-        let prevRow = (y & 1) != 0 ? (xsize + 2) : 0
+        let curRow = (y & 1) != 0 ? 0 : stride
+        let prevRow = (y & 1) != 0 ? stride : 0
         let val = addBits(valIn)
         error[curRow + x] = Int32(truncatingIfNeeded: pred - val)
-        for i in 0..<kNumWPPredictors {
-            let err = UInt32(truncatingIfNeeded: (abs(prediction[i] - val) + kPredictionRound) >> kPredExtraBits)
-            predErrors[i][curRow + x] = err
-            predErrors[i][prevRow + x + 1] &+= err
+        let planeSize = stride * 2
+        @inline(__always) func update(_ plane: Int, _ prediction: Int) {
+            let err = UInt32(truncatingIfNeeded: (abs(prediction - val) + kPredictionRound) >> kPredExtraBits)
+            let base = predErrors + plane * planeSize
+            base[curRow + x] = err
+            base[prevRow + x + 1] &+= err
         }
+        update(0, pr0)
+        update(1, pr1)
+        update(2, pr2)
+        update(3, pr3)
     }
 }

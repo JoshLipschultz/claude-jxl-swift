@@ -104,7 +104,14 @@ private func decodeChannel(
     let refCount = propCount - kNumNonrefProperties
     let references = refCount > 0 ? precomputeReferenceChannels(image: image, chan: chan, refCount: refCount) : []
 
-    let wpState = WPState(header: wpHeader, xsize: w, ysize: h)
+    // The weighted predictor's error window costs more per pixel than the rest
+    // of the decode combined; run it only when the tree can observe it — via
+    // the WP property (15) at a split or the Weighted predictor (6) at a leaf
+    // (libjxl `TreeToLookupTable` use_wp gating).
+    let treeUsesWP = tree.contains { node in
+        node.property == -1 ? node.predictor == 6 : node.property == 15
+    }
+    let wpState = treeUsesWP ? WPState(header: wpHeader, xsize: w, ysize: h) : nil
     var props = [Int32](repeating: 0, count: propCount)
     props[0] = Int32(truncatingIfNeeded: chan)
     props[1] = Int32(truncatingIfNeeded: groupID)
@@ -138,9 +145,9 @@ private func decodeChannel(
                 props[13] = Int32(truncatingIfNeeded: top - toptop)
                 props[14] = Int32(truncatingIfNeeded: left - leftleft)
 
-                let wpPred = wpState.predict(
+                let wpPred = wpState?.predict(
                     x: x, y: y, xsize: w, N: top, W: left, NE: topright, NW: topleft, NN: toptop,
-                    computeProperties: true, properties: &props, offset: 15)
+                    computeProperties: true, properties: &props, offset: 15) ?? 0
 
                 for i in 0..<refCount { props[16 + i] = references[i][rowBase + x] }
 
@@ -159,7 +166,7 @@ private func decodeChannel(
                 let v = reader.readHybridUintClustered(context, br)
                 let value = Int(unpackSigned(v)) * Int(leaf.multiplier) + guess
                 px[rowBase + x] = Int32(truncatingIfNeeded: value)
-                wpState.updateErrors(Int(px[rowBase + x]), x: x, y: y, xsize: w)
+                wpState?.updateErrors(Int(px[rowBase + x]), x: x, y: y, xsize: w)
             }
         }
     }
@@ -282,10 +289,22 @@ func modularDecode(
 /// Decodes one AC group's large channels into `fullImage` at the group's rect
 /// (libjxl ModularFrameDecoder::DecodeGroup, the use_full_image path). Single
 /// pass => shift bracket [0, 2].
-func decodeModularGroup(
+/// A decoded AC group's sub-image plus where each of its channels lands in the
+/// full image. Produced by `decodeModularGroupImage` (safe to run concurrently
+/// across groups), consumed by `blitModularGroup` (serial).
+struct ModularGroupResult {
+    let gi: ModularImage
+    let mapping: [(fullC: Int, x: Int, y: Int, w: Int, h: Int)]
+}
+
+/// Decodes one AC group's large channels into a group-local sub-image (libjxl
+/// ModularFrameDecoder::DecodeGroup, the use_full_image path). Single pass =>
+/// shift bracket [0, 2]. Reads `fullImage` only for the channel layout, so
+/// groups can decode concurrently; the writes happen in `blitModularGroup`.
+func decodeModularGroupImage(
     _ br: BitReader, fullImage: ModularImage, group g: Int, dim: FrameDimensions,
     globalTree: [MATreeNode]?, globalCode: ANSCode?, globalCtxMap: [UInt8]?, streamID: Int
-) throws {
+) throws -> ModularGroupResult? {
     let minShift = 0
     let maxShift = 2
     let groupDim = dim.groupDim
@@ -317,21 +336,29 @@ func decodeModularGroup(
         gi.channels.append(ModularChannel(w: rw, h: rh, hshift: fc.hshift, vshift: fc.vshift))
         mapping.append((c, rx, ry, rw, rh))
     }
-    if gi.channels.isEmpty { return }
+    if gi.channels.isEmpty { return nil }
 
     let header = try modularDecode(
         br, image: gi, groupID: streamID, globalTree: globalTree, globalCode: globalCode,
         globalCtxMap: globalCtxMap)
     try undoTransforms(gi, transforms: header.transforms)
+    return ModularGroupResult(gi: gi, mapping: mapping)
+}
 
-    for (gic, m) in mapping.enumerated() {
-        let src = gi.channels[gic]
-        var dst = fullImage.channels[m.fullC]
-        for yy in 0..<m.h {
-            let dstBase = (m.y + yy) * dst.w + m.x
-            let srcBase = yy * src.w
-            for xx in 0..<m.w { dst.pixels[dstBase + xx] = src.pixels[srcBase + xx] }
+/// Copies a decoded group sub-image into the full image at its rects. Mutates
+/// the destination plane in place (no COW copy of the full-size channel).
+func blitModularGroup(_ result: ModularGroupResult, into fullImage: ModularImage) {
+    for (gic, m) in result.mapping.enumerated() {
+        let srcW = result.gi.channels[gic].w
+        let dstW = fullImage.channels[m.fullC].w
+        result.gi.channels[gic].pixels.withUnsafeBufferPointer { s in
+            fullImage.channels[m.fullC].pixels.withUnsafeMutableBufferPointer { d in
+                for yy in 0..<m.h {
+                    let dstBase = (m.y + yy) * dstW + m.x
+                    let srcBase = yy * srcW
+                    for xx in 0..<m.w { d[dstBase + xx] = s[srcBase + xx] }
+                }
+            }
         }
-        fullImage.channels[m.fullC] = dst
     }
 }

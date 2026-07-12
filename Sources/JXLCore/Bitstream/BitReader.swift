@@ -56,9 +56,27 @@ public final class BitReader {
     public var allReadsWithinBounds: Bool { !didOverread && bitPosition <= bitCount }
 
     /// Reads `count` bits (0...64), LSB-first, and returns them right-aligned.
+    ///
+    /// Fast path: while at least 8 bytes remain in the window, a single
+    /// unaligned 64-bit load supplies up to 56 bits (after the ≤7-bit intra-byte
+    /// shift) — this is the hot path under every entropy-coded stream. The
+    /// byte-at-a-time loop remains as the tail/large-count fallback.
     @discardableResult
     public func read(_ count: Int) -> UInt64 {
         precondition(count >= 0 && count <= 64, "read(\(count)) out of range")
+        let byteIndex = baseByte + (bitPosition >> 3)
+        if count <= 56 && byteIndex + 8 <= endByte {
+            let word = data.withUnsafeBytes {
+                $0.loadUnaligned(fromByteOffset: byteIndex, as: UInt64.self)
+            }.littleEndian
+            let value = (word >> UInt64(bitPosition & 7)) & ((UInt64(1) << UInt64(count)) - 1)
+            bitPosition += count
+            return value
+        }
+        return readSlow(count)
+    }
+
+    private func readSlow(_ count: Int) -> UInt64 {
         if count == 0 { return 0 }
 
         var result: UInt64 = 0

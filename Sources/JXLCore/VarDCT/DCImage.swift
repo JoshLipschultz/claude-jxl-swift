@@ -207,33 +207,33 @@ private func adaptiveDCSmoothing(
     let inY = y
     let inB = b
 
+    let facX = dcFactors[0]
+    let facY = dcFactors[1]
+    let facB = dcFactors[2]
+    // 3x3 smooth of one plane at `c`; returns (center, smoothed).
+    @inline(__always) func smooth(_ p: [Float], _ c: Int, _ top: Int, _ bot: Int) -> (Float, Float) {
+        let corner = (p[top - 1] + p[top + 1]) + (p[bot - 1] + p[bot + 1])
+        let side = (p[c - 1] + p[c + 1]) + (p[top] + p[bot])
+        return (p[c], corner * kSmoothW2 + side * kSmoothW1 + p[c] * kSmoothW0)
+    }
     for yy in 1..<(h - 1) {
         for xx in 1..<(w - 1) {
             let c = yy * w + xx
             let top = c - w
             let bot = c + w
 
+            let (mcX, smX) = smooth(inX, c, top, bot)
+            let (mcY, smY) = smooth(inY, c, top, bot)
+            let (mcB, smB) = smooth(inB, c, top, bot)
             var gap: Float = 0.5
-            var mc = [Float](repeating: 0, count: 3)
-            var sm = [Float](repeating: 0, count: 3)
-            let chans = [inX, inY, inB]
-            for ch in 0..<3 {
-                let p = chans[ch]
-                let tl = p[top - 1], tc = p[top], tr = p[top + 1]
-                let ml = p[c - 1], center = p[c], mr = p[c + 1]
-                let bl = p[bot - 1], bc = p[bot], brr = p[bot + 1]
-                let corner = (tl + tr) + (bl + brr)
-                let side = (ml + mr) + (tc + bc)
-                let smoothed = corner * kSmoothW2 + side * kSmoothW1 + center * kSmoothW0
-                mc[ch] = center
-                sm[ch] = smoothed
-                gap = max(gap, abs((center - smoothed) / dcFactors[ch]))
-            }
+            gap = max(gap, abs((mcX - smX) / facX))
+            gap = max(gap, abs((mcY - smY) / facY))
+            gap = max(gap, abs((mcB - smB) / facB))
             var factor = 3.0 - 4.0 * gap
             if factor < 0 { factor = 0 }
-            x[c] = (sm[0] - mc[0]) * factor + mc[0]
-            y[c] = (sm[1] - mc[1]) * factor + mc[1]
-            b[c] = (sm[2] - mc[2]) * factor + mc[2]
+            x[c] = (smX - mcX) * factor + mcX
+            y[c] = (smY - mcY) * factor + mcY
+            b[c] = (smB - mcB) * factor + mcB
         }
     }
 }
