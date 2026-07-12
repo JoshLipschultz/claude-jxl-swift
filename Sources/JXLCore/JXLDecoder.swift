@@ -1,10 +1,10 @@
 // JXLDecoder.swift
 //
-// Top-level entry points. This is the orchestrator that will grow to drive the
-// full decode pipeline (headers -> frames -> entropy -> Modular/VarDCT -> pixels).
-//
-// Current milestone (M2 partial): container demux + dimensions + basic image
-// metadata. Frame, entropy, Modular/VarDCT, and pixel decoding land next.
+// Top-level entry points. Every pixel- and frame-level API is a thin wrapper
+// over `FrameDecoder` (Frame/FrameDecoder.swift), which parses the container,
+// codestream headers, FrameHeader, and TOC exactly once and caches each decode
+// stage. `readInfo` stays standalone: it reads only through ImageMetadata and
+// must work even for frames the frame parser cannot yet handle.
 
 import Foundation
 
@@ -67,25 +67,6 @@ public struct JXLFrameInfo {
     public let codestreamLength: Int
 }
 
-private func sectionRole(
-    logicalIndex: Int, numGroups: Int, numDCGroups: Int, numPasses: Int
-) -> JXLFrameSectionRole {
-    if numGroups == 1 && numPasses == 1 {
-        return .singleSectionCoalesced
-    }
-
-    if logicalIndex == 0 { return .dcGlobal }
-
-    let acGlobalIndex = numDCGroups + 1
-    if logicalIndex < acGlobalIndex {
-        return .dcGroup(logicalIndex - 1)
-    }
-    if logicalIndex == acGlobalIndex { return .acGlobal }
-
-    let acIndex = logicalIndex - acGlobalIndex - 1
-    return .acGroup(pass: acIndex / numGroups, group: acIndex % numGroups)
-}
-
 /// A decoded raster image: one Int32 plane per channel (color channels first,
 /// then extra channels such as alpha), each `width * height` row-major.
 public struct JXLDecodedImage {
@@ -139,203 +120,57 @@ public enum JXL {
         try readInfo(from: [UInt8](data))
     }
 
+    /// Convenience overload reading a file from disk.
+    public static func readInfo(contentsOf url: URL) throws -> JXLImageInfo {
+        try readInfo(from: try Data(contentsOf: url))
+    }
+
     /// Structural information about the first frame: encoding, group grid, and
     /// the TOC section layout. Available without decoding pixels.
     public static func readFrameInfo(from data: [UInt8]) throws -> JXLFrameInfo {
-        let parsed = try JXLContainer.parse(data)
-        guard parsed.codestream.count >= 2,
-            parsed.codestream[0] == 0xFF, parsed.codestream[1] == 0x0A
-        else { throw JXLError.invalidSignature }
-
-        let reader = BitReader(parsed.codestream)
-        reader.skip(16)
-        let size = SizeHeader(reader)
-        let metadata = JXLImageMetadata(reader)
-        CustomTransformData.skip(reader, xybEncoded: metadata.xybEncoded)
-        if metadata.colorEncoding.wantICC {
-            // A compressed ICC profile would follow here; not yet supported.
-            throw JXLError.unsupported("embedded ICC profile")
-        }
-        // The codestream headers are followed by byte alignment before the frames
-        // (libjxl JxlDecoderReadAllHeaders -> JumpToByteBoundary).
-        reader.alignToByte()
-
-        let ctx = FrameContext(metadata: metadata, width: size.width, height: size.height)
-        let frameHeader = FrameHeader(reader: reader, context: ctx)
-        let dim = frameHeader.frameDimensions(ctx)
-        let entries = numTocEntries(
-            numGroups: dim.numGroups, numDCGroups: dim.numDCGroups,
-            numPasses: Int(frameHeader.numPasses))
-
-        guard let toc = readGroupOffsets(reader, tocEntries: entries) else {
-            throw JXLError.malformed("could not read TOC")
-        }
-        try reader.ensureInBounds("TOC")
-
-        let dataStartByte = reader.bitPosition / 8
-        let sections = toc.offsets.enumerated().map { index, offset in
-            let size = Int(toc.sizes[index])
-            let start = dataStartByte + offset
-            return JXLFrameSectionInfo(
-                index: index,
-                role: sectionRole(
-                    logicalIndex: index, numGroups: dim.numGroups,
-                    numDCGroups: dim.numDCGroups, numPasses: Int(frameHeader.numPasses)),
-                offset: offset,
-                size: size,
-                codestreamRange: start..<(start + size))
-        }
-
-        return JXLFrameInfo(
-            isModular: frameHeader.isModular,
-            frameType: frameHeader.frameType,
-            flags: frameHeader.flags,
-            isLast: frameHeader.isLast,
-            numGroups: dim.numGroups,
-            numDCGroups: dim.numDCGroups,
-            numPasses: Int(frameHeader.numPasses),
-            tocEntryCount: entries,
-            sectionSizes: toc.sizes,
-            sections: sections,
-            totalSectionBytes: toc.totalSize,
-            dataStartByte: dataStartByte,
-            codestreamLength: parsed.codestream.count)
+        try FrameDecoder(data: data).frameInfo()
     }
 
     public static func readFrameInfo(from data: Data) throws -> JXLFrameInfo {
         try readFrameInfo(from: [UInt8](data))
     }
 
+    public static func readFrameInfo(contentsOf url: URL) throws -> JXLFrameInfo {
+        try readFrameInfo(from: try Data(contentsOf: url))
+    }
+
     /// Decodes a JPEG XL image to pixel planes. Modular (lossless) frames return
     /// their native samples (integers as values, 32-bit float as IEEE-754 bit
     /// patterns); VarDCT (lossy) frames reconstruct to three 8-bit sRGB planes.
-    /// A single regular frame is supported.
-    public static func decodeImage(from data: [UInt8]) throws -> JXLDecodedImage {
-        let parsed = try JXLContainer.parse(data)
-        guard parsed.codestream.count >= 2,
-            parsed.codestream[0] == 0xFF, parsed.codestream[1] == 0x0A
-        else { throw JXLError.invalidSignature }
-
-        let reader = BitReader(parsed.codestream)
-        reader.skip(16)
-        let size = SizeHeader(reader)
-        let metadata = JXLImageMetadata(reader)
-        CustomTransformData.skip(reader, xybEncoded: metadata.xybEncoded)
-        if metadata.colorEncoding.wantICC { throw JXLError.unsupported("embedded ICC profile") }
-        reader.alignToByte()
-
-        let ctx = FrameContext(metadata: metadata, width: size.width, height: size.height)
-        let frameHeader = FrameHeader(reader: reader, context: ctx)
-        // VarDCT (lossy) frames reconstruct to 8-bit sRGB via the VarDCT path.
-        if !frameHeader.isModular {
-            return try reconstructVarDCTDecodedImage(from: data)
-        }
-        guard frameHeader.frameType == .regular, frameHeader.flags == 0 else {
-            throw JXLError.unsupported("non-regular or feature-flagged frames")
-        }
-        if metadata.bitDepth.isFloatingPoint && metadata.bitDepth.bitsPerSample != 32 {
-            throw JXLError.unsupported("non-binary32 floating-point samples")
-        }
-
-        guard frameHeader.numPasses == 1 else {
-            throw JXLError.unsupported("progressive (multi-pass) frames")
-        }
-        let dim = frameHeader.frameDimensions(ctx)
-
-        let entries = numTocEntries(
-            numGroups: dim.numGroups, numDCGroups: dim.numDCGroups,
-            numPasses: Int(frameHeader.numPasses))
-        guard let toc = readGroupOffsets(reader, tocEntries: entries) else {
-            throw JXLError.malformed("could not read TOC")
-        }
-        let dataStart = reader.bitPosition / 8
-        let cs = parsed.codestream
-        func sectionReader(_ logicalIndex: Int) -> BitReader {
-            let start = dataStart + toc.offsets[logicalIndex]
-            return BitReader(Array(cs[start..<(start + Int(toc.sizes[logicalIndex]))]))
-        }
-
-        // Global modular (section 0 = LfGlobal): DequantMatrices.DecodeDC, then
-        // has_tree / the global MA tree + code, then the global modular stream.
-        let r0 = sectionReader(0)
-        if r0.read(1) == 0 {
-            for _ in 0..<3 { _ = r0.readF16() }
-        }
-        var globalTree: [MATreeNode]? = nil
-        var globalCode: ANSCode? = nil
-        var globalCtxMap: [UInt8]? = nil
-        if r0.read(1) == 1 {  // has_tree
-            guard let tree = decodeMATree(r0, treeSizeLimit: 1 << 22),
-                let (code, ctxMap) = decodeHistograms(
-                    r0, numContexts: (tree.count + 1) / 2, disallowLZ77: false)
-            else { throw JXLError.malformed("could not read global modular tree") }
-            globalTree = tree
-            globalCode = code
-            globalCtxMap = ctxMap
-        }
-
-        let isGray = metadata.colorSpace == .grayscale && frameHeader.colorTransform == .none
-        let colorChannels = isGray ? 1 : 3
-        let extra = metadata.extraChannelCount
-        let fullImage = ModularImage(
-            w: dim.xsize, h: dim.ysize, bitdepth: Int(metadata.bitDepth.bitsPerSample),
-            channelCount: colorChannels + extra)
-
-        // For a single group the global stream carries every channel; otherwise
-        // large channels are decoded per AC group.
-        let maxChan = dim.numGroups == 1 ? Int.max : dim.groupDim
-        let globalHeader = try modularDecode(
-            r0, image: fullImage, groupID: 0, globalTree: globalTree, globalCode: globalCode,
-            globalCtxMap: globalCtxMap, maxChanSize: maxChan)
-
-        if dim.numGroups > 1 {
-            for g in 0..<dim.numGroups {
-                let section = acGroupIndex(
-                    pass: 0, group: g, numGroups: dim.numGroups, numDCGroups: dim.numDCGroups)
-                // ModularStreamId::ModularAC(g, pass 0).ID  (kNumQuantTables = 17)
-                let streamID = 1 + 3 * dim.numDCGroups + 17 + g
-                try decodeModularGroup(
-                    sectionReader(section), fullImage: fullImage, group: g, dim: dim,
-                    globalTree: globalTree, globalCode: globalCode, globalCtxMap: globalCtxMap,
-                    streamID: streamID)
-            }
-        }
-
-        try undoTransforms(fullImage, transforms: globalHeader.transforms)
-
-        return JXLDecodedImage(
-            width: dim.xsize, height: dim.ysize, colorChannels: colorChannels,
-            extraChannels: extra, bitsPerSample: Int(metadata.bitDepth.bitsPerSample),
-            isFloat: metadata.bitDepth.isFloatingPoint,
-            planes: fullImage.channels.map { $0.pixels })
+    /// A single regular frame is supported. `limits` bounds the allocations a
+    /// (possibly hostile) header can demand.
+    public static func decodeImage(
+        from data: [UInt8], limits: JXLDecodeLimits = .default
+    ) throws -> JXLDecodedImage {
+        try FrameDecoder(data: data, limits: limits).decodeImage()
     }
 
-    public static func decodeImage(from data: Data) throws -> JXLDecodedImage {
-        try decodeImage(from: [UInt8](data))
+    public static func decodeImage(
+        from data: Data, limits: JXLDecodeLimits = .default
+    ) throws -> JXLDecodedImage {
+        try decodeImage(from: [UInt8](data), limits: limits)
     }
 
-    public static func decodeImage(contentsOf url: URL) throws -> JXLDecodedImage {
-        try decodeImage(from: try Data(contentsOf: url))
-    }
-
-    public static func readFrameInfo(contentsOf url: URL) throws -> JXLFrameInfo {
-        try readFrameInfo(from: try Data(contentsOf: url))
+    public static func decodeImage(
+        contentsOf url: URL, limits: JXLDecodeLimits = .default
+    ) throws -> JXLDecodedImage {
+        try decodeImage(from: try Data(contentsOf: url), limits: limits)
     }
 
     /// Returns the raw bytes for one logical frame section. The section range is
     /// resolved against the bare codestream, so this works for both raw and
     /// container-wrapped `.jxl` inputs.
     public static func readFrameSectionData(from data: [UInt8], sectionIndex: Int) throws -> Data {
-        let parsed = try JXLContainer.parse(data)
-        let info = try readFrameInfo(from: data)
-        guard sectionIndex >= 0 && sectionIndex < info.sections.count else {
+        let decoder = try FrameDecoder(data: data)
+        guard sectionIndex >= 0 && sectionIndex < decoder.sectionCount else {
             throw JXLError.malformed("frame section index out of range")
         }
-        let range = info.sections[sectionIndex].codestreamRange
-        guard range.lowerBound >= 0 && range.upperBound <= parsed.codestream.count else {
-            throw JXLError.malformed("frame section range outside codestream")
-        }
-        return Data(parsed.codestream[range])
+        return Data(decoder.codestream[decoder.sectionRange(sectionIndex)])
     }
 
     public static func readFrameSectionData(from data: Data, sectionIndex: Int) throws -> Data {
@@ -350,7 +185,11 @@ public enum JXL {
     public static func readFrameSectionReader(from data: [UInt8], sectionIndex: Int) throws
         -> BitReader
     {
-        BitReader([UInt8](try readFrameSectionData(from: data, sectionIndex: sectionIndex)))
+        let decoder = try FrameDecoder(data: data)
+        guard sectionIndex >= 0 && sectionIndex < decoder.sectionCount else {
+            throw JXLError.malformed("frame section index out of range")
+        }
+        return decoder.sectionReader(sectionIndex)
     }
 
     public static func readFrameSectionReader(from data: Data, sectionIndex: Int) throws
@@ -371,17 +210,19 @@ public enum JXL {
     /// is in a distinct TOC section. Single-section VarDCT frames return `nil` for
     /// `acGlobal` because DC groups precede AC-global inside the same section.
     public static func readVarDCTInfo(from data: [UInt8]) throws -> JXLVarDCTInfo {
-        let frame = try readFrameInfo(from: data)
+        let decoder = try FrameDecoder(data: data)
+        let frame = decoder.frameInfo()
         guard !frame.isModular else { throw JXLError.unsupported("Modular frame is not VarDCT") }
 
-        let dcGlobal = try readVarDCTDCGlobalInfo(
-            readFrameSectionReader(from: data, sectionIndex: 0))
+        // Preflight reads use their own section readers (not the staged decode
+        // path), so they work on frames the strict pipeline still rejects.
+        let dcGlobal = try readVarDCTDCGlobalInfo(decoder.sectionReader(0))
         let acGlobalIndex =
             frame.numGroups == 1 && frame.numPasses == 1 ? nil : frame.numDCGroups + 1
         let acGlobal: VarDCTACGlobalInfo?
         if let acGlobalIndex {
             acGlobal = try readVarDCTACGlobalInfo(
-                readFrameSectionReader(from: data, sectionIndex: acGlobalIndex),
+                decoder.sectionReader(acGlobalIndex),
                 frame: frame,
                 blockContextMap: dcGlobal.blockContextMap)
         } else {
@@ -396,10 +237,5 @@ public enum JXL {
 
     public static func readVarDCTInfo(contentsOf url: URL) throws -> JXLVarDCTInfo {
         try readVarDCTInfo(from: try Data(contentsOf: url))
-    }
-
-    /// Convenience overload reading a file from disk.
-    public static func readInfo(contentsOf url: URL) throws -> JXLImageInfo {
-        try readInfo(from: try Data(contentsOf: url))
     }
 }

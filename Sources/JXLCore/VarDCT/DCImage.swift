@@ -36,7 +36,7 @@ struct DCDequant {
     let cfl: [Float]
 }
 
-private func computeDCDequant(_ g: VarDCTDCGlobalInfo) -> DCDequant {
+func computeDCDequant(_ g: VarDCTDCGlobalInfo) -> DCDequant {
     let globalScale = Float(g.quantizer.globalScale)
     let quantDC = Float(g.quantizer.quantDC)
     // inv_global_scale_ = kGlobalScaleDenom / global_scale_; (kGlobalScaleDenom = 1<<16)
@@ -62,127 +62,73 @@ private func computeDCDequant(_ g: VarDCTDCGlobalInfo) -> DCDequant {
     return DCDequant(mulDC: mulDC, cfl: cfl)
 }
 
-/// Shared parse state for a VarDCT frame: everything through `ProcessDCGlobal`,
-/// plus the per-section readers. Used by both the DC-image and AC-metadata
-/// decoders so the header/TOC/DC-global prefix is parsed once.
-struct VarDCTSetup {
-    let metadata: JXLImageMetadata
-    let frameHeader: FrameHeader
-    let dim: FrameDimensions
-    let dcGlobal: VarDCTDCGlobalDecoded
-    let dequant: DCDequant
-    let coalesced: Bool
-    /// Section 0 reader, positioned immediately after `ProcessDCGlobal`.
-    let r0: BitReader
-    let cs: [UInt8]
-    let dataStart: Int
-    let offsets: [Int]
-    let sizes: [Int]
-
-    func sectionReader(_ logicalIndex: Int) -> BitReader {
-        let start = dataStart + offsets[logicalIndex]
-        return BitReader(Array(cs[start..<(start + sizes[logicalIndex])]))
-    }
-
-    /// The reader to use for DC group `dcg`: the shared section-0 reader for a
-    /// coalesced single-section frame, else the DC group's own section.
-    func dcGroupReader(_ dcg: Int) -> BitReader {
-        coalesced ? r0 : sectionReader(1 + dcg)
-    }
-
-    /// DC group `dcg`'s rect in block units.
-    func dcGroupRect(_ dcg: Int) -> (x0: Int, y0: Int, w: Int, h: Int) {
-        let gx = dcg % dim.xsizeDCGroups
-        let gy = dcg / dim.xsizeDCGroups
-        let x0 = gx * dim.groupDim
-        let y0 = gy * dim.groupDim
-        return (x0, y0, min(dim.groupDim, dim.xsizeBlocks - x0),
-            min(dim.groupDim, dim.ysizeBlocks - y0))
-    }
+/// The decoded low-frequency layer of a VarDCT frame: the dequantized XYB DC
+/// planes and the AC metadata (strategies, quant field, EPF sharpness, CfL
+/// maps). Both live in the same per-DC-group TOC sections (`VarDCTDC` then
+/// `AcMetadata` behind one ANS final-state check), so they are decoded together
+/// in a single pass per group.
+struct VarDCTLowFrequency {
+    let dc: VarDCTDCImage
+    let metadata: VarDCTACMetadata
 }
 
-/// Parses a VarDCT frame through `ProcessDCGlobal`. Restricted to the currently
-/// supported subset: single-pass, 4:4:4, no patches/splines/noise.
-func setupVarDCT(_ data: [UInt8]) throws -> VarDCTSetup {
-    let parsed = try JXLContainer.parse(data)
-    guard parsed.codestream.count >= 2,
-        parsed.codestream[0] == 0xFF, parsed.codestream[1] == 0x0A
-    else { throw JXLError.invalidSignature }
-
-    let reader = BitReader(parsed.codestream)
-    reader.skip(16)
-    let size = SizeHeader(reader)
-    let metadata = JXLImageMetadata(reader)
-    CustomTransformData.skip(reader, xybEncoded: metadata.xybEncoded)
-    if metadata.colorEncoding.wantICC { throw JXLError.unsupported("embedded ICC profile") }
-    reader.alignToByte()
-
-    let ctx = FrameContext(metadata: metadata, width: size.width, height: size.height)
-    let frameHeader = FrameHeader(reader: reader, context: ctx)
-    guard !frameHeader.isModular else { throw JXLError.unsupported("Modular frame is not VarDCT") }
-    guard frameHeader.frameType == .regular else {
-        throw JXLError.unsupported("non-regular VarDCT frame")
-    }
-    guard frameHeader.numPasses == 1 else {
-        throw JXLError.unsupported("progressive (multi-pass) VarDCT frames")
-    }
-    guard frameHeader.chromaChannelMode == [0, 0, 0] else {
-        throw JXLError.unsupported("chroma-subsampled VarDCT frames")
-    }
-    // No patches/splines/noise: those precede DequantMatrices.DecodeDC and are
-    // not yet parsed.
-    guard frameHeader.flags == 0 else {
-        throw JXLError.unsupported("VarDCT frame features (patches/splines/noise)")
-    }
-
-    let dim = frameHeader.frameDimensions(ctx)
-    let entries = numTocEntries(
-        numGroups: dim.numGroups, numDCGroups: dim.numDCGroups,
-        numPasses: Int(frameHeader.numPasses))
-    guard let toc = readGroupOffsets(reader, tocEntries: entries) else {
-        throw JXLError.malformed("could not read TOC")
-    }
-    let dataStart = reader.bitPosition / 8
-    let cs = parsed.codestream
-
-    let coalesced = dim.numGroups == 1 && frameHeader.numPasses == 1
-
-    // ProcessDCGlobal (section 0), keeping the global tree/code/context map.
-    let start0 = dataStart + toc.offsets[0]
-    let r0 = BitReader(Array(cs[start0..<(start0 + Int(toc.sizes[0]))]))
-    let dcGlobal = try readVarDCTDCGlobal(r0)
-    let dequant = computeDCDequant(dcGlobal.info)
-
-    return VarDCTSetup(
-        metadata: metadata, frameHeader: frameHeader, dim: dim, dcGlobal: dcGlobal,
-        dequant: dequant, coalesced: coalesced, r0: r0, cs: cs, dataStart: dataStart,
-        offsets: toc.offsets, sizes: toc.sizes.map(Int.init))
-}
-
-/// Decodes the dequantized XYB DC image of a single-pass, 4:4:4 VarDCT frame.
-public func decodeVarDCTDCImage(from data: [UInt8]) throws -> VarDCTDCImage {
-    let s = try setupVarDCT(data)
-    let dim = s.dim
+/// Decodes every DC group's `VarDCTDC` + `AcMetadata` (libjxl `ProcessDCGroup`)
+/// in one pass, then applies adaptive DC smoothing. For a coalesced frame this
+/// leaves `d.r0` positioned at HfGlobal.
+func decodeVarDCTLowFrequency(_ d: FrameDecoder) throws -> VarDCTLowFrequency {
+    let dcGlobal = try d.varDCTDCGlobal()
+    let dequant = try d.varDCTDCDequant()
+    let dim = d.dim
     let bw = dim.xsizeBlocks
     let bh = dim.ysizeBlocks
     var planeX = [Float](repeating: 0, count: bw * bh)
     var planeY = [Float](repeating: 0, count: bw * bh)
     var planeB = [Float](repeating: 0, count: bw * bh)
 
-    // ProcessDCGroup: decode each DC group's VarDCTDC stream into the planes.
+    let ctw = divCeil(bw, kColorTileDimInBlocks)
+    let cth = divCeil(bh, kColorTileDimInBlocks)
+    var meta = VarDCTACMetadata(
+        widthBlocks: bw, heightBlocks: bh,
+        strategy: [UInt8](repeating: 0, count: bw * bh),
+        isFirstBlock: [Bool](repeating: false, count: bw * bh),
+        quantField: [Int32](repeating: 0, count: bw * bh),
+        epfSharpness: [UInt8](repeating: 0, count: bw * bh),
+        ytoxMap: [Int8](repeating: 0, count: ctw * cth),
+        ytobMap: [Int8](repeating: 0, count: ctw * cth),
+        colorTileWidth: ctw, colorTileHeight: cth, varblockCount: 0, usedACs: 0)
+    // `valid[i]` mirrors libjxl AcStrategyImage validity: a block is valid once
+    // covered by a placed varblock.
+    var valid = [Bool](repeating: false, count: bw * bh)
+    var totalVarblocks = 0
+    var usedACs: UInt32 = 0
+
     for dcg in 0..<dim.numDCGroups {
-        let rect = s.dcGroupRect(dcg)
+        let rect = d.dcGroupRect(dcg)
+        let reader = d.dcGroupReader(dcg)
         try decodeVarDCTDC(
-            s.dcGroupReader(dcg), groupIndex: dcg, rectW: rect.w, rectH: rect.h,
-            dcGlobal: s.dcGlobal, dequant: s.dequant,
+            reader, groupIndex: dcg, rectW: rect.w, rectH: rect.h,
+            dcGlobal: dcGlobal, dequant: dequant,
             destX: &planeX, destY: &planeY, destB: &planeB,
             destW: bw, x0: rect.x0, y0: rect.y0)
+        // (ModularDC reads nothing without extra channels.)
+        try decodeAcMetadataGroup(
+            reader, groupIndex: dcg, rect: rect, dim: dim,
+            dcGlobal: dcGlobal, meta: &meta, valid: &valid,
+            totalVarblocks: &totalVarblocks, usedACs: &usedACs)
     }
+    meta.varblockCount = totalVarblocks
+    meta.usedACs = usedACs
 
     adaptiveDCSmoothing(
-        dcFactors: s.dequant.mulDC, w: bw, h: bh, x: &planeX, y: &planeY, b: &planeB)
+        dcFactors: dequant.mulDC, w: bw, h: bh, x: &planeX, y: &planeY, b: &planeB)
 
-    return VarDCTDCImage(widthBlocks: bw, heightBlocks: bh, x: planeX, y: planeY, b: planeB)
+    let dc = VarDCTDCImage(widthBlocks: bw, heightBlocks: bh, x: planeX, y: planeY, b: planeB)
+    return VarDCTLowFrequency(dc: dc, metadata: meta)
+}
+
+/// Decodes the dequantized XYB DC image of a single-pass, 4:4:4 VarDCT frame.
+public func decodeVarDCTDCImage(from data: [UInt8]) throws -> VarDCTDCImage {
+    try FrameDecoder(data: data).varDCTLowFrequency().dc
 }
 
 public func decodeVarDCTDCImage(from data: Data) throws -> VarDCTDCImage {

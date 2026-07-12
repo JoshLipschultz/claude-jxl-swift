@@ -19,6 +19,11 @@ public enum JXLError: Error, CustomStringConvertible, Equatable {
     /// The stream is structurally invalid (violates the spec).
     case malformed(String)
 
+    /// The image is valid but exceeds the caller's `JXLDecodeLimits` (e.g. a
+    /// header claiming enormous dimensions). Guards against decode bombs when
+    /// parsing untrusted files.
+    case limitExceeded(String)
+
     public var description: String {
         switch self {
         case .invalidSignature:
@@ -29,6 +34,8 @@ public enum JXLError: Error, CustomStringConvertible, Equatable {
             return "Unsupported JPEG XL feature: \(what)."
         case .malformed(let why):
             return "Malformed JPEG XL stream: \(why)."
+        case .limitExceeded(let what):
+            return "JPEG XL image exceeds decode limits: \(what)."
         }
     }
 }

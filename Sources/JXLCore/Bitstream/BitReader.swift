@@ -11,22 +11,39 @@
 import Foundation
 
 public final class BitReader {
-    /// Backing bytes (the raw codestream, signature already consumed by the caller
-    /// or skipped via `skip`).
+    /// Backing bytes. May be shared with other readers: `baseByte`/`endByte`
+    /// bound this reader's window, so sections of one codestream can each get a
+    /// reader without copying (Swift arrays are copy-on-write; nobody mutates).
     private let data: [UInt8]
+    private let baseByte: Int
+    private let endByte: Int
 
-    /// Absolute position, in bits, from the start of `data`.
+    /// Position, in bits, from the start of this reader's window.
     public private(set) var bitPosition: Int = 0
 
-    /// Set once a read crosses the end of `data`. Headers should never trigger this.
+    /// Set once a read crosses the end of the window. Headers should never trigger this.
     public private(set) var didOverread: Bool = false
 
     public init(_ data: [UInt8]) {
         self.data = data
+        self.baseByte = 0
+        self.endByte = data.count
     }
 
-    /// Total number of bits in the buffer.
-    public var bitCount: Int { data.count * 8 }
+    /// A reader over `byteRange` of `data`, sharing the storage (no copy).
+    /// `bitPosition` is relative to the start of the range. The range must lie
+    /// within `data`; callers validate untrusted ranges before constructing.
+    public init(_ data: [UInt8], byteRange: Range<Int>) {
+        precondition(
+            byteRange.lowerBound >= 0 && byteRange.upperBound <= data.count,
+            "BitReader byteRange outside buffer")
+        self.data = data
+        self.baseByte = byteRange.lowerBound
+        self.endByte = byteRange.upperBound
+    }
+
+    /// Total number of bits in the window.
+    public var bitCount: Int { (endByte - baseByte) * 8 }
 
     /// Bits remaining before the end of the buffer.
     public var bitsRemaining: Int { max(0, bitCount - bitPosition) }
@@ -47,10 +64,10 @@ public final class BitReader {
         var result: UInt64 = 0
         var produced = 0
         while produced < count {
-            let byteIndex = bitPosition >> 3
+            let byteIndex = baseByte + (bitPosition >> 3)
             let bitOffset = bitPosition & 7
             let current: UInt64
-            if byteIndex < data.count {
+            if byteIndex < endByte {
                 current = UInt64(data[byteIndex])
             } else {
                 current = 0

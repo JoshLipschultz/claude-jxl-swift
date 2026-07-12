@@ -15,7 +15,6 @@
 import Foundation
 
 private let kDCTBlockSize = 64
-private let kColorTileDimInBlocks = 8
 private let kNonZeroBuckets = 37
 private let kZeroDensityContextCount = 458
 private let kZeroDensityContextLimit = 474
@@ -108,14 +107,16 @@ private func log2OfPow2(_ v: Int) -> Int { v.trailingZeroBitCount }
 
 /// Decodes all AC coefficients of a single-pass, 4:4:4 VarDCT frame.
 public func decodeVarDCTCoefficients(from data: [UInt8]) throws -> VarDCTCoefficients {
-    let s = try setupVarDCT(data)
-    let meta = try decodeLowFrequency(s)
-    let acReader = s.coalesced ? s.r0 : s.sectionReader(s.dim.numDCGroups + 1)
-    let acGlobal = try decodeVarDCTACGlobal(
-        acReader, dim: s.dim, numPasses: Int(s.frameHeader.numPasses),
-        blockContextMap: s.dcGlobal.info.blockContextMap, usedACs: meta.usedACs)
+    try FrameDecoder(data: data).varDCTCoefficients()
+}
 
-    let bctx = s.dcGlobal.info.blockContextMap
+/// Stage implementation for `FrameDecoder.varDCTCoefficients()`: forces the
+/// low-frequency and AC-global stages, then entropy-decodes every AC group.
+func decodeVarDCTCoefficients(_ d: FrameDecoder) throws -> VarDCTCoefficients {
+    let meta = try d.varDCTLowFrequency().metadata
+    let acGlobal = try d.varDCTACGlobal()
+
+    let bctx = try d.varDCTDCGlobal().info.blockContextMap
     // Context map padded by the "cheat" margin so out-of-range zero-density
     // contexts index validly (libjxl resize to num_contexts + limit - count).
     let numContexts = acGlobal.numHistograms * bctx.numACContexts
@@ -129,28 +130,24 @@ public func decodeVarDCTCoefficients(from data: [UInt8]) throws -> VarDCTCoeffic
 
     var blocks: [VarDCTBlock] = []
     var totalNonZeros = 0
-    let bgDim = s.dim.groupDim >> 3  // group dimension in blocks
+    let dim = d.dim
+    let bgDim = dim.groupDim >> 3  // group dimension in blocks
 
-    for g in 0..<s.dim.numGroups {
-        let gx = g % s.dim.xsizeGroups
-        let gy = g / s.dim.xsizeGroups
+    // Each AC group is a pure function of its own section bytes plus the
+    // immutable globals above, so this loop can become concurrent per group
+    // (coalesced frames excepted: they share one sequential reader).
+    for g in 0..<dim.numGroups {
+        let gx = g % dim.xsizeGroups
+        let gy = g / dim.xsizeGroups
         let bx0 = gx * bgDim
         let by0 = gy * bgDim
-        let gw = min(bgDim, s.dim.xsizeBlocks - bx0)
-        let gh = min(bgDim, s.dim.ysizeBlocks - by0)
+        let gw = min(bgDim, dim.xsizeBlocks - bx0)
+        let gh = min(bgDim, dim.ysizeBlocks - by0)
 
-        let groupReader: BitReader
-        if s.coalesced {
-            groupReader = s.r0
-        } else {
-            let section = acGroupIndex(
-                pass: 0, group: g, numGroups: s.dim.numGroups, numDCGroups: s.dim.numDCGroups)
-            groupReader = s.sectionReader(section)
-        }
         try decodeACGroup(
-            groupReader, meta: meta, acGlobal: acGlobal, bctx: bctx, ctxMap: ctxMap,
+            d.acGroupReader(g), meta: meta, acGlobal: acGlobal, bctx: bctx, ctxMap: ctxMap,
             histoSelectorBits: histoSelectorBits, bx0: bx0, by0: by0, gw: gw, gh: gh,
-            blockW: s.dim.xsizeBlocks, blocks: &blocks, totalNonZeros: &totalNonZeros)
+            blockW: dim.xsizeBlocks, blocks: &blocks, totalNonZeros: &totalNonZeros)
     }
 
     return VarDCTCoefficients(blocks: blocks, totalNonZeros: totalNonZeros)

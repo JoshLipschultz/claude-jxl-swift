@@ -60,8 +60,9 @@ Sources/JXLCore/
     FrameHeader.swift   frame type, passes, blending               [M4 ✅ partial]
     FrameDimensions.swift group/DC-group grid math                 [M4 ✅ partial]
     TOC.swift           section-size table + permutation decode    [M4 ✅ partial]
-    Frame.swift         group/pass orchestration                   [M4]
-    Frame.swift         role-aware TOC sections (in JXLDecoder)     [M4 ✅]
+    FrameDecoder.swift  single-parse frame orchestrator: headers/TOC
+                        parsed once, staged Modular + VarDCT decode,
+                        decode limits, section-bounds validation      [✅]
   Headers/
     CustomTransformData.swift opsin matrix + upsampling weights    [M4 ✅]
   Modular/
@@ -72,21 +73,46 @@ Sources/JXLCore/
     Transforms.swift    inverse RCT ✅ + Palette ✅ (Squeeze pending) [M5 wip]
   VarDCT/
     VarDCTInfo.swift    DC-global preflight (quantizer, ctx map)   [M6 ✅]
-    DCImage.swift       XYB DC image decode                        [M6 ✅]
+    DCImage.swift       low-frequency pass: XYB DC + AC metadata   [M6 ✅]
     ACMetadata.swift    block strategies, quant field, CfL maps    [M6 ✅]
     CoeffOrder.swift    natural orders + permutations              [M6 ✅]
     PassGroup.swift     AC coefficient entropy decode              [M6 ✅]
     DequantWeights.swift default dequant matrices per strategy     [M6 ✅]
     DCTTransforms.swift inverse transforms ≤32x32 + LLF insertion  [M6 ✅]
-    Reconstruct.swift   dequant→transform→filters→sRGB + Gaborish/EPF1 [M6/M7 ✅]
+    Reconstruct.swift   dequant→transform→Gaborish/EPF1→XYB planes [M6/M7 ✅]
   Restoration/
     Upsampling.swift                                               [M7]
   Color/
-    ColorManagement.swift XYB->linear->display, tone mapping       [M8]
+    ColorManagement.swift XYBImage planes + XYB→sRGB8 stage        [✅ initial]
+                        (ICC, tone mapping, 16-bit/float out: M8)
   JXLImage.swift        decoded pixel buffer (public)              [M5+]
-  JXLDecoder.swift      top-level orchestrator                     [M1 ✅ partial]
+  JXLDecoder.swift      public API (thin wrappers over FrameDecoder) [✅]
   Errors.swift                                                     [M1 ✅]
 ```
+
+### Decoder architecture
+
+`FrameDecoder` is the spine: it parses the container, codestream headers,
+`FrameHeader`, and TOC exactly once at init (validating every section's byte
+range), then exposes each decode stage as a cached accessor —
+`decodeModularImage()`, or for VarDCT `varDCTDCGlobal()` →
+`varDCTLowFrequency()` (each DC group's `VarDCTDC` + `AcMetadata` in one pass)
+→ `varDCTACGlobal()` → `varDCTCoefficients()` → `reconstructXYB()`. Later
+stages force earlier ones, which also keeps the shared section-0 reader
+correctly sequenced for coalesced single-section frames. Section readers share
+the codestream storage (`BitReader(_:byteRange:)`) — no per-section copies.
+Every public `JXL.*` entry point and byte-taking VarDCT helper is a thin
+wrapper constructing one `FrameDecoder`.
+
+VarDCT reconstruction stops at `XYBImage` (padded float planes); conversion to
+display pixels lives in `Color/ColorManagement.swift`, which is where M8 lands
+without touching the transform pipeline. `JXLDecodeLimits` (default ~2^30
+samples) bounds what a hostile header can make the decoder allocate;
+pixel-decoding APIs take it as a parameter.
+
+Per-AC-group decode is a pure function of its section bytes plus immutable
+globals, so group-parallel decode is a small later change (coalesced frames
+excepted).
 
 ## Milestones
 
@@ -272,6 +298,19 @@ along) as one refactor _before_ M7 upsampling / M8 color** — they touch every
 stage boundary, and each milestone built on the current shape adds migration
 cost. Items 5–7 get much easier once a single decoder object exists; item 6 is
 a design constraint to hold while writing it.
+
+> **Status (landed same day, "Architecture" revision):** items 1–4 are done —
+> `FrameDecoder` single-parse orchestrator, unified Modular/VarDCT dispatch
+> with a merged DC+ACMeta low-frequency pass, `XYBImage` + the color-stage
+> split, and copy-free section readers. Item 5 is partly done
+> (`JXLDecodeLimits`, TOC section-bounds validation at init; the trap→throw
+> audit and fuzzing remain). Item 6 is honored structurally (per-group decode
+> is a pure function of section bytes + immutable globals; not yet parallel).
+> Item 7 remains: the byte-taking VarDCT free functions stayed public as
+> one-line wrappers because the CLI links JXLCore as a separate module —
+> shrink the surface when a `JXLKit`-style target exists. See "Decoder
+> architecture" above for the resulting shape. The section-by-section details
+> below are kept for rationale.
 
 ### 1. One parse, one decode — a real decoder state object
 

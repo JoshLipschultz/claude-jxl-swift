@@ -1,13 +1,14 @@
 // Reconstruct.swift
 //
-// VarDCT reconstruction to pixels: dequantize AC coefficients (with
+// VarDCT reconstruction to XYB planes: dequantize AC coefficients (with
 // chroma-from-luma), insert the lowest frequencies from the DC image, apply the
 // block's inverse transform (any strategy up to 32x32 — see Transforms.swift),
-// then XYB -> linear -> sRGB. Per-strategy dequant matrices come from
+// then the Gaborish and EPF (edge-preserving) restoration filters when enabled
+// (libjxl GaborishStage / EPF1Stage). Per-strategy dequant matrices come from
 // DequantWeights.swift.
 //
-// The Gaborish and EPF (edge-preserving) restoration filters are applied when
-// enabled (libjxl GaborishStage / EPF1Stage).
+// The output is an `XYBImage`; conversion to display pixels is the color
+// pipeline's job (Color/ColorManagement.swift).
 //
 // Restrictions: transforms up to 32x32 (no DCT64+), single pass, 4:4:4.
 
@@ -25,38 +26,6 @@ private func adjustQuantBias(_ q: Int32, _ c: Int) -> Float {
     if q == -1 { return -kDefaultQuantBias[c] }
     let qf = Float(q)
     return qf - kDefaultQuantBias[3] / qf
-}
-
-// MARK: - XYB -> linear -> sRGB
-
-private let kOpsinBias: Float = 0.0037930732552754493
-private let kInverseOpsin: [Float] = [
-    11.031566901960783, -9.866943921568629, -0.16462299647058826,
-    -3.254147380392157, 4.418770392156863, -0.16462299647058826,
-    -3.6588512862745097, 2.7129230470588235, 1.9459282392156863,
-]
-
-private func srgbEncode(_ d: Float) -> Float {
-    let v = max(0, min(1, d))
-    return v <= 0.0031308 ? 12.92 * v : 1.055 * powf(v, 1.0 / 2.4) - 0.055
-}
-
-/// XYB -> sRGB 8-bit, matching libjxl XybToRgb + the sRGB transfer function.
-private func xybToSRGB8(x: Float, y: Float, b: Float) -> (UInt8, UInt8, UInt8) {
-    // libjxl opsin_biases_cbrt = cbrt(-bias) = -cbrt(bias), and XybToRgb
-    // subtracts it — i.e. adds cbrt(bias) — to recover cbrt(mixed).
-    let biasCbrt = cbrtf(kOpsinBias)
-    let gr = (y + x) + biasCbrt
-    let gg = (y - x) + biasCbrt
-    let gb = b + biasCbrt
-    let mr = gr * gr * gr - kOpsinBias
-    let mg = gg * gg * gg - kOpsinBias
-    let mb = gb * gb * gb - kOpsinBias
-    let lr = kInverseOpsin[0] * mr + kInverseOpsin[1] * mg + kInverseOpsin[2] * mb
-    let lg = kInverseOpsin[3] * mr + kInverseOpsin[4] * mg + kInverseOpsin[5] * mb
-    let lb = kInverseOpsin[6] * mr + kInverseOpsin[7] * mg + kInverseOpsin[8] * mb
-    func to8(_ l: Float) -> UInt8 { UInt8(max(0, min(255, (srgbEncode(l) * 255).rounded()))) }
-    return (to8(lr), to8(lg), to8(lb))
 }
 
 // MARK: - Gaborish (libjxl GaborishStage)
@@ -176,193 +145,171 @@ private func epf1(
 
 // MARK: - Full reconstruction
 
+extension FrameDecoder {
+    /// Reconstructs the frame's XYB planes: dequant + chroma-from-luma, LLF
+    /// insertion from the DC image, per-block inverse transforms, then the
+    /// enabled restoration filters. Handles all AC strategies up to 32x32.
+    func reconstructXYB() throws -> XYBImage {
+        let lf = try varDCTLowFrequency()
+        let coeffs = try varDCTCoefficients()
+        let dcGlobalInfo = try varDCTDCGlobal().info
+        let meta = lf.metadata
+        let dc = lf.dc
+
+        for b in coeffs.blocks where b.strategy >= kStrategyQuantTable.count {
+            throw JXLError.unsupported("VarDCT transforms larger than 32x32")
+        }
+
+        // Dequant tables per quant-table kind, computed once for the kinds in use.
+        var dequantTables = [[Float]?](repeating: nil, count: QuantTableKind.allCases.count)
+        for b in coeffs.blocks {
+            let kind = kStrategyQuantTable[Int(b.strategy)]
+            if dequantTables[kind.rawValue] == nil {
+                dequantTables[kind.rawValue] = defaultDequantTable(kind)
+            }
+        }
+
+        let invGlobalScale = Float(1 << 16) / Float(dcGlobalInfo.quantizer.globalScale)
+        let xDmMul = powf(1.0 / 1.25, Float(frameHeader.xQmScale) - 2.0)
+        let bDmMul = powf(1.0 / 1.25, Float(frameHeader.bQmScale) - 2.0)
+
+        // Chroma-from-luma bases.
+        let cc = dcGlobalInfo.colorCorrelation
+        let colorFactor = Float(cc?.colorFactor ?? 84)
+        let colorScale = 1.0 / colorFactor
+        let baseX = cc?.baseCorrelationX ?? 0.0
+        let baseB = cc?.baseCorrelationB ?? 1.0
+
+        let bw = dim.xsizeBlocks
+        let rowStride = bw * 8
+        let paddedH = dim.ysizeBlocks * 8
+        var planeX = [Float](repeating: 0, count: rowStride * paddedH)
+        var planeY = planeX
+        var planeB = planeX
+
+        // Scratch buffers reused across blocks (max transform is 32x32 = 1024).
+        var scratchX = [Float](repeating: 0, count: 1024)
+        var scratchY = [Float](repeating: 0, count: 1024)
+        var scratchB = [Float](repeating: 0, count: 1024)
+        var scratchTmp = [Float](repeating: 0, count: 1024)
+
+        planeX.withUnsafeMutableBufferPointer { pX in
+        planeY.withUnsafeMutableBufferPointer { pY in
+        planeB.withUnsafeMutableBufferPointer { pB in
+        scratchX.withUnsafeMutableBufferPointer { sXBuf in
+        scratchY.withUnsafeMutableBufferPointer { sYBuf in
+        scratchB.withUnsafeMutableBufferPointer { sBBuf in
+        scratchTmp.withUnsafeMutableBufferPointer { tmpBuf in
+            let bufX = sXBuf.baseAddress!
+            let bufY = sYBuf.baseAddress!
+            let bufB = sBBuf.baseAddress!
+            let tmp = tmpBuf.baseAddress!
+
+            for blk in coeffs.blocks {
+                let bx = blk.bx
+                let by = blk.by
+                let strategy = Int(blk.strategy)
+                let size = blk.coveredX * blk.coveredY * 64
+                let quant = Float(meta.quantField[by * bw + bx])
+                let scaledDequant = invGlobalScale / quant
+                let ctX = bx / 8
+                let ctY = by / 8
+                let cmapW = meta.colorTileWidth
+                let xCC = baseX + Float(meta.ytoxMap[ctY * cmapW + ctX]) * colorScale
+                let bCC = baseB + Float(meta.ytobMap[ctY * cmapW + ctX]) * colorScale
+
+                // Dequantize with quant biases + chroma-from-luma (elementwise: the
+                // dequant matrix layout matches the coefficient storage).
+                let table = dequantTables[kStrategyQuantTable[strategy].rawValue]!
+                table.withUnsafeBufferPointer { t in
+                    blk.coeff[0].withUnsafeBufferPointer { cX in
+                    blk.coeff[1].withUnsafeBufferPointer { cY in
+                    blk.coeff[2].withUnsafeBufferPointer { cB in
+                        for k in 0..<size {
+                            let xMul = t[k] * scaledDequant * xDmMul
+                            let yMul = t[size + k] * scaledDequant
+                            let bMul = t[2 * size + k] * scaledDequant * bDmMul
+                            let dqXcc = adjustQuantBias(cX[k], 0) * xMul
+                            let dqY = adjustQuantBias(cY[k], 1) * yMul
+                            let dqBcc = adjustQuantBias(cB[k], 2) * bMul
+                            bufY[k] = dqY
+                            bufX[k] = xCC * dqY + dqXcc
+                            bufB[k] = bCC * dqY + dqBcc
+                        }
+                    }
+                    }
+                    }
+                }
+
+                // Insert the lowest frequencies from the DC image.
+                let dcOrigin = by * dc.widthBlocks + bx
+                insertLLF(bufX, strategy: strategy, dc: dc.x, dcStride: dc.widthBlocks, dcOrigin: dcOrigin)
+                insertLLF(bufY, strategy: strategy, dc: dc.y, dcStride: dc.widthBlocks, dcOrigin: dcOrigin)
+                insertLLF(bufB, strategy: strategy, dc: dc.b, dcStride: dc.widthBlocks, dcOrigin: dcOrigin)
+
+                // Inverse transform straight into the padded XYB planes.
+                let origin = by * 8 * rowStride + bx * 8
+                for (buf, plane) in [(bufX, pX.baseAddress!), (bufY, pY.baseAddress!), (bufB, pB.baseAddress!)] {
+                    let out = plane + origin
+                    switch strategy {
+                    case 1:
+                        identityTransform(buf, pixels: out, stride: rowStride)
+                    case 2:
+                        dct2x2Transform(buf, pixels: out, stride: rowStride)
+                    case 3:
+                        dct4x4Transform(buf, pixels: out, stride: rowStride, scratch: tmp)
+                    case 12:
+                        dct4x8Transform(buf, pixels: out, stride: rowStride, scratch: tmp)
+                    case 13:
+                        dct8x4Transform(buf, pixels: out, stride: rowStride, scratch: tmp)
+                    case 14, 15, 16, 17:
+                        afvTransform(kind: strategy - 14, buf, pixels: out, stride: rowStride, scratch: tmp)
+                    default:
+                        scaledIDCT(
+                            buf, h: kStrategyBlockH[strategy], w: kStrategyBlockW[strategy],
+                            pixels: out, stride: rowStride, tmp: tmp)
+                    }
+                }
+            }
+        }
+        }
+        }
+        }
+        }
+        }
+        }
+
+        // Gaborish restoration filter (libjxl GaborishStage), on the full XYB
+        // planes with 1-pixel mirror border.
+        if frameHeader.loopFilterGab {
+            let fh = frameHeader
+            gaborish(&planeX, w: rowStride, h: paddedH, weight1: fh.gabXWeight1, weight2: fh.gabXWeight2)
+            gaborish(&planeY, w: rowStride, h: paddedH, weight1: fh.gabYWeight1, weight2: fh.gabYWeight2)
+            gaborish(&planeB, w: rowStride, h: paddedH, weight1: fh.gabBWeight1, weight2: fh.gabBWeight2)
+        }
+        // EPF (edge-preserving filter). For epf_iters == 1 only the single middle
+        // pass (EPF1) runs (libjxl dec_cache.cc). Operates on the block-padded XYB.
+        if frameHeader.loopFilterEpfIters >= 1 {
+            let quantScale = Float(dcGlobalInfo.quantizer.globalScale) / Float(1 << 16)
+            let sigmaInv = computeEPFSigma(meta: meta, quantScale: quantScale)
+            epf1(
+                x: &planeX, y: &planeY, b: &planeB, w: rowStride, h: paddedH,
+                sigmaInv: sigmaInv, bw: dim.xsizeBlocks)
+        }
+
+        return XYBImage(
+            width: dim.xsize, height: dim.ysize, stride: rowStride, paddedHeight: paddedH,
+            x: planeX, y: planeY, b: planeB)
+    }
+}
+
 /// Decodes a single-pass, 4:4:4 VarDCT frame to an 8-bit sRGB image
 /// (interleaved RGB, row-major). Handles all AC strategies up to 32x32.
 public func reconstructVarDCTImage(from data: [UInt8]) throws -> (width: Int, height: Int, rgb: [UInt8]) {
-    let s = try setupVarDCT(data)
-    let meta = try decodeLowFrequency(s)
-    let acReader = s.coalesced ? s.r0 : s.sectionReader(s.dim.numDCGroups + 1)
-    let acGlobal = try decodeVarDCTACGlobal(
-        acReader, dim: s.dim, numPasses: Int(s.frameHeader.numPasses),
-        blockContextMap: s.dcGlobal.info.blockContextMap, usedACs: meta.usedACs)
-    let coeffs = try decodeVarDCTCoefficients(from: data)
-    let dc = try decodeVarDCTDCImage(from: data)
-
-    for b in coeffs.blocks where b.strategy >= kStrategyQuantTable.count {
-        throw JXLError.unsupported("VarDCT transforms larger than 32x32")
-    }
-    _ = acGlobal
-
-    // Dequant tables per quant-table kind, computed once for the kinds in use.
-    var dequantTables = [[Float]?](repeating: nil, count: QuantTableKind.allCases.count)
-    for b in coeffs.blocks {
-        let kind = kStrategyQuantTable[Int(b.strategy)]
-        if dequantTables[kind.rawValue] == nil {
-            dequantTables[kind.rawValue] = defaultDequantTable(kind)
-        }
-    }
-
-    let invGlobalScale = Float(1 << 16) / Float(s.dcGlobal.info.quantizer.globalScale)
-    let xDmMul = powf(1.0 / 1.25, Float(s.frameHeader.xQmScale) - 2.0)
-    let bDmMul = powf(1.0 / 1.25, Float(s.frameHeader.bQmScale) - 2.0)
-
-    // Chroma-from-luma bases.
-    let cc = s.dcGlobal.info.colorCorrelation
-    let colorFactor = Float(cc?.colorFactor ?? 84)
-    let colorScale = 1.0 / colorFactor
-    let baseX = cc?.baseCorrelationX ?? 0.0
-    let baseB = cc?.baseCorrelationB ?? 1.0
-
-    let bw = s.dim.xsizeBlocks
-    let pxW = s.dim.xsize
-    let pxH = s.dim.ysize
-    // Full-resolution XYB planes.
-    var planeX = [Float](repeating: 0, count: bw * 8 * s.dim.ysizeBlocks * 8)
-    var planeY = planeX
-    var planeB = planeX
-    let rowStride = bw * 8
-    let paddedH = s.dim.ysizeBlocks * 8
-
-    // Scratch buffers reused across blocks (max transform is 32x32 = 1024).
-    var scratchX = [Float](repeating: 0, count: 1024)
-    var scratchY = [Float](repeating: 0, count: 1024)
-    var scratchB = [Float](repeating: 0, count: 1024)
-    var scratchTmp = [Float](repeating: 0, count: 1024)
-
-    planeX.withUnsafeMutableBufferPointer { pX in
-    planeY.withUnsafeMutableBufferPointer { pY in
-    planeB.withUnsafeMutableBufferPointer { pB in
-    scratchX.withUnsafeMutableBufferPointer { sXBuf in
-    scratchY.withUnsafeMutableBufferPointer { sYBuf in
-    scratchB.withUnsafeMutableBufferPointer { sBBuf in
-    scratchTmp.withUnsafeMutableBufferPointer { tmpBuf in
-        let bufX = sXBuf.baseAddress!
-        let bufY = sYBuf.baseAddress!
-        let bufB = sBBuf.baseAddress!
-        let tmp = tmpBuf.baseAddress!
-
-        for blk in coeffs.blocks {
-            let bx = blk.bx
-            let by = blk.by
-            let strategy = Int(blk.strategy)
-            let size = blk.coveredX * blk.coveredY * 64
-            let quant = Float(meta.quantField[by * bw + bx])
-            let scaledDequant = invGlobalScale / quant
-            let ctX = bx / 8
-            let ctY = by / 8
-            let cmapW = meta.colorTileWidth
-            let xCC = baseX + Float(meta.ytoxMap[ctY * cmapW + ctX]) * colorScale
-            let bCC = baseB + Float(meta.ytobMap[ctY * cmapW + ctX]) * colorScale
-
-            // Dequantize with quant biases + chroma-from-luma (elementwise: the
-            // dequant matrix layout matches the coefficient storage).
-            let table = dequantTables[kStrategyQuantTable[strategy].rawValue]!
-            table.withUnsafeBufferPointer { t in
-                blk.coeff[0].withUnsafeBufferPointer { cX in
-                blk.coeff[1].withUnsafeBufferPointer { cY in
-                blk.coeff[2].withUnsafeBufferPointer { cB in
-                    for k in 0..<size {
-                        let xMul = t[k] * scaledDequant * xDmMul
-                        let yMul = t[size + k] * scaledDequant
-                        let bMul = t[2 * size + k] * scaledDequant * bDmMul
-                        let dqXcc = adjustQuantBias(cX[k], 0) * xMul
-                        let dqY = adjustQuantBias(cY[k], 1) * yMul
-                        let dqBcc = adjustQuantBias(cB[k], 2) * bMul
-                        bufY[k] = dqY
-                        bufX[k] = xCC * dqY + dqXcc
-                        bufB[k] = bCC * dqY + dqBcc
-                    }
-                }
-                }
-                }
-            }
-
-            // Insert the lowest frequencies from the DC image.
-            let dcOrigin = by * dc.widthBlocks + bx
-            insertLLF(bufX, strategy: strategy, dc: dc.x, dcStride: dc.widthBlocks, dcOrigin: dcOrigin)
-            insertLLF(bufY, strategy: strategy, dc: dc.y, dcStride: dc.widthBlocks, dcOrigin: dcOrigin)
-            insertLLF(bufB, strategy: strategy, dc: dc.b, dcStride: dc.widthBlocks, dcOrigin: dcOrigin)
-
-            // Inverse transform straight into the padded XYB planes.
-            let origin = by * 8 * rowStride + bx * 8
-            for (buf, plane) in [(bufX, pX.baseAddress!), (bufY, pY.baseAddress!), (bufB, pB.baseAddress!)] {
-                let out = plane + origin
-                switch strategy {
-                case 1:
-                    identityTransform(buf, pixels: out, stride: rowStride)
-                case 2:
-                    dct2x2Transform(buf, pixels: out, stride: rowStride)
-                case 3:
-                    dct4x4Transform(buf, pixels: out, stride: rowStride, scratch: tmp)
-                case 12:
-                    dct4x8Transform(buf, pixels: out, stride: rowStride, scratch: tmp)
-                case 13:
-                    dct8x4Transform(buf, pixels: out, stride: rowStride, scratch: tmp)
-                case 14, 15, 16, 17:
-                    afvTransform(kind: strategy - 14, buf, pixels: out, stride: rowStride, scratch: tmp)
-                default:
-                    scaledIDCT(
-                        buf, h: kStrategyBlockH[strategy], w: kStrategyBlockW[strategy],
-                        pixels: out, stride: rowStride, tmp: tmp)
-                }
-            }
-        }
-    }
-    }
-    }
-    }
-    }
-    }
-    }
-
-    // Gaborish restoration filter (libjxl GaborishStage), on the full XYB
-    // planes with 1-pixel mirror border.
-    if s.frameHeader.loopFilterGab {
-        let fh = s.frameHeader
-        gaborish(&planeX, w: rowStride, h: paddedH, weight1: fh.gabXWeight1, weight2: fh.gabXWeight2)
-        gaborish(&planeY, w: rowStride, h: paddedH, weight1: fh.gabYWeight1, weight2: fh.gabYWeight2)
-        gaborish(&planeB, w: rowStride, h: paddedH, weight1: fh.gabBWeight1, weight2: fh.gabBWeight2)
-    }
-    // EPF (edge-preserving filter). For epf_iters == 1 only the single middle
-    // pass (EPF1) runs (libjxl dec_cache.cc). Operates on the block-padded XYB.
-    if s.frameHeader.loopFilterEpfIters >= 1 {
-        let quantScale = Float(s.dcGlobal.info.quantizer.globalScale) / Float(1 << 16)
-        let sigmaInv = computeEPFSigma(meta: meta, quantScale: quantScale)
-        epf1(
-            x: &planeX, y: &planeY, b: &planeB, w: rowStride, h: paddedH,
-            sigmaInv: sigmaInv, bw: s.dim.xsizeBlocks)
-    }
-
-    var rgb = [UInt8](repeating: 0, count: pxW * pxH * 3)
-    for y in 0..<pxH {
-        for x in 0..<pxW {
-            let src = y * rowStride + x
-            let (r, g, b) = xybToSRGB8(x: planeX[src], y: planeY[src], b: planeB[src])
-            let dst = (y * pxW + x) * 3
-            rgb[dst] = r
-            rgb[dst + 1] = g
-            rgb[dst + 2] = b
-        }
-    }
-    return (pxW, pxH, rgb)
+    let xyb = try FrameDecoder(data: data).reconstructXYB()
+    return (xyb.width, xyb.height, xybToSRGB8Interleaved(xyb))
 }
 
 public func reconstructVarDCTImage(from data: Data) throws -> (width: Int, height: Int, rgb: [UInt8]) {
     try reconstructVarDCTImage(from: [UInt8](data))
-}
-
-/// Reconstructs a VarDCT (lossy) frame as a `JXLDecodedImage`: three 8-bit sRGB
-/// planes (R, G, B), so the public `JXL.decodeImage` can return lossy images in
-/// the same shape as the Modular path.
-func reconstructVarDCTDecodedImage(from data: [UInt8]) throws -> JXLDecodedImage {
-    let (w, h, rgb) = try reconstructVarDCTImage(from: data)
-    var planes = [[Int32]](repeating: [Int32](repeating: 0, count: w * h), count: 3)
-    for i in 0..<(w * h) {
-        planes[0][i] = Int32(rgb[i * 3])
-        planes[1][i] = Int32(rgb[i * 3 + 1])
-        planes[2][i] = Int32(rgb[i * 3 + 2])
-    }
-    return JXLDecodedImage(
-        width: w, height: h, colorChannels: 3, extraChannels: 0, bitsPerSample: 8,
-        isFloat: false, planes: planes)
 }

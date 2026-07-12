@@ -24,7 +24,7 @@ import Foundation
 let kVarDCTNumStrategies = 27  // AcStrategy::kNumValidStrategies
 private let kEpfSharpEntries = 8
 private let kQuantMax = 256  // Quantizer::kQuantMax
-private let kColorTileDimInBlocks = 8
+let kColorTileDimInBlocks = 8
 
 // AcStrategy::covered_blocks_x / covered_blocks_y LUTs (ac_strategy.h).
 let kCoveredBlocksX: [Int] = [
@@ -60,51 +60,10 @@ public struct VarDCTACMetadata: Equatable {
 
 /// Decodes the AC metadata for every DC group of a VarDCT frame, alongside the
 /// `VarDCTDC` stream that precedes it in each DC group section. Returns the
-/// assembled full-frame metadata.
+/// assembled full-frame metadata. (The full low-frequency pass lives in
+/// `decodeVarDCTLowFrequency`, DCImage.swift.)
 public func decodeVarDCTACMetadata(from data: [UInt8]) throws -> VarDCTACMetadata {
-    try decodeLowFrequency(setupVarDCT(data))
-}
-
-/// Decodes the low-frequency layer (every DC group's `VarDCTDC` + `AcMetadata`)
-/// for an already-parsed frame, leaving `s.r0` positioned at HfGlobal for a
-/// coalesced single-section frame.
-func decodeLowFrequency(_ s: VarDCTSetup) throws -> VarDCTACMetadata {
-    let dim = s.dim
-    let bw = dim.xsizeBlocks
-    let bh = dim.ysizeBlocks
-    let ctw = divCeil(bw, kColorTileDimInBlocks)
-    let cth = divCeil(bh, kColorTileDimInBlocks)
-
-    var meta = VarDCTACMetadata(
-        widthBlocks: bw, heightBlocks: bh,
-        strategy: [UInt8](repeating: 0, count: bw * bh),
-        isFirstBlock: [Bool](repeating: false, count: bw * bh),
-        quantField: [Int32](repeating: 0, count: bw * bh),
-        epfSharpness: [UInt8](repeating: 0, count: bw * bh),
-        ytoxMap: [Int8](repeating: 0, count: ctw * cth),
-        ytobMap: [Int8](repeating: 0, count: ctw * cth),
-        colorTileWidth: ctw, colorTileHeight: cth, varblockCount: 0, usedACs: 0)
-    // `valid[i]` mirrors libjxl AcStrategyImage validity: a block is valid once
-    // covered by a placed varblock.
-    var valid = [Bool](repeating: false, count: bw * bh)
-    var totalVarblocks = 0
-    var usedACs: UInt32 = 0
-
-    for dcg in 0..<dim.numDCGroups {
-        let rect = s.dcGroupRect(dcg)
-        let reader = s.dcGroupReader(dcg)
-        // ProcessDCGroup: VarDCTDC, then (ModularDC reads nothing without extra
-        // channels), then DecodeAcMetadata. Decode and discard the DC here; the
-        // public DC-image path produces the dequantized planes.
-        try skipVarDCTDC(reader, groupIndex: dcg, rectW: rect.w, rectH: rect.h, dcGlobal: s.dcGlobal)
-        try decodeAcMetadataGroup(
-            reader, groupIndex: dcg, rect: rect, dim: dim,
-            dcGlobal: s.dcGlobal, meta: &meta, valid: &valid, totalVarblocks: &totalVarblocks,
-            usedACs: &usedACs)
-    }
-    meta.varblockCount = totalVarblocks
-    meta.usedACs = usedACs
-    return meta
+    try FrameDecoder(data: data).varDCTLowFrequency().metadata
 }
 
 public func decodeVarDCTACMetadata(from data: Data) throws -> VarDCTACMetadata {
@@ -117,15 +76,8 @@ public func decodeVarDCTACMetadata(from data: Data) throws -> VarDCTACMetadata {
 public func decodeVarDCTACGlobalForFrame(from data: [UInt8]) throws
     -> (metadata: VarDCTACMetadata, acGlobal: VarDCTACGlobal)
 {
-    let s = try setupVarDCT(data)
-    let meta = try decodeLowFrequency(s)
-    // HfGlobal: continues in section 0 for a coalesced frame, else its own
-    // section at index numDCGroups + 1.
-    let acReader = s.coalesced ? s.r0 : s.sectionReader(s.dim.numDCGroups + 1)
-    let acg = try decodeVarDCTACGlobal(
-        acReader, dim: s.dim, numPasses: Int(s.frameHeader.numPasses),
-        blockContextMap: s.dcGlobal.info.blockContextMap, usedACs: meta.usedACs)
-    return (meta, acg)
+    let d = try FrameDecoder(data: data)
+    return (try d.varDCTLowFrequency().metadata, try d.varDCTACGlobal())
 }
 
 public func decodeVarDCTACGlobalForFrame(from data: Data) throws
@@ -134,21 +86,8 @@ public func decodeVarDCTACGlobalForFrame(from data: Data) throws
     try decodeVarDCTACGlobalForFrame(from: [UInt8](data))
 }
 
-/// Decodes the `VarDCTDC` stream to advance the reader past it (the DC values
-/// themselves are produced by the DC-image path). Mirrors `DecodeVarDCTDC`
-/// up to and including the modular decode.
-private func skipVarDCTDC(
-    _ br: BitReader, groupIndex: Int, rectW: Int, rectH: Int, dcGlobal: VarDCTDCGlobalDecoded
-) throws {
-    _ = br.read(2)  // extra_precision
-    let image = ModularImage(w: rectW, h: rectH, bitdepth: 8, channelCount: 3)
-    _ = try modularDecode(
-        br, image: image, groupID: 1 + groupIndex,
-        globalTree: dcGlobal.tree, globalCode: dcGlobal.code, globalCtxMap: dcGlobal.ctxMap)
-}
-
 /// Decodes one DC group's `AcMetadata` stream and writes into `meta`/`valid`.
-private func decodeAcMetadataGroup(
+func decodeAcMetadataGroup(
     _ br: BitReader, groupIndex: Int, rect: (x0: Int, y0: Int, w: Int, h: Int),
     dim: FrameDimensions, dcGlobal: VarDCTDCGlobalDecoded,
     meta: inout VarDCTACMetadata, valid: inout [Bool], totalVarblocks: inout Int,

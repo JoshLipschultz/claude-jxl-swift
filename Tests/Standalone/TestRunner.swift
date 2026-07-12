@@ -463,6 +463,32 @@ struct TestRunner {
         } else {
             check(false, "decodeImage handles a VarDCT (lossy) frame")
         }
+
+        // Decode limits: a cap below the frame's sample count must refuse the
+        // decode with `.limitExceeded` before allocating pixel planes, for both
+        // the Modular and VarDCT paths.
+        for name in ["640x480_lossless.jxl", "640x480_lossy.jxl"] {
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent(name)) else {
+                check(false, "\(name) missing for limits test")
+                continue
+            }
+            do {
+                _ = try JXL.decodeImage(
+                    from: [UInt8](data), limits: JXLDecodeLimits(maxTotalSamples: 1024))
+                check(false, "\(name) decode should exceed a 1024-sample limit")
+            } catch let e as JXLError {
+                if case .limitExceeded = e {
+                    check(true, "\(name) limited decode throws limitExceeded")
+                } else {
+                    check(false, "\(name) limited decode threw \(e) instead of limitExceeded")
+                }
+            } catch {
+                check(false, "\(name) limited decode threw unexpected \(error)")
+            }
+            check(
+                (try? JXL.decodeImage(from: [UInt8](data))) != nil,
+                "\(name) still decodes under default limits")
+        }
     }
 
     // MARK: - VarDCT DC image (M6)
