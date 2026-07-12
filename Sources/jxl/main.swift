@@ -30,7 +30,7 @@ func usage() -> Never {
         USAGE:
           jxl info   <file.jxl>            Print dimensions and container layout
           jxl boxes  <file.jxl>            List ISOBMFF container boxes
-          jxl decode <file.jxl> <out.pnm>  Decode lossless image to PGM/PPM
+          jxl decode <file.jxl> <out.pnm>  Decode image (lossless or lossy) to PNM
           jxl vardct <file.jxl>            Preflight VarDCT global metadata
           jxl vardct-dc <file.jxl> [dump]  Decode VarDCT XYB DC image (lossy)
           jxl vardct-acmeta <file.jxl>     Decode VarDCT AC metadata (strategy/quant)

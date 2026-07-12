@@ -101,7 +101,7 @@ Sources/JXLCore/
 | M7 | Restoration | Gaborish + EPF + upsampling | 🟡 Gaborish + EPF1 validated at ~54 dB on the mixed-strategy fixture (EPF sigma exercised across multi-block varblocks). Upsampling and EPF0/EPF2 (epf_iters ≠ 1) remain |
 | M8 | Color pipeline | XYB→sRGB, ICC, alpha, 8/16-bit/float output | |
 | M9 | Advanced | patches, splines, noise, animation, extra channels, JPEG recon | |
-| M10 | macOS integration | `CGImage` bridge + Quick Look thumbnail/preview appex | |
+| M10 | macOS integration | `CGImage` bridge + Quick Look thumbnail/preview appex | 🟡 `JXL.decodeImage` unified across Modular + VarDCT (lossy → 8-bit sRGB planes), so the JXLViewer app decodes both. `CGImage` bridge in the app; Quick Look appex still needs Xcode |
 
 Cross-cutting, ongoing: conformance corpus from the libjxl test suite, fuzzing,
 and SIMD/performance once correctness is locked per stage.
@@ -262,3 +262,114 @@ cannot resolve its bundled frameworks), so `swift build`/`swift test` fail. We
 build with `swiftc` directly via `Scripts/build.sh` and `Scripts/run-tests.sh`.
 `Package.swift` is maintained so that once full Xcode is installed, standard
 `swift build` / `swift test` work unchanged.
+
+## Architectural review notes (2026-07-12)
+
+From an architecture pass over the whole library. The validation discipline and
+spec-mirroring layout are in good shape; these notes are about structure,
+ordered by leverage. **Suggested sequencing: land items 1–2 (with 3–4 riding
+along) as one refactor _before_ M7 upsampling / M8 color** — they touch every
+stage boundary, and each milestone built on the current shape adds migration
+cost. Items 5–7 get much easier once a single decoder object exists; item 6 is
+a design constraint to hold while writing it.
+
+### 1. One parse, one decode — a real decoder state object
+
+Every public entry point is a stateless function taking raw bytes, and stages
+compose by re-parsing the file. One `reconstructVarDCTImage` call runs
+`setupVarDCT` itself, then `decodeVarDCTCoefficients(from: data)` (which runs
+`setupVarDCT` again plus a full second `decodeLowFrequency` — the entire
+DC-group entropy decode, redone), then `decodeVarDCTDCImage(from: data)` (a
+third parse + DC decode). Container demux, headers, TOC, and DC-global each run
+3× per image. The "parse headers up to the TOC" prologue is also hand-duplicated
+in three places (`readFrameInfo`, `decodeImage`, `setupVarDCT`).
+
+This was the right shape for incremental oracle validation, but the wrong shape
+to grow M7–M9 on. Promote `VarDCTSetup` to a `FrameDecoder` (headers, TOC,
+section readers, decoded globals, accumulated per-stage results); make every
+stage take that state; reduce the public preflight APIs to thin views over it.
+Per-stage testability is preserved — tests construct the decoder and stop at
+any stage.
+
+### 2. Unify Modular and VarDCT under one frame orchestrator
+
+Two disjoint worlds today: Modular is inlined inside `JXL.decodeImage` (~100
+lines of section logic in the API function, and it *rejects* VarDCT frames);
+VarDCT is free functions returning a different type. Symptom: the viewer only
+calls `JXL.decodeImage`, so it cannot display lossy images despite M6 being
+essentially done.
+
+The format argues for unification: both modes share the identical frame
+skeleton (FrameHeader → TOC → LfGlobal/LfGroup/HfGlobal/PassGroup), VarDCT
+frames already carry Modular sub-streams, and M9 (multi-frame, kReferenceOnly,
+blending, patches) operates *above* the mode split. Write the long-ghosted
+`Frame.swift` orchestrator: it owns section dispatch, with Modular and VarDCT
+as strategy implementations filling a common output.
+
+### 3. A shared plane/image type before M8, not during it
+
+Pipeline outputs are incompatible: Modular → `[[Int32]]` (float bit patterns
+punned into Int32), VarDCT → interleaved 8-bit sRGB with color hard-baked into
+the bottom of `Reconstruct.swift`. Everything next — upsampling (M7), color/ICC
+(M8), blending/patches (M9), CGImage bridge (M10) — wants float planes with
+explicit stride and padded borders; the VarDCT code already invents this ad hoc
+(`rowStride = bw * 8`, mirror-border logic duplicated in `gaborish` and `epf1`).
+
+Define a `Plane` type (storage + width/height/stride, padded-border variant so
+filters stop re-implementing mirroring) and an `ImageBundle` (color planes
+tagged XYB-or-integer, extra channels, metadata) as *the* interstage currency.
+Reconstruction stops at XYB float planes; color management and bit-depth
+quantization become terminal stages both modes share. Also fixes the
+`JXLDecodedImage.planes: [[Int32]]` + `isFloat` punning wart before app code
+hardens around it.
+
+### 4. Memory model: stop copying buffers
+
+Three copy layers per decode: `[UInt8](data)` at every `Data` overload,
+container reassembly copying the codestream out of the boxes, and
+`sectionReader` doing `BitReader(Array(cs[range]))` per section. For a large
+photo in a QuickLook extension that is several full-file copies before a pixel
+exists. Make `BitReader` take shared storage plus a byte range (or
+`ArraySlice`); single-`jxlc` files can borrow the payload range instead of
+reassembling. (The byte-at-a-time `read` loop → 64-bit refill word is a
+separate perf item; defer per the roadmap. The *ownership* change is
+architectural and belongs in the item-1 refactor, when section readers get
+restructured anyway.)
+
+### 5. Hostile-input posture, earlier than "cross-cutting later"
+
+QuickLook means parsing untrusted files in a system-invoked process: the bar is
+"never trap, never OOM," not just "throw on malformed." Current gaps:
+`precondition` in `BitReader.read`; forced unwraps in reconstruction;
+`Array(cs[start..<start+size])` trapping on a malformed TOC with out-of-range
+sections; and allocations sized directly from header-claimed dimensions (a
+100-byte file claiming 2³⁰×2³⁰ allocates before validation). Add a
+`DecodeLimits` (max pixel count / max memory) checked right after `SizeHeader`,
+audit untrusted-input paths from trap to throw, and start fuzzing at the
+`FrameDecoder` boundary once item 1 lands.
+
+### 6. Shape the group loop for parallelism now, parallelize later
+
+The TOC exists so groups decode independently, and the per-group loops are
+already almost pure. In the `FrameDecoder`, keep per-group decode a pure
+function of `(section bytes, immutable globals) → group result`, and keep the
+coalesced single-section case (shared mutable `r0`) an explicit special case
+rather than letting it shape the general path. Then `TaskGroup` parallelism is
+a five-line change, and Swift-6 `Sendable` on the public value types comes
+nearly free.
+
+### 7. API surface: separate the library from its scaffolding
+
+Milestone scaffolding is `public`: `decodeVarDCTCoefficients`,
+`decodeVarDCTDCImage`, `reconstructVarDCTImage` (anonymous tuple return),
+`readFrameSectionReader` (exposes `BitReader`). Once items 1–2 land, shrink the
+public surface to `JXL.readInfo` / `readFrameInfo` / `decodeImage` plus
+options; move stage-level access to `internal` + `@testable` (or
+`@_spi(Testing)` if the standalone runner can't use `@testable`). Plan a small
+`JXLKit`-style target for the CGImage bridge (currently in the viewer app;
+QuickLook and third parties will want it), keeping `JXLCore` Foundation-only.
+
+Doc note: the accumulated per-milestone "status" narratives above are becoming
+a lab notebook — consider moving them to a `NOTES.md`/changelog and keeping
+this file describing the current state, since multiple agents work from it as
+shared truth.

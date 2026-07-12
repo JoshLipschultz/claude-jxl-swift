@@ -206,10 +206,10 @@ public enum JXL {
         try readFrameInfo(from: [UInt8](data))
     }
 
-    /// Decodes a JPEG XL image to pixel planes. Currently supports the lossless
-    /// Modular subset: a single regular frame and only RCT/Palette (or no)
-    /// transforms. Integer samples are returned as sample values; 32-bit float
-    /// samples are returned as their IEEE-754 binary32 bit patterns.
+    /// Decodes a JPEG XL image to pixel planes. Modular (lossless) frames return
+    /// their native samples (integers as values, 32-bit float as IEEE-754 bit
+    /// patterns); VarDCT (lossy) frames reconstruct to three 8-bit sRGB planes.
+    /// A single regular frame is supported.
     public static func decodeImage(from data: [UInt8]) throws -> JXLDecodedImage {
         let parsed = try JXLContainer.parse(data)
         guard parsed.codestream.count >= 2,
@@ -226,7 +226,10 @@ public enum JXL {
 
         let ctx = FrameContext(metadata: metadata, width: size.width, height: size.height)
         let frameHeader = FrameHeader(reader: reader, context: ctx)
-        guard frameHeader.isModular else { throw JXLError.unsupported("VarDCT (lossy) frames") }
+        // VarDCT (lossy) frames reconstruct to 8-bit sRGB via the VarDCT path.
+        if !frameHeader.isModular {
+            return try reconstructVarDCTDecodedImage(from: data)
+        }
         guard frameHeader.frameType == .regular, frameHeader.flags == 0 else {
             throw JXLError.unsupported("non-regular or feature-flagged frames")
         }

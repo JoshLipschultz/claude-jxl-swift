@@ -451,6 +451,18 @@ struct TestRunner {
         FileHandle.standardError.write(
             Data("  [decodeImage] byte-exact lossless images=\(verified) (+ float)\n".utf8))
         check(verified >= 17, "decodeImage byte-exact for >=17 lossless fixtures (single + multi group)")
+
+        // Unified API: decodeImage also handles VarDCT (lossy), returning 8-bit
+        // RGB planes, so the viewer/CLI have a single entry point.
+        if let data = try? Data(contentsOf: dir.appendingPathComponent("640x480_lossy.jxl")),
+            let img = try? JXL.decodeImage(from: [UInt8](data))
+        {
+            check(img.colorChannels == 3 && img.bitsPerSample == 8, "lossy decodeImage is 8-bit RGB")
+            check(img.width == 640 && img.height == 480, "lossy decodeImage dimensions")
+            check(!img.isFloat && img.planes.count == 3, "lossy decodeImage plane shape")
+        } else {
+            check(false, "decodeImage handles a VarDCT (lossy) frame")
+        }
     }
 
     // MARK: - VarDCT DC image (M6)

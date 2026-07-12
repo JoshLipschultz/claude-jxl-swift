@@ -13,7 +13,8 @@ import JXLCore
 /// because `CGImage` is immutable and read-only after creation.
 struct DecodeResult: @unchecked Sendable {
     /// The rendered image, or `nil` if pixel decoding failed (metadata may still
-    /// be available — e.g. lossy files we can inspect but not yet decode).
+    /// be available). Both lossless (Modular) and lossy (VarDCT) frames decode
+    /// via `JXL.decodeImage`.
     let image: CGImage?
     /// Per-pixel sample access for the inspector, in native bit depth.
     let sampler: PixelSampler?

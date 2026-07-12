@@ -350,3 +350,19 @@ public func reconstructVarDCTImage(from data: [UInt8]) throws -> (width: Int, he
 public func reconstructVarDCTImage(from data: Data) throws -> (width: Int, height: Int, rgb: [UInt8]) {
     try reconstructVarDCTImage(from: [UInt8](data))
 }
+
+/// Reconstructs a VarDCT (lossy) frame as a `JXLDecodedImage`: three 8-bit sRGB
+/// planes (R, G, B), so the public `JXL.decodeImage` can return lossy images in
+/// the same shape as the Modular path.
+func reconstructVarDCTDecodedImage(from data: [UInt8]) throws -> JXLDecodedImage {
+    let (w, h, rgb) = try reconstructVarDCTImage(from: data)
+    var planes = [[Int32]](repeating: [Int32](repeating: 0, count: w * h), count: 3)
+    for i in 0..<(w * h) {
+        planes[0][i] = Int32(rgb[i * 3])
+        planes[1][i] = Int32(rgb[i * 3 + 1])
+        planes[2][i] = Int32(rgb[i * 3 + 2])
+    }
+    return JXLDecodedImage(
+        width: w, height: h, colorChannels: 3, extraChannels: 0, bitsPerSample: 8,
+        isFloat: false, planes: planes)
+}
