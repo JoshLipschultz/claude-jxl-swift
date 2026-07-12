@@ -45,7 +45,7 @@ struct LZ77Params {
 }
 
 /// A fully-decoded entropy-code header: enough to construct an `ANSSymbolReader`.
-public struct ANSCode {
+public struct ANSCode: Sendable {
     var usePrefixCode = false
     var logAlphaSize = 0
     var aliasTables: [AliasEntry] = []  // flat: numHistograms * (1 << logAlphaSize)

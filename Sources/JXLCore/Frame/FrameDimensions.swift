@@ -12,7 +12,7 @@ let kGroupDim = 256
 @inline(__always)
 func divCeil(_ a: Int, _ b: Int) -> Int { (a + b - 1) / b }
 
-public struct FrameDimensions: Equatable {
+public struct FrameDimensions: Equatable, Sendable {
     public var xsize = 0
     public var ysize = 0
     public var xsizeBlocks = 0

@@ -4,11 +4,14 @@ A from-scratch implementation of a [JPEG XL](https://jpeg.org/jpegxl/)
 (ISO/IEC 18181) decoder in Swift, for use in macOS applications and a Quick Look
 extension. No dependency on libjxl; libjxl is used only as a test oracle.
 
-> **Status: decoding pixels.** The full container → headers → entropy (ANS /
-> prefix / LZ77) → frame/TOC → Modular pipeline is implemented and validated
-> against libjxl. Lossless images using RCT (or no transform) decode
-> **byte-exact vs `djxl`** — grayscale-less RGB/RGBA/16-bit so far. Palette,
-> Squeeze, multi-group, and VarDCT (lossy) are next. See
+> **Status: both pipelines decode pixels.** Container → headers → entropy
+> (ANS / prefix / LZ77) → frame/TOC, then **Modular (lossless)** — byte-exact
+> vs `djxl` across the fixture corpus (gray/RGB/RGBA, 8/16-bit/float32, RCT +
+> Palette, single + multi-group) — and **VarDCT (lossy)** — all transforms up
+> to 32×32 with Gaborish + EPF1, ~54 dB vs `djxl` — both behind one
+> `JXL.decodeImage`, driven by a single-parse `FrameDecoder` with decode
+> limits and a mutation-fuzz harness. Squeeze, progressive, DCT64+, the full
+> color pipeline (ICC, 16-bit/float lossy output), and animation remain. See
 > [ARCHITECTURE.md](ARCHITECTURE.md) for the design and milestone status.
 
 ## What works today
@@ -23,7 +26,7 @@ $ jxl boxes image.jxl                 # ISOBMFF box listing
 'ftyp'  20 bytes  (payload 12)
 'jxlc'  7952 bytes  (payload 7944)
 
-$ jxl decode image.jxl out.ppm        # decode lossless image -> PGM/PPM
+$ jxl decode image.jxl out.ppm        # decode (lossless or lossy) -> PGM/PPM
 decoded 640 x 480 -> out.ppm
 ```
 
@@ -33,7 +36,7 @@ Library:
 import JXLCore
 
 let info = try JXL.readInfo(contentsOf: url)        // metadata only
-let image = try JXL.decodeImage(contentsOf: url)    // pixel planes (lossless subset)
+let image = try JXL.decodeImage(contentsOf: url)    // pixel planes (lossless native, lossy sRGB8)
 print(image.width, image.height, image.colorChannels, image.planes.count)
 ```
 
@@ -47,6 +50,7 @@ directly:
 ```
 sh Scripts/build.sh        # builds .build/manual/jxl
 sh Scripts/run-tests.sh    # compiles + runs the standalone test suite
+sh Scripts/fuzz.sh [n]     # mutation-fuzzes the decoder over the fixtures
 ```
 
 Once full Xcode is present, the standard flow works against `Package.swift`:

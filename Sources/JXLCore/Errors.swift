@@ -5,7 +5,7 @@
 import Foundation
 
 /// Errors thrown while parsing or decoding a JPEG XL stream.
-public enum JXLError: Error, CustomStringConvertible, Equatable {
+public enum JXLError: Error, CustomStringConvertible, Equatable, Sendable {
     /// The data does not begin with a recognized JPEG XL signature
     /// (neither the raw codestream `FF 0A` nor the ISOBMFF container box).
     case invalidSignature

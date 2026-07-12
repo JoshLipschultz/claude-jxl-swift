@@ -17,7 +17,7 @@ import Foundation
 
 /// One ISOBMFF box. `payload` is the byte range of the box contents (excluding
 /// the size/type header) within the original file.
-public struct JXLBox: Equatable {
+public struct JXLBox: Equatable, Sendable {
     public let type: String
     public let payload: Range<Int>
     public let headerSize: Int
@@ -26,7 +26,7 @@ public struct JXLBox: Equatable {
 }
 
 /// Result of splitting a file into its container structure and codestream.
-public struct ParsedFile {
+public struct ParsedFile: Sendable {
     /// `true` if the file used the ISOBMFF container; `false` for a bare codestream.
     public let isContainer: Bool
     /// The boxes in the order they appear (empty for a bare codestream).
@@ -71,6 +71,9 @@ public enum JXLContainer {
                     throw JXLError.truncated(context: "box largesize for '\(type)'")
                 }
                 let large = beUInt64(data, offset + 8)
+                guard large <= UInt64(data.count) else {
+                    throw JXLError.malformed("box '\(type)' largesize \(large) overruns file")
+                }
                 headerSize = 16
                 boxLength = Int(large)
             case 0:

@@ -57,13 +57,12 @@ multi-window behaviour from the terminal.
   VarDCT globals for lossy frames.
 - **Checkerboard** behind transparent images; a background thread does the decode.
 
-Lossless Modular images render today; lossy (VarDCT) files still show the
-decoder's error in the status bar but their **metadata panel is fully populated**,
-so the app is already useful for inspecting them. Decode + conversion live in
-[`DecodePipeline.swift`](JXLViewer/DecodePipeline.swift) and
-[`JXLImageConverter.swift`](JXLViewer/JXLImageConverter.swift) (the one spot that
-knows the plane layout) — reuse them from the Quick Look provider below once you
-want real thumbnails.
+Both Modular (lossless) and VarDCT (lossy) images render, via the unified
+`JXL.decodeImage`. Decoding lives in
+[`DecodePipeline.swift`](JXLViewer/DecodePipeline.swift); the `CGImage`
+conversion (the one spot that knows the plane layout) is the **`JXLKit`**
+library target (`Sources/JXLKit/JXLImageConverter.swift`), shared with the
+Quick Look provider below for real thumbnails.
 
 ## Quick Look extension (needs full Xcode)
 

@@ -7,7 +7,7 @@
 
 import Foundation
 
-public struct SizeHeader: Equatable {
+public struct SizeHeader: Equatable, Sendable {
     public let width: UInt32
     public let height: UInt32
 

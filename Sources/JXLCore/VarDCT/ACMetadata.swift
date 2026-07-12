@@ -35,7 +35,7 @@ let kCoveredBlocksY: [Int] = [
 ]
 
 /// Per-DC-group AC metadata, indexed in the full block grid.
-public struct VarDCTACMetadata: Equatable {
+@_spi(Stages) public struct VarDCTACMetadata: Equatable, Sendable {
     public let widthBlocks: Int
     public let heightBlocks: Int
     /// Raw AC strategy (`AcStrategyType`) at each block. Covered (non-top-left)
@@ -62,25 +62,25 @@ public struct VarDCTACMetadata: Equatable {
 /// `VarDCTDC` stream that precedes it in each DC group section. Returns the
 /// assembled full-frame metadata. (The full low-frequency pass lives in
 /// `decodeVarDCTLowFrequency`, DCImage.swift.)
-public func decodeVarDCTACMetadata(from data: [UInt8]) throws -> VarDCTACMetadata {
+@_spi(Stages) public func decodeVarDCTACMetadata(from data: [UInt8]) throws -> VarDCTACMetadata {
     try FrameDecoder(data: data).varDCTLowFrequency().metadata
 }
 
-public func decodeVarDCTACMetadata(from data: Data) throws -> VarDCTACMetadata {
+@_spi(Stages) public func decodeVarDCTACMetadata(from data: Data) throws -> VarDCTACMetadata {
     try decodeVarDCTACMetadata(from: [UInt8](data))
 }
 
 /// Decodes the low-frequency layer plus the AC-global (HfGlobal) layer:
 /// coefficient orders and AC histograms. Validates the coefficient-order ANS
 /// stream's final state.
-public func decodeVarDCTACGlobalForFrame(from data: [UInt8]) throws
+@_spi(Stages) public func decodeVarDCTACGlobalForFrame(from data: [UInt8]) throws
     -> (metadata: VarDCTACMetadata, acGlobal: VarDCTACGlobal)
 {
     let d = try FrameDecoder(data: data)
     return (try d.varDCTLowFrequency().metadata, try d.varDCTACGlobal())
 }
 
-public func decodeVarDCTACGlobalForFrame(from data: Data) throws
+@_spi(Stages) public func decodeVarDCTACGlobalForFrame(from data: Data) throws
     -> (metadata: VarDCTACMetadata, acGlobal: VarDCTACGlobal)
 {
     try decodeVarDCTACGlobalForFrame(from: [UInt8](data))

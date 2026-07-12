@@ -19,7 +19,7 @@ import Foundation
 
 /// Dequantized XYB DC planes at block resolution (one sample per 8x8 block).
 /// `x` and `b` are the chroma planes, `y` the luma plane.
-public struct VarDCTDCImage: Equatable {
+@_spi(Stages) public struct VarDCTDCImage: Equatable, Sendable {
     public let widthBlocks: Int
     public let heightBlocks: Int
     public var x: [Float]
@@ -127,15 +127,15 @@ func decodeVarDCTLowFrequency(_ d: FrameDecoder) throws -> VarDCTLowFrequency {
 }
 
 /// Decodes the dequantized XYB DC image of a single-pass, 4:4:4 VarDCT frame.
-public func decodeVarDCTDCImage(from data: [UInt8]) throws -> VarDCTDCImage {
+@_spi(Stages) public func decodeVarDCTDCImage(from data: [UInt8]) throws -> VarDCTDCImage {
     try FrameDecoder(data: data).varDCTLowFrequency().dc
 }
 
-public func decodeVarDCTDCImage(from data: Data) throws -> VarDCTDCImage {
+@_spi(Stages) public func decodeVarDCTDCImage(from data: Data) throws -> VarDCTDCImage {
     try decodeVarDCTDCImage(from: [UInt8](data))
 }
 
-public func decodeVarDCTDCImage(contentsOf url: URL) throws -> VarDCTDCImage {
+@_spi(Stages) public func decodeVarDCTDCImage(contentsOf url: URL) throws -> VarDCTDCImage {
     try decodeVarDCTDCImage(from: try Data(contentsOf: url))
 }
 

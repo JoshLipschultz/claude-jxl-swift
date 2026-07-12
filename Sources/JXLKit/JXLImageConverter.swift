@@ -1,9 +1,11 @@
 // JXLImageConverter.swift
 //
 // Bridges the decoder's `JXLDecodedImage` (one Int32 plane per channel) to a
-// displayable `CGImage`. This is the only place in the viewer that knows the
-// plane layout: color channels first (1 = grayscale, 3 = RGB), then extra
-// channels, with the first extra channel treated as alpha.
+// displayable `CGImage`. This is the only place that knows the plane layout:
+// color channels first (1 = grayscale, 3 = RGB), then extra channels, with the
+// first extra channel treated as alpha. Shared by the viewer app, the Quick
+// Look extension, and any other CoreGraphics consumer — JXLCore itself stays
+// Foundation-only.
 //
 // Output is always 8-bit straight-alpha RGBA in device RGB, which is plenty for
 // on-screen inspection. 16-bit and 32-bit-float sources are tone-mapped down to
@@ -13,14 +15,14 @@ import CoreGraphics
 import Foundation
 import JXLCore
 
-enum JXLImageConverter {
+public enum JXLImageConverter {
 
-    enum ConversionError: Error, CustomStringConvertible {
+    public enum ConversionError: Error, CustomStringConvertible, Sendable {
         case emptyImage
         case missingPlanes
         case cgImageCreationFailed
 
-        var description: String {
+        public var description: String {
             switch self {
             case .emptyImage: return "image has zero width or height"
             case .missingPlanes: return "decoded image is missing colour planes"
@@ -30,9 +32,9 @@ enum JXLImageConverter {
     }
 
     /// Builds an RGBA8 `CGImage` from a decoded image. `orientation` is the EXIF
-    /// orientation (1...8) from the file metadata; it is applied here so the
-    /// viewer shows pixels the right way up.
-    static func makeCGImage(from image: JXLDecodedImage, orientation: UInt32 = 1) throws -> CGImage {
+    /// orientation (1...8) from the file metadata; it is applied here so callers
+    /// show pixels the right way up.
+    public static func makeCGImage(from image: JXLDecodedImage, orientation: UInt32 = 1) throws -> CGImage {
         guard image.width > 0, image.height > 0 else { throw ConversionError.emptyImage }
         guard image.colorChannels >= 1, image.planes.count >= image.colorChannels else {
             throw ConversionError.missingPlanes

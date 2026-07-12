@@ -7,6 +7,7 @@
 import CoreGraphics
 import Foundation
 import JXLCore
+import JXLKit
 
 /// Everything a document window needs after a decode, all Sendable so it can
 /// cross from the background task to the main actor. `@unchecked` is sound

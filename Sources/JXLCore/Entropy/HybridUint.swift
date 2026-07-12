@@ -67,15 +67,22 @@ public struct HybridUintConfig: Equatable, Sendable {
 
 extension BitReader {
     /// Reads one `HybridUintConfig` description (libjxl `DecodeUintConfig`).
-    public func readHybridUintConfig(logAlphaSize: Int) -> HybridUintConfig {
+    /// Returns `nil` for configurations the spec forbids (`split_exponent >
+    /// log_alpha_size`, `msb > split_exponent`, `msb + lsb > split_exponent`) —
+    /// on such streams libjxl fails the decode, and proceeding here would
+    /// produce negative bit counts.
+    public func readHybridUintConfig(logAlphaSize: Int) -> HybridUintConfig? {
         let splitExponent = UInt32(read(ceilLog2Nonzero(UInt32(logAlphaSize + 1))))
+        if splitExponent > UInt32(logAlphaSize) { return nil }
         var msb: UInt32 = 0
         var lsb: UInt32 = 0
         if Int(splitExponent) != logAlphaSize {
             let nbitsMSB = ceilLog2Nonzero(splitExponent + 1)
             msb = UInt32(read(nbitsMSB))
-            let nbitsLSB = ceilLog2Nonzero(splitExponent &- msb &+ 1)
+            if msb > splitExponent { return nil }
+            let nbitsLSB = ceilLog2Nonzero(splitExponent - msb + 1)
             lsb = UInt32(read(nbitsLSB))
+            if msb + lsb > splitExponent { return nil }
         }
         return HybridUintConfig(splitExponent: splitExponent, msbInToken: msb, lsbInToken: lsb)
     }

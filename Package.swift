@@ -8,12 +8,19 @@ let package = Package(
     ],
     products: [
         .library(name: "JXLCore", targets: ["JXLCore"]),
+        .library(name: "JXLKit", targets: ["JXLKit"]),
         .executable(name: "jxl", targets: ["jxl"]),
     ],
     targets: [
         // Pure-Swift, from-scratch JPEG XL implementation. No dependency on libjxl.
         .target(
             name: "JXLCore"
+        ),
+        // CoreGraphics bridge (CGImage from decoded planes), shared by the
+        // viewer app and the Quick Look extension. Keeps JXLCore Foundation-only.
+        .target(
+            name: "JXLKit",
+            dependencies: ["JXLCore"]
         ),
         // Command-line front-end: `jxl info <file>`, `jxl boxes <file>`.
         .executableTarget(

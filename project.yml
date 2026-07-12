@@ -33,6 +33,8 @@ targets:
     dependencies:
       - package: JXL
         product: JXLCore
+      - package: JXL
+        product: JXLKit
     settings:
       base:
         PRODUCT_NAME: JXLViewer

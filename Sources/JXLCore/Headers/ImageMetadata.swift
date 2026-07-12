@@ -42,7 +42,7 @@ public struct JXLColorEncoding: Equatable, Sendable {
     public let renderingIntent: UInt32
 }
 
-public struct JXLImageMetadata: Equatable {
+public struct JXLImageMetadata: Equatable, Sendable {
     public let bitDepth: JXLBitDepth
     public let colorEncoding: JXLColorEncoding
     public let extraChannelCount: Int

@@ -7,7 +7,7 @@
 //   jxl vardct <file.jxl>            Preflight VarDCT global metadata.
 
 import Foundation
-import JXLCore
+@_spi(Stages) import JXLCore
 
 func colorSpaceName(_ colorSpace: JXLColorSpace) -> String {
     switch colorSpace {

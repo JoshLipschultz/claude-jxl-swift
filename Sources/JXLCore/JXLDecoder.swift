@@ -9,7 +9,7 @@
 import Foundation
 
 /// Lightweight description of a JPEG XL file, available without decoding pixels.
-public struct JXLImageInfo: Equatable {
+public struct JXLImageInfo: Equatable, Sendable {
     public let width: UInt32
     public let height: UInt32
     public let bitDepth: JXLBitDepth
@@ -27,7 +27,7 @@ public struct JXLImageInfo: Equatable {
 }
 
 /// Logical role of a TOC section in the frame payload.
-public enum JXLFrameSectionRole: Equatable {
+public enum JXLFrameSectionRole: Equatable, Sendable {
     /// Single-group, single-pass frames coalesce DC-global, DC-group,
     /// AC-global, and AC-group payloads into section 0.
     case singleSectionCoalesced
@@ -38,7 +38,7 @@ public enum JXLFrameSectionRole: Equatable {
 }
 
 /// Byte range for a TOC section in the frame payload.
-public struct JXLFrameSectionInfo: Equatable {
+public struct JXLFrameSectionInfo: Equatable, Sendable {
     /// Logical section id, after applying any TOC permutation.
     public let index: Int
     public let role: JXLFrameSectionRole
@@ -50,7 +50,7 @@ public struct JXLFrameSectionInfo: Equatable {
 }
 
 /// Structural description of a frame and its TOC.
-public struct JXLFrameInfo {
+public struct JXLFrameInfo: Sendable {
     public let isModular: Bool
     public let frameType: FrameType
     public let flags: UInt64
@@ -69,7 +69,7 @@ public struct JXLFrameInfo {
 
 /// A decoded raster image: one Int32 plane per channel (color channels first,
 /// then extra channels such as alpha), each `width * height` row-major.
-public struct JXLDecodedImage {
+public struct JXLDecodedImage: Sendable {
     public let width: Int
     public let height: Int
     public let colorChannels: Int  // 1 (grayscale) or 3 (RGB)

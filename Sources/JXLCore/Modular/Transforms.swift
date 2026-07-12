@@ -10,11 +10,31 @@ import Foundation
 /// Applies a transform's channel-layout change before decoding (libjxl
 /// Transform::MetaApply). RCT keeps the layout; Palette collapses channels into
 /// an index plane plus a palette meta-channel.
+/// libjxl `CheckEqualChannels`: the channel range must lie within the image and
+/// every channel in it must match the first one's dimensions. Transforms index
+/// with stream-controlled `begin_c`/`num_c`, so this is the bounds gate for
+/// hostile input.
+private func checkEqualChannels(_ image: ModularImage, _ begin: Int, _ end: Int) -> Bool {
+    guard begin >= 0, begin <= end, end < image.channels.count else { return false }
+    let first = image.channels[begin]
+    for c in begin...end {
+        let ch = image.channels[c]
+        if ch.w != first.w || ch.h != first.h { return false }
+    }
+    return true
+}
+
 func metaApplyTransform(_ image: ModularImage, transform t: ModularTransform) throws {
     switch t.id {
     case .rct:
-        break  // no layout change
+        // No layout change, but validate here so decode never reaches an
+        // out-of-range or malformed RCT (libjxl InvRCT: rct_type < 42).
+        guard Int(t.rctType) < 42, checkEqualChannels(image, Int(t.beginC), Int(t.beginC) + 2)
+        else { throw ModularDecodeError.invalidTransform }
     case .palette:
+        guard t.numC >= 1,
+            checkEqualChannels(image, Int(t.beginC), Int(t.beginC) + Int(t.numC) - 1)
+        else { throw ModularDecodeError.invalidTransform }
         metaPalette(
             image, beginC: Int(t.beginC), endC: Int(t.beginC) + Int(t.numC) - 1,
             nbColors: Int(t.nbColors), nbDeltas: Int(t.nbDeltas))

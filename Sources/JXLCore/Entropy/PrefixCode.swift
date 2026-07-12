@@ -171,7 +171,7 @@ private let kCodeLengthStaticTable: [HuffmanCode] = [
     HuffmanCode(bits: 2, value: 3), HuffmanCode(bits: 4, value: 5),
 ]
 
-public struct PrefixCode {
+public struct PrefixCode: Sendable {
     var table: [HuffmanCode]
 
     /// Wraps a pre-built decode table (used by tests and internal callers).

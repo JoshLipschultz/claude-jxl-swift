@@ -88,6 +88,10 @@ Sources/JXLCore/
   JXLImage.swift        decoded pixel buffer (public)              [M5+]
   JXLDecoder.swift      public API (thin wrappers over FrameDecoder) [✅]
   Errors.swift                                                     [M1 ✅]
+Sources/JXLKit/
+  JXLImageConverter.swift CGImage bridge (viewer + Quick Look)     [✅]
+Tests/Fuzz/
+  FuzzRunner.swift      seeded mutation fuzzer (Scripts/fuzz.sh)   [✅]
 ```
 
 ### Decoder architecture
@@ -111,8 +115,21 @@ samples) bounds what a hostile header can make the decoder allocate;
 pixel-decoding APIs take it as a parameter.
 
 Per-AC-group decode is a pure function of its section bytes plus immutable
-globals, so group-parallel decode is a small later change (coalesced frames
-excepted).
+globals, and runs **concurrently** across groups
+(`DispatchQueue.concurrentPerform`, coalesced single-section frames excepted);
+results merge in group order, so output is deterministic. The public value
+types are `Sendable`; `FrameDecoder` itself is not (mutable stage caches) —
+one instance per decode.
+
+`Sources/JXLKit` is the CoreGraphics bridge (`JXLImageConverter`:
+`JXLDecodedImage` → `CGImage` with EXIF orientation), shared by the viewer app
+and the Quick Look extension so `JXLCore` stays Foundation-only. The
+stage-level VarDCT entry points (`decodeVarDCTDCImage`,
+`decodeVarDCTACMetadata`, `decodeVarDCTACGlobalForFrame`,
+`decodeVarDCTCoefficients`, `reconstructVarDCTImage` and their result types)
+are gated behind `@_spi(Stages)` — visible to the `jxl` CLI's diagnostic
+subcommands via `@_spi(Stages) import JXLCore`, absent from the plain public
+API, which is now `JXL.*` + the metadata/info types + `BitReader`/fields.
 
 ## Milestones
 
@@ -262,6 +279,11 @@ Every stage is validated against libjxl rather than trusted by inspection:
   both shipped with libjxl) for lossy.
 - Fixtures are produced from known-size PPMs, so dimensions are also checkable
   without any oracle.
+- **Robustness**: `sh Scripts/fuzz.sh [iterations]` runs a deterministic
+  mutation fuzzer (seeded byte flips + truncations of every fixture) against
+  the public entry points. Garbage must produce a thrown `JXLError`, never a
+  trap; on a crash, `/tmp/jxl-fuzz-status` names the fixture + seed and
+  `.build/manual/fuzz <fixturesDir> --repro <fixture> <seed>` replays it.
 
 ## Quick Look integration (M10)
 
@@ -302,15 +324,27 @@ a design constraint to hold while writing it.
 > **Status (landed same day, "Architecture" revision):** items 1–4 are done —
 > `FrameDecoder` single-parse orchestrator, unified Modular/VarDCT dispatch
 > with a merged DC+ACMeta low-frequency pass, `XYBImage` + the color-stage
-> split, and copy-free section readers. Item 5 is partly done
-> (`JXLDecodeLimits`, TOC section-bounds validation at init; the trap→throw
-> audit and fuzzing remain). Item 6 is honored structurally (per-group decode
-> is a pure function of section bytes + immutable globals; not yet parallel).
-> Item 7 remains: the byte-taking VarDCT free functions stayed public as
-> one-line wrappers because the CLI links JXLCore as a separate module —
-> shrink the surface when a `JXLKit`-style target exists. See "Decoder
-> architecture" above for the resulting shape. The section-by-section details
-> below are kept for rationale.
+> split, and copy-free section readers. Item 5 is done for a first pass:
+> `JXLDecodeLimits`, TOC section-bounds validation at init, and a seeded
+> mutation fuzzer (`Scripts/fuzz.sh`, `Tests/Fuzz/FuzzRunner.swift`) that runs
+> byte flips + truncations over the fixture corpus against `readInfo` /
+> `readFrameInfo` / `decodeImage`. Its first runs found and fixed four traps
+> on hostile input: hybrid-uint configs with `msb > split_exponent`
+> (`readHybridUintConfig` is now failable, matching libjxl `DecodeUintConfig`),
+> Modular transforms with out-of-range channels / bad RCT types (now gated by
+> a `CheckEqualChannels` port in `metaApplyTransform`), a >Int.max extensions
+> skip in `skipExtensions` (now clamps past-the-end and latches overread),
+> and a >Int.max ISOBMFF `largesize` (now `malformed`). Keep the fuzzer in the
+> loop when touching bitstream-facing code (it now also exercises
+> `readVarDCTInfo`). Item 6 is done: AC groups decode concurrently
+> (`concurrentPerform`, deterministic merge order) and the public value types
+> are `Sendable`. Item 7 is done: the `JXLKit` target owns the `CGImage`
+> bridge (viewer + Quick Look share it; `project.yml`/`Package.swift`/
+> `build.sh` updated, xcodeproj regenerated), and the stage-level VarDCT
+> functions + result types are `@_spi(Stages)` — the CLI imports the SPI; the
+> plain public surface is `JXL.*`, the info/metadata types, and the bitstream
+> primitives. See "Decoder architecture" above for the resulting shape. The
+> section-by-section details below are kept for rationale.
 
 ### 1. One parse, one decode — a real decoder state object
 

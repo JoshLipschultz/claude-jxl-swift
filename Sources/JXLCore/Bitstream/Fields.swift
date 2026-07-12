@@ -83,7 +83,14 @@ extension BitReader {
         for i in 0..<64 where (extensions & (UInt64(1) << UInt64(i))) != 0 {
             totalBits &+= readU64()
         }
-        skip(Int(totalBits))
+        // A hostile stream can claim up to ~64 * 2^64 bits. Anything past the
+        // buffer is equivalent: skip just beyond the end, which latches
+        // `didOverread` so the caller's bounds check fails cleanly.
+        if totalBits > UInt64(bitsRemaining) {
+            skip(bitsRemaining + 8)
+        } else {
+            skip(Int(totalBits))
+        }
     }
 
     /// `F16()` — IEEE-754 binary16 stored little-endian in the bitstream,

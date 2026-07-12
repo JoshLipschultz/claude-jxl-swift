@@ -25,7 +25,7 @@ let kStrategyOrder: [Int] = [
 ]
 
 /// Per-pass decoded AC-global state.
-public struct VarDCTACGlobal {
+@_spi(Stages) public struct VarDCTACGlobal: Sendable {
     public let numHistograms: Int
     /// `orders[pass][bucket*3 + channel]` — the coefficient order for each used
     /// bucket/channel (empty for buckets no AC strategy uses).

@@ -21,6 +21,16 @@ swiftc -O -parse-as-library \
     -emit-library -static -o "$BUILD/libJXLCore.a" \
     $CORE_SRC
 
+echo "==> Building JXLKit (CGImage bridge)"
+KIT_SRC=$(find "$ROOT/Sources/JXLKit" -name '*.swift' | sort)
+# shellcheck disable=SC2086
+swiftc -O -parse-as-library \
+    -module-name JXLKit \
+    -I "$BUILD" \
+    -emit-module -emit-module-path "$BUILD/JXLKit.swiftmodule" \
+    -emit-library -static -o "$BUILD/libJXLKit.a" \
+    $KIT_SRC
+
 echo "==> Building jxl CLI"
 swiftc -O \
     -module-name jxl \

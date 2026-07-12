@@ -200,7 +200,12 @@ private func precomputeReferenceChannels(image: ModularImage, chan: Int, refCoun
     return refs
 }
 
-enum ModularDecodeError: Error { case unsupportedTransform, badGroupHeader, badTree, finalState }
+enum ModularDecodeError: Error {
+    case unsupportedTransform, badGroupHeader, badTree, finalState
+    /// A transform whose parameters are structurally invalid for the current
+    /// channel layout (out-of-range channels, mismatched sizes, bad RCT type).
+    case invalidTransform
+}
 
 /// Decodes a Modular image stream into `image` (libjxl ModularDecode), using a
 /// pre-decoded global tree/code when `header.use_global_tree` is set.

@@ -35,7 +35,7 @@ private let kDefaultBlockContextMap: [UInt8] = [
     7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
 ]
 
-public enum VarDCTQuantEncodingMode: UInt32, Equatable {
+public enum VarDCTQuantEncodingMode: UInt32, Equatable, Sendable {
     case library = 0
     case identity = 1
     case dct2 = 2
@@ -46,12 +46,12 @@ public enum VarDCTQuantEncodingMode: UInt32, Equatable {
     case raw = 7
 }
 
-public struct VarDCTQuantizerInfo: Equatable {
+public struct VarDCTQuantizerInfo: Equatable, Sendable {
     public let globalScale: UInt32
     public let quantDC: UInt32
 }
 
-public struct VarDCTColorCorrelationInfo: Equatable {
+public struct VarDCTColorCorrelationInfo: Equatable, Sendable {
     public let allDefault: Bool
     public let colorFactor: UInt32
     public let baseCorrelationX: Float
@@ -60,7 +60,7 @@ public struct VarDCTColorCorrelationInfo: Equatable {
     public let yToBDC: Int8
 }
 
-public struct VarDCTBlockContextMap: Equatable {
+public struct VarDCTBlockContextMap: Equatable, Sendable {
     public let dcThresholds: [[Int32]]
     public let qfThresholds: [UInt32]
     public let contextMap: [UInt8]
@@ -75,7 +75,7 @@ public struct VarDCTBlockContextMap: Equatable {
     public var numACContexts: Int { numContexts * (kNonZeroBuckets + kZeroDensityContextCount) }
 }
 
-public struct VarDCTDCGlobalInfo: Equatable {
+public struct VarDCTDCGlobalInfo: Equatable, Sendable {
     public let dcQuantIsDefault: Bool
     public let dcQuant: [Float]
     public let quantizer: VarDCTQuantizerInfo
@@ -86,7 +86,7 @@ public struct VarDCTDCGlobalInfo: Equatable {
     public let modularGlobalTreeNodeCount: Int?
 }
 
-public struct VarDCTACGlobalInfo: Equatable {
+public struct VarDCTACGlobalInfo: Equatable, Sendable {
     public let dequantMatricesAreDefault: Bool
     public let quantEncodingModes: [VarDCTQuantEncodingMode]
     public let numHistograms: Int
@@ -94,7 +94,7 @@ public struct VarDCTACGlobalInfo: Equatable {
     public let histogramsParsed: Bool
 }
 
-public struct JXLVarDCTInfo {
+public struct JXLVarDCTInfo: Sendable {
     public let frame: JXLFrameInfo
     public let dcGlobal: VarDCTDCGlobalInfo
     public let acGlobal: VarDCTACGlobalInfo?

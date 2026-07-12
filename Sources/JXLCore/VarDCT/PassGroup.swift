@@ -38,7 +38,7 @@ private let kCoeffNumNonzeroContext: [Int] = [
 /// channel. The coefficient buffer has `coveredX*coveredY*kDCTBlockSize`
 /// entries; the first `coveredX*coveredY` (LLF) positions are left zero here and
 /// are filled from the DC image during reconstruction.
-public struct VarDCTBlock {
+@_spi(Stages) public struct VarDCTBlock: Sendable {
     public let bx: Int
     public let by: Int
     public let strategy: UInt8
@@ -49,7 +49,7 @@ public struct VarDCTBlock {
 }
 
 /// All decoded varblocks of a frame plus a decode summary.
-public struct VarDCTCoefficients {
+@_spi(Stages) public struct VarDCTCoefficients: Sendable {
     public let blocks: [VarDCTBlock]
     public let totalNonZeros: Int
 }
@@ -106,7 +106,7 @@ private func log2OfPow2(_ v: Int) -> Int { v.trailingZeroBitCount }
 // MARK: - Group decode
 
 /// Decodes all AC coefficients of a single-pass, 4:4:4 VarDCT frame.
-public func decodeVarDCTCoefficients(from data: [UInt8]) throws -> VarDCTCoefficients {
+@_spi(Stages) public func decodeVarDCTCoefficients(from data: [UInt8]) throws -> VarDCTCoefficients {
     try FrameDecoder(data: data).varDCTCoefficients()
 }
 
@@ -120,49 +120,86 @@ func decodeVarDCTCoefficients(_ d: FrameDecoder) throws -> VarDCTCoefficients {
     // Context map padded by the "cheat" margin so out-of-range zero-density
     // contexts index validly (libjxl resize to num_contexts + limit - count).
     let numContexts = acGlobal.numHistograms * bctx.numACContexts
-    var ctxMap = acGlobal.contextMaps[0]
-    if ctxMap.count < numContexts + kZeroDensityContextLimit - kZeroDensityContextCount {
-        ctxMap += [UInt8](
-            repeating: 0,
-            count: numContexts + kZeroDensityContextLimit - kZeroDensityContextCount - ctxMap.count)
-    }
+    let ctxMap: [UInt8] = {
+        var map = acGlobal.contextMaps[0]
+        if map.count < numContexts + kZeroDensityContextLimit - kZeroDensityContextCount {
+            map += [UInt8](
+                repeating: 0,
+                count: numContexts + kZeroDensityContextLimit - kZeroDensityContextCount - map.count)
+        }
+        return map
+    }()
     let histoSelectorBits = ceilLog2Nonzero(UInt32(acGlobal.numHistograms))
+
+    let dim = d.dim
+    let bgDim = dim.groupDim >> 3  // group dimension in blocks
+    let blockW = dim.xsizeBlocks
+
+    let groupBounds: @Sendable (Int) -> (bx0: Int, by0: Int, gw: Int, gh: Int) = { g in
+        let bx0 = (g % dim.xsizeGroups) * bgDim
+        let by0 = (g / dim.xsizeGroups) * bgDim
+        return (bx0, by0, min(bgDim, dim.xsizeBlocks - bx0), min(bgDim, dim.ysizeBlocks - by0))
+    }
+
+    // A coalesced frame has a single group read sequentially from the shared
+    // section-0 reader.
+    if d.coalesced {
+        let (bx0, by0, gw, gh) = groupBounds(0)
+        let (blocks, nz) = try decodeACGroup(
+            d.acGroupReader(0), meta: meta, acGlobal: acGlobal, bctx: bctx, ctxMap: ctxMap,
+            histoSelectorBits: histoSelectorBits, bx0: bx0, by0: by0, gw: gw, gh: gh,
+            blockW: blockW)
+        return VarDCTCoefficients(blocks: blocks, totalNonZeros: nz)
+    }
+
+    // Each AC group is a pure function of its own section bytes plus the
+    // immutable value-type globals above, so groups decode concurrently. Only
+    // Sendable values are captured; each iteration owns its BitReader and
+    // writes one distinct pre-allocated slot.
+    typealias GroupResult = Result<(blocks: [VarDCTBlock], nonZeros: Int), Error>
+    let codestream = d.codestream
+    let sectionRanges = (0..<dim.numGroups).map { g in
+        d.sectionRange(acGroupIndex(
+            pass: 0, group: g, numGroups: dim.numGroups, numDCGroups: dim.numDCGroups))
+    }
+    var results = [GroupResult?](repeating: nil, count: dim.numGroups)
+    results.withUnsafeMutableBufferPointer { slots in
+        // Each iteration writes only its own pre-allocated slot, so handing the
+        // buffer to concurrent code is race-free by construction.
+        nonisolated(unsafe) let out = slots
+        DispatchQueue.concurrentPerform(iterations: dim.numGroups) { g in
+            let (bx0, by0, gw, gh) = groupBounds(g)
+            out[g] = GroupResult {
+                try decodeACGroup(
+                    BitReader(codestream, byteRange: sectionRanges[g]),
+                    meta: meta, acGlobal: acGlobal, bctx: bctx, ctxMap: ctxMap,
+                    histoSelectorBits: histoSelectorBits, bx0: bx0, by0: by0, gw: gw, gh: gh,
+                    blockW: blockW)
+            }
+        }
+    }
 
     var blocks: [VarDCTBlock] = []
     var totalNonZeros = 0
-    let dim = d.dim
-    let bgDim = dim.groupDim >> 3  // group dimension in blocks
-
-    // Each AC group is a pure function of its own section bytes plus the
-    // immutable globals above, so this loop can become concurrent per group
-    // (coalesced frames excepted: they share one sequential reader).
-    for g in 0..<dim.numGroups {
-        let gx = g % dim.xsizeGroups
-        let gy = g / dim.xsizeGroups
-        let bx0 = gx * bgDim
-        let by0 = gy * bgDim
-        let gw = min(bgDim, dim.xsizeBlocks - bx0)
-        let gh = min(bgDim, dim.ysizeBlocks - by0)
-
-        try decodeACGroup(
-            d.acGroupReader(g), meta: meta, acGlobal: acGlobal, bctx: bctx, ctxMap: ctxMap,
-            histoSelectorBits: histoSelectorBits, bx0: bx0, by0: by0, gw: gw, gh: gh,
-            blockW: dim.xsizeBlocks, blocks: &blocks, totalNonZeros: &totalNonZeros)
+    for result in results {
+        let (groupBlocks, nz) = try result!.get()
+        blocks.append(contentsOf: groupBlocks)
+        totalNonZeros += nz
     }
-
     return VarDCTCoefficients(blocks: blocks, totalNonZeros: totalNonZeros)
 }
 
-public func decodeVarDCTCoefficients(from data: Data) throws -> VarDCTCoefficients {
+@_spi(Stages) public func decodeVarDCTCoefficients(from data: Data) throws -> VarDCTCoefficients {
     try decodeVarDCTCoefficients(from: [UInt8](data))
 }
 
 private func decodeACGroup(
     _ br: BitReader, meta: VarDCTACMetadata, acGlobal: VarDCTACGlobal,
     bctx: VarDCTBlockContextMap, ctxMap: [UInt8], histoSelectorBits: Int,
-    bx0: Int, by0: Int, gw: Int, gh: Int, blockW: Int,
-    blocks: inout [VarDCTBlock], totalNonZeros: inout Int
-) throws {
+    bx0: Int, by0: Int, gw: Int, gh: Int, blockW: Int
+) throws -> (blocks: [VarDCTBlock], nonZeros: Int) {
+    var blocks: [VarDCTBlock] = []
+    var totalNonZeros = 0
     var curHistogram = 0
     if histoSelectorBits != 0 { curHistogram = Int(br.read(histoSelectorBits)) }
     guard curHistogram < acGlobal.numHistograms else {
@@ -239,4 +276,5 @@ private func decodeACGroup(
     guard reader.checkANSFinalState() else {
         throw JXLError.malformed("AC group ANS checksum failure")
     }
+    return (blocks, totalNonZeros)
 }

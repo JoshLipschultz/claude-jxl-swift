@@ -7,15 +7,15 @@
 
 import Foundation
 
-public enum FrameType: UInt32 { case regular = 0, dc = 1, referenceOnly = 2, skipProgressive = 3 }
-public enum FrameEncoding { case modular, varDCT }
-public enum ColorTransform: UInt32 { case xyb = 0, none = 1, ycbcr = 2 }
+public enum FrameType: UInt32, Sendable { case regular = 0, dc = 1, referenceOnly = 2, skipProgressive = 3 }
+public enum FrameEncoding: Sendable { case modular, varDCT }
+public enum ColorTransform: UInt32, Sendable { case xyb = 0, none = 1, ycbcr = 2 }
 
 private let kUseDcFrame: UInt64 = 32
 private let kEpfSharpEntries = 8
 
 /// ImageMetadata-derived context needed to parse a FrameHeader.
-public struct FrameContext {
+public struct FrameContext: Sendable {
     public let xybEncoded: Bool
     public let numExtraChannels: Int
     public let haveAnimation: Bool
@@ -33,7 +33,7 @@ public struct FrameContext {
     }
 }
 
-public struct FrameHeader {
+public struct FrameHeader: Sendable {
     public var frameType: FrameType = .regular
     public var encoding: FrameEncoding = .varDCT
     public var flags: UInt64 = 0

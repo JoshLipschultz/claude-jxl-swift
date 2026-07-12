@@ -107,7 +107,8 @@ func decodeHistograms(_ br: BitReader, numContexts numContexts0: Int, disallowLZ
     if code.lz77.enabled {
         code.lz77.minSymbol = br.readU32(.value(224), .value(512), .value(4096), .bits(15, offset: 8))
         code.lz77.minLength = br.readU32(.value(3), .value(4), .bits(2, offset: 5), .bits(8, offset: 9))
-        code.lz77.lengthUintConfig = br.readHybridUintConfig(logAlphaSize: 8)
+        guard let lengthConfig = br.readHybridUintConfig(logAlphaSize: 8) else { return nil }
+        code.lz77.lengthUintConfig = lengthConfig
         numContexts += 1
     }
     if code.lz77.enabled && disallowLZ77 { return nil }
@@ -128,7 +129,12 @@ func decodeHistograms(_ br: BitReader, numContexts numContexts0: Int, disallowLZ
         code.logAlphaSize = Int(br.read(2)) + 5
     }
 
-    code.uintConfig = (0..<numHistograms).map { _ in br.readHybridUintConfig(logAlphaSize: code.logAlphaSize) }
+    var uintConfigs: [HybridUintConfig] = []
+    for _ in 0..<numHistograms {
+        guard let config = br.readHybridUintConfig(logAlphaSize: code.logAlphaSize) else { return nil }
+        uintConfigs.append(config)
+    }
+    code.uintConfig = uintConfigs
 
     let maxAlphabetSize = 1 << code.logAlphaSize
     guard decodeANSCodes(&code, numHistograms: numHistograms, maxAlphabetSize: maxAlphabetSize, br: br)
