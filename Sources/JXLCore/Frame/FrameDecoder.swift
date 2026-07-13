@@ -63,6 +63,8 @@ final class FrameDecoder {
     /// Single-group single-pass frames coalesce every payload into section 0.
     let coalesced: Bool
     let limits: JXLDecodeLimits
+    /// Decoded embedded ICC profile bytes (present when `want_icc` is set).
+    let iccProfile: [UInt8]?
 
     var codestream: [UInt8] { parsed.codestream }
 
@@ -90,8 +92,10 @@ final class FrameDecoder {
         metadata = JXLImageMetadata(reader)
         CustomTransformData.skip(reader, xybEncoded: metadata.xybEncoded)
         if metadata.colorEncoding.wantICC {
-            // A compressed ICC profile would follow here; not yet supported.
-            throw JXLError.unsupported("embedded ICC profile")
+            // A compressed ICC profile follows the transform data.
+            iccProfile = try readICCProfile(reader)
+        } else {
+            iccProfile = nil
         }
         // The codestream headers are followed by byte alignment before the frames
         // (libjxl JxlDecoderReadAllHeaders -> JumpToByteBoundary).
@@ -194,10 +198,12 @@ final class FrameDecoder {
             return try decodeModularImage()
         }
         let xyb = try reconstructXYB()
+        // VarDCT planes are converted to sRGB, so the embedded profile (which
+        // describes the original space) is deliberately not attached.
         return JXLDecodedImage(
             width: xyb.width, height: xyb.height, colorChannels: 3,
             extraChannels: 0, bitsPerSample: 8, isFloat: false,
-            planes: xybToSRGB8Planes(xyb))
+            planes: xybToSRGB8Planes(xyb), iccProfile: nil)
     }
 
     // MARK: Modular pixels
@@ -293,11 +299,14 @@ final class FrameDecoder {
 
         try undoTransforms(fullImage, transforms: globalHeader.transforms)
 
+        // Modular samples are native (no color transform applied here), so the
+        // embedded profile — when present — describes them directly.
         return JXLDecodedImage(
             width: dim.xsize, height: dim.ysize, colorChannels: colorChannels,
             extraChannels: extra, bitsPerSample: Int(metadata.bitDepth.bitsPerSample),
             isFloat: metadata.bitDepth.isFloatingPoint,
-            planes: fullImage.channels.map { $0.pixels })
+            planes: fullImage.channels.map { $0.pixels },
+            iccProfile: iccProfile.map { Data($0) })
     }
 
     // MARK: VarDCT stages

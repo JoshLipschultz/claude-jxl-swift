@@ -31,6 +31,7 @@ func usage() -> Never {
           jxl info   <file.jxl>            Print dimensions and container layout
           jxl boxes  <file.jxl>            List ISOBMFF container boxes
           jxl decode <file.jxl> <out.pnm>  Decode image (lossless or lossy) to PNM
+          jxl icc    <file.jxl> [out.icc]  Extract the embedded ICC profile
           jxl vardct <file.jxl>            Preflight VarDCT global metadata
           jxl vardct-dc <file.jxl> [dump]  Decode VarDCT XYB DC image (lossy)
           jxl vardct-acmeta <file.jxl>     Decode VarDCT AC metadata (strategy/quant)
@@ -201,6 +202,21 @@ do {
         out.append(contentsOf: rgb)
         try Data(out).write(to: URL(fileURLWithPath: args[3]))
         print("reconstructed \(w) x \(h) -> \(args[3])")
+
+    case "icc":
+        guard let profile = try JXL.readICCProfile(from: bytes) else {
+            print("no embedded ICC profile (want_icc unset)")
+            break
+        }
+        if args.count >= 4 {
+            try profile.write(to: URL(fileURLWithPath: args[3]))
+            print("wrote \(profile.count)-byte ICC profile -> \(args[3])")
+        } else {
+            let desc = profile.count >= 132
+                ? String(decoding: profile[16..<20], as: UTF8.self)
+                : "?"
+            print("embedded ICC profile: \(profile.count) bytes, data color space '\(desc)'")
+        }
 
     case "bench":
         let iters = args.count >= 4 ? (Int(args[3]) ?? 5) : 5

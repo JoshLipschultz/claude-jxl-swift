@@ -79,6 +79,11 @@ public struct JXLDecodedImage: Sendable {
     /// pixel value (read via `Float(bitPattern: UInt32(bitPattern: sample))`).
     public let isFloat: Bool
     public let planes: [[Int32]]
+    /// The embedded ICC profile describing the returned samples, when the file
+    /// carries one AND the samples are in that profile's space (Modular frames).
+    /// `nil` for VarDCT frames, whose planes are always converted to sRGB —
+    /// use `JXL.readICCProfile` to obtain the raw embedded profile regardless.
+    public let iccProfile: Data?
 }
 
 public enum JXL {
@@ -202,6 +207,23 @@ public enum JXL {
         -> BitReader
     {
         try readFrameSectionReader(from: try Data(contentsOf: url), sectionIndex: sectionIndex)
+    }
+
+    /// Returns the embedded ICC profile, decoded from its compressed form, or
+    /// `nil` when the file's color encoding does not carry one (`want_icc`
+    /// unset). This is the profile as embedded — for XYB-encoded (lossy) files
+    /// it describes the *original* color space, not the sRGB planes
+    /// `decodeImage` currently produces.
+    public static func readICCProfile(from data: [UInt8]) throws -> Data? {
+        try FrameDecoder(data: data).iccProfile.map { Data($0) }
+    }
+
+    public static func readICCProfile(from data: Data) throws -> Data? {
+        try readICCProfile(from: [UInt8](data))
+    }
+
+    public static func readICCProfile(contentsOf url: URL) throws -> Data? {
+        try readICCProfile(from: try Data(contentsOf: url))
     }
 
     /// Parses the currently implemented VarDCT global metadata without decoding

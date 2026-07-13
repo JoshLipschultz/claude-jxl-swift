@@ -66,9 +66,55 @@ struct TestRunner {
         vardctAC()
         vardctReconstruct()
         colorQuantizer()
+        iccProfile()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
+    }
+
+    // MARK: - Embedded ICC profiles (M8)
+
+    /// `32x24_icc.jxl` (lossless) embeds the AdobeRGB profile (via sips +
+    /// cjxl). The decoded profile must be byte-exact against `32x24_icc.icc`,
+    /// which round-trips identically through djxl. `32x24_icc_lossy.jxl` came
+    /// from the same tagged PNG but cjxl numericized AdobeRGB into custom
+    /// primaries + gamma (`want_icc` unset) — the correct answer is `nil`.
+    static func iccProfile() {
+        let dir = fixturesDir()
+        guard let oracle = try? Data(contentsOf: dir.appendingPathComponent("32x24_icc.icc")),
+            let lossless = try? Data(contentsOf: dir.appendingPathComponent("32x24_icc.jxl")),
+            let lossy = try? Data(contentsOf: dir.appendingPathComponent("32x24_icc_lossy.jxl"))
+        else {
+            check(false, "ICC fixtures present")
+            return
+        }
+
+        do {
+            let profile = try JXL.readICCProfile(from: lossless)
+            check(profile == oracle, "32x24_icc.jxl ICC profile byte-exact vs djxl")
+        } catch {
+            check(false, "32x24_icc.jxl readICCProfile threw \(error)")
+        }
+
+        // Pixel decoding must proceed past the embedded profile, and the
+        // Modular result (native samples) carries it.
+        if let img = try? JXL.decodeImage(from: [UInt8](lossless)) {
+            check(img.width == 32 && img.height == 24, "icc lossless decode dimensions")
+            check(img.iccProfile == oracle, "icc lossless decode carries the profile")
+        } else {
+            check(false, "icc lossless decodeImage")
+        }
+
+        // Custom numeric color encoding (no embedded profile): decodes, nil profile.
+        if let img = try? JXL.decodeImage(from: [UInt8](lossy)) {
+            check(img.width == 32 && img.height == 24, "icc lossy decode dimensions")
+            check(img.iccProfile == nil, "custom-numeric lossy has no embedded profile")
+        } else {
+            check(false, "icc lossy decodeImage")
+        }
+        check(
+            (try? JXL.readICCProfile(from: lossy)).flatMap { $0 } == nil,
+            "numericized lossy returns nil profile")
     }
 
     // MARK: - Color: sRGB8 quantizer

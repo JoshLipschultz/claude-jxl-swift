@@ -74,7 +74,10 @@ public enum JXLImageConverter {
             }
         }
 
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        // Tag with the embedded ICC profile when the decoder attached one (its
+        // samples are in that space); otherwise assume device RGB.
+        let colorSpace = image.iccProfile.flatMap { CGColorSpace(iccData: $0 as CFData) }
+            ?? CGColorSpaceCreateDeviceRGB()
         let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue)
         guard
             let provider = CGDataProvider(data: Data(rgba) as CFData),

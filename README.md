@@ -10,9 +10,11 @@ extension. No dependency on libjxl; libjxl is used only as a test oracle.
 > Palette, single + multi-group) — and **VarDCT (lossy)** — all transforms up
 > to 32×32 with Gaborish + EPF1, ~54 dB vs `djxl` — both behind one
 > `JXL.decodeImage`, driven by a single-parse `FrameDecoder` with decode
-> limits and a mutation-fuzz harness. Squeeze, progressive, DCT64+, the full
-> color pipeline (ICC, 16-bit/float lossy output), and animation remain. See
-> [ARCHITECTURE.md](ARCHITECTURE.md) for the design and milestone status.
+> limits and a mutation-fuzz harness. Embedded **ICC profiles** decode
+> byte-exact vs `djxl` (`JXL.readICCProfile`). Squeeze, progressive, DCT64+,
+> the rest of the color pipeline (16-bit/float lossy output, CMS), and
+> animation remain. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and
+> milestone status.
 
 ## What works today
 
