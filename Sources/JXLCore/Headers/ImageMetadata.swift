@@ -23,6 +23,12 @@ public enum JXLColorSpace: UInt32, Equatable, Sendable {
     case unknown = 3
 }
 
+/// A CIE xy chromaticity coordinate (signaled as signed micro-units).
+public struct JXLChromaticity: Equatable, Sendable {
+    public let x: Double
+    public let y: Double
+}
+
 /// The serialized color encoding (everything signaled in the codestream's
 /// ColorEncoding bundle). Enum-valued fields use the raw codestream values,
 /// matching libjxl's public `JxlColorEncoding`.
@@ -31,8 +37,12 @@ public struct JXLColorEncoding: Equatable, Sendable {
     public let colorSpace: JXLColorSpace
     /// 1=D65, 2=Custom, 10=E, 11=DCI. 0 when not signaled (ICC or XYB).
     public let whitePoint: UInt32
+    /// Signaled only when `whitePoint == 2` (Custom).
+    public let customWhitePoint: JXLChromaticity?
     /// 1=sRGB, 2=Custom, 9=2100, 11=P3. 0 when not signaled (gray/XYB/ICC).
     public let primaries: UInt32
+    /// Signaled only when `primaries == 2` (Custom): red, green, blue.
+    public let customPrimaries: [JXLChromaticity]?
     public let hasGamma: Bool
     /// gamma × 1e7, valid only when `hasGamma`.
     public let gamma: UInt32
@@ -118,7 +128,8 @@ public struct JXLImageMetadata: Equatable, Sendable {
 
 private enum ImageMetadataFields {
     static let defaultSRGB = JXLColorEncoding(
-        wantICC: false, colorSpace: .rgb, whitePoint: 1, primaries: 1,
+        wantICC: false, colorSpace: .rgb, whitePoint: 1, customWhitePoint: nil,
+        primaries: 1, customPrimaries: nil,
         hasGamma: false, gamma: 0, transferFunction: 13, renderingIntent: 1)
 
     // MARK: BitDepth
@@ -185,21 +196,26 @@ private enum ImageMetadataFields {
         var transferFunction: UInt32 = 0
         var renderingIntent: UInt32 = 0
 
+        var customWhitePoint: JXLChromaticity? = nil
+        var customPrimaries: [JXLChromaticity]? = nil
+
         if !wantICC {
             // White point — read unless the color space implies it (XYB).
             if colorSpace != .xyb {
                 whitePoint = reader.readEnum()
                 if whitePoint == 2 {  // kCustom
-                    readCustomxy(reader)
+                    customWhitePoint = readCustomxy(reader)
                 }
             }
             // Primaries — only when the color space has them (not gray, not XYB).
             if colorSpace != .grayscale && colorSpace != .xyb {
                 primaries = reader.readEnum()
                 if primaries == 2 {  // kCustom
-                    readCustomxy(reader)  // red
-                    readCustomxy(reader)  // green
-                    readCustomxy(reader)  // blue
+                    customPrimaries = [
+                        readCustomxy(reader),  // red
+                        readCustomxy(reader),  // green
+                        readCustomxy(reader),  // blue
+                    ]
                 }
             }
             // CustomTransferFunction — implicit (skipped) for XYB.
@@ -215,20 +231,26 @@ private enum ImageMetadataFields {
         }
 
         return JXLColorEncoding(
-            wantICC: wantICC, colorSpace: colorSpace, whitePoint: whitePoint,
-            primaries: primaries, hasGamma: hasGamma, gamma: gamma,
+            wantICC: wantICC, colorSpace: colorSpace,
+            whitePoint: whitePoint, customWhitePoint: customWhitePoint,
+            primaries: primaries, customPrimaries: customPrimaries,
+            hasGamma: hasGamma, gamma: gamma,
             transferFunction: transferFunction, renderingIntent: renderingIntent)
     }
 
     /// Customxy: two coordinates, each U32(Bits(19), BitsOffset(19, 524288),
     /// BitsOffset(20, 1048576), BitsOffset(21, 2097152)) holding a packed signed
-    /// value. We only need to consume the bits.
-    static func readCustomxy(_ reader: BitReader) {
-        for _ in 0..<2 {
-            _ = reader.readU32(
+    /// micro-unit value (x * 1e6, zig-zag coded).
+    static func readCustomxy(_ reader: BitReader) -> JXLChromaticity {
+        var coords = [Double](repeating: 0, count: 2)
+        for i in 0..<2 {
+            let packed = reader.readU32(
                 .bits(19), .bits(19, offset: 524288), .bits(20, offset: 1_048_576),
                 .bits(21, offset: 2_097_152))
+            let signed = Int32(bitPattern: (packed >> 1) ^ (0 &- (packed & 1)))
+            coords[i] = Double(signed) * 1e-6
         }
+        return JXLChromaticity(x: coords[0], y: coords[1])
     }
 
     // MARK: Optional sub-headers (consumed, values not exposed yet)

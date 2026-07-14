@@ -115,6 +115,36 @@ struct TestRunner {
         check(
             (try? JXL.readICCProfile(from: lossy)).flatMap { $0 } == nil,
             "numericized lossy returns nil profile")
+
+        // Numeric color-encoding output: the lossy fixture declares custom
+        // (AdobeRGB) primaries + gamma; our reconstruction must match djxl's
+        // color-managed output (`32x24_icc_lossy.ppm`) at oracle precision.
+        if let refPPM = try? Data(contentsOf: dir.appendingPathComponent("32x24_icc_lossy.ppm")),
+            let (w, h, rgb) = try? reconstructVarDCTImage(from: [UInt8](lossy))
+        {
+            // Strip the P6 header: bytes after the third newline.
+            var newlines = 0
+            var offset = 0
+            for (i, byte) in refPPM.enumerated() where byte == 0x0A {
+                newlines += 1
+                if newlines == 3 {
+                    offset = i + 1
+                    break
+                }
+            }
+            let ref = [UInt8](refPPM[offset...])
+            check(ref.count == w * h * 3 && rgb.count == ref.count, "icc lossy reference size")
+            var se = 0.0
+            for i in 0..<min(ref.count, rgb.count) {
+                let d = Double(Int(ref[i]) - Int(rgb[i]))
+                se += d * d
+            }
+            let mse = se / Double(ref.count)
+            let psnr = mse == 0 ? 999 : 10 * log10(255.0 * 255.0 / mse)
+            check(psnr > 50, "custom-primaries lossy matches djxl (PSNR \(Int(psnr)) dB)")
+        } else {
+            check(false, "icc lossy PSNR oracle")
+        }
     }
 
     // MARK: - Color: sRGB8 quantizer

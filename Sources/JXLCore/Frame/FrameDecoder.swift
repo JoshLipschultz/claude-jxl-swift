@@ -198,12 +198,15 @@ final class FrameDecoder {
             return try decodeModularImage()
         }
         let xyb = try reconstructXYB()
-        // VarDCT planes are converted to sRGB, so the embedded profile (which
-        // describes the original space) is deliberately not attached.
+        // VarDCT planes are converted to the frame's declared numeric encoding
+        // (primaries/white point/transfer); files whose encoding is an ICC
+        // profile fall back to sRGB output, so the profile (which describes the
+        // original space) is deliberately not attached.
+        let spec = try makeOutputColorSpec(metadata.colorEncoding)
         return JXLDecodedImage(
             width: xyb.width, height: xyb.height, colorChannels: 3,
             extraChannels: 0, bitsPerSample: 8, isFloat: false,
-            planes: xybToSRGB8Planes(xyb), iccProfile: nil)
+            planes: xybToRGB8Planes(xyb, spec: spec), iccProfile: nil)
     }
 
     // MARK: Modular pixels

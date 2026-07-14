@@ -83,8 +83,10 @@ Sources/JXLCore/
   Restoration/
     Upsampling.swift                                               [M7]
   Color/
-    ColorManagement.swift XYBImage planes + XYB→sRGB8 stage        [✅ initial]
-                        (tone mapping, 16-bit/float out: M8)
+    ColorManagement.swift XYBImage planes; XYB→linear→declared
+                        encoding (primaries matrix + Bradford,
+                        gamma/709/DCI/sRGB/linear quantizer)       [M8 🟡]
+                        (16-bit/float out, PQ/HLG, CMS remain)
     ICCCodec.swift      embedded ICC profile decode (ReadICC +
                         UnpredictICC, byte-exact vs djxl)          [M8 ✅]
   JXLImage.swift        decoded pixel buffer (public)              [M5+]
@@ -144,7 +146,7 @@ API, which is now `JXL.*` + the metadata/info types + `BitReader`/fields.
 | M5 | **Modular mode** | lossless `.jxl` → pixels | 🟢 **all 17 lossless fixtures byte-exact vs djxl** — single + multi-group, RCT + Palette, gray/RGB/RGBA/8/16-bit. Float, Squeeze, progressive remain |
 | M6 | VarDCT mode | lossy photographic `.jxl` → pixels | 🟢 **all transforms up to 32×32 at ~54 dB vs djxl** — full pipeline (entropy → dequant → LLF-from-DC → inverse transform → CfL → filters → XYB→sRGB) for DCT8/16/32, all rectangular sizes, IDENTITY, DCT2x2/4x4/4x8/8x4, AFV0–3, validated on the mixed-strategy fixture. DCT64+ remains |
 | M7 | Restoration | Gaborish + EPF + upsampling | 🟡 Gaborish + EPF1 validated at ~54 dB on the mixed-strategy fixture (EPF sigma exercised across multi-block varblocks). Upsampling and EPF0/EPF2 (epf_iters ≠ 1) remain |
-| M8 | Color pipeline | XYB→sRGB, ICC, alpha, 8/16-bit/float output | 🟡 embedded ICC profiles decode **byte-exact vs djxl** (`ReadICC` + `UnpredictICC` port); `JXL.readICCProfile`, `JXLDecodedImage.iccProfile` (Modular), `CGImage` tagging in JXLKit. 16-bit/float lossy output, CMS transform for XYB→profile space, tone mapping remain |
+| M8 | Color pipeline | XYB→sRGB, ICC, alpha, 8/16-bit/float output | 🟡 embedded ICC profiles decode **byte-exact vs djxl** (`ReadICC` + `UnpredictICC` port; `JXL.readICCProfile`, `JXLDecodedImage.iccProfile`, `CGImage` tagging in JXLKit). Numeric color encodings render correctly: custom/enum primaries + white points (Bradford adaptation) and gamma/709/DCI/linear transfers — **54.6 dB vs djxl** on the custom-primaries fixture, in-suite oracle. 16-bit/float lossy output, PQ/HLG, CMS for XYB→ICC-profile space remain |
 | M9 | Advanced | patches, splines, noise, animation, extra channels, JPEG recon | |
 | M10 | macOS integration | `CGImage` bridge + Quick Look thumbnail/preview appex | 🟡 `JXL.decodeImage` unified across Modular + VarDCT (lossy → 8-bit sRGB planes), so the JXLViewer app decodes both. `CGImage` bridge in the app; Quick Look appex still needs Xcode |
 

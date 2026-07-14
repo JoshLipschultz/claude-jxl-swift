@@ -400,8 +400,10 @@ extension FrameDecoder {
 /// Decodes a single-pass, 4:4:4 VarDCT frame to an 8-bit sRGB image
 /// (interleaved RGB, row-major). Handles all AC strategies up to 32x32.
 @_spi(Stages) public func reconstructVarDCTImage(from data: [UInt8]) throws -> (width: Int, height: Int, rgb: [UInt8]) {
-    let xyb = try FrameDecoder(data: data).reconstructXYB()
-    return (xyb.width, xyb.height, xybToSRGB8Interleaved(xyb))
+    let decoder = try FrameDecoder(data: data)
+    let xyb = try decoder.reconstructXYB()
+    let spec = try makeOutputColorSpec(decoder.metadata.colorEncoding)
+    return (xyb.width, xyb.height, xybToRGB8Interleaved(xyb, spec: spec))
 }
 
 @_spi(Stages) public func reconstructVarDCTImage(from data: Data) throws -> (width: Int, height: Int, rgb: [UInt8]) {
