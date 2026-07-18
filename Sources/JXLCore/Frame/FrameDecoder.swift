@@ -49,22 +49,48 @@ func sectionRole(
     return .acGroup(pass: acIndex / numGroups, group: acIndex % numGroups)
 }
 
-final class FrameDecoder {
-    let parsed: ParsedFile
-    let size: SizeHeader
-    let metadata: JXLImageMetadata
-    let frameHeader: FrameHeader
+/// One parsed frame: header + TOC layout. The presented (displayed) frame's
+/// slot doubles as the FrameDecoder's own state; frames preceding it in the
+/// codestream (patch reference frames) keep their own slots.
+struct FrameSlot {
+    let header: FrameHeader
     let dim: FrameDimensions
     let tocOffsets: [Int]
     let tocSizes: [Int]
     let totalSectionBytes: Int
     /// Byte offset (within the codestream) where the first section's data begins.
     let dataStart: Int
-    /// Single-group single-pass frames coalesce every payload into section 0.
-    let coalesced: Bool
+
+    var coalesced: Bool { dim.numGroups == 1 && header.numPasses == 1 }
+
+    func sectionRange(_ logicalIndex: Int) -> Range<Int> {
+        let start = dataStart + tocOffsets[logicalIndex]
+        return start..<(start + tocSizes[logicalIndex])
+    }
+}
+
+final class FrameDecoder {
+    let parsed: ParsedFile
+    let size: SizeHeader
+    let metadata: JXLImageMetadata
+    /// The presented frame (first regular frame), preceded by `referenceSlots`.
+    let slot: FrameSlot
+    /// Frames stored for later reference (`frameType == .referenceOnly`), in
+    /// codestream order. Decoded lazily when the patch dictionary needs them.
+    let referenceSlots: [FrameSlot]
     let limits: JXLDecodeLimits
     /// Decoded embedded ICC profile bytes (present when `want_icc` is set).
     let iccProfile: [UInt8]?
+
+    var frameHeader: FrameHeader { slot.header }
+    var dim: FrameDimensions { slot.dim }
+    var tocOffsets: [Int] { slot.tocOffsets }
+    var tocSizes: [Int] { slot.tocSizes }
+    var totalSectionBytes: Int { slot.totalSectionBytes }
+    /// Byte offset (within the codestream) where the first section's data begins.
+    var dataStart: Int { slot.dataStart }
+    /// Single-group single-pass frames coalesce every payload into section 0.
+    var coalesced: Bool { slot.coalesced }
 
     var codestream: [UInt8] { parsed.codestream }
 
@@ -102,29 +128,55 @@ final class FrameDecoder {
         reader.alignToByte()
 
         let ctx = FrameContext(metadata: metadata, width: size.width, height: size.height)
-        frameHeader = FrameHeader(reader: reader, context: ctx)
-        dim = frameHeader.frameDimensions(ctx)
-        coalesced = dim.numGroups == 1 && frameHeader.numPasses == 1
+
+        // Walk the frame sequence: reference-only frames (patch dictionaries
+        // draw from them) are recorded and skipped; the first frame of any
+        // other type is the presented one.
+        var preceding: [FrameSlot] = []
+        var current = try FrameDecoder.parseFrameSlot(
+            reader, context: ctx, codestreamCount: parsed.codestream.count)
+        while current.header.frameType == .referenceOnly {
+            preceding.append(current)
+            guard preceding.count <= 8 else {
+                throw JXLError.malformed("too many reference frames")
+            }
+            // The TOC leaves the reader at the frame's data start; the next
+            // frame header begins right after its sections, byte-aligned.
+            reader.skip(current.totalSectionBytes * 8)
+            current = try FrameDecoder.parseFrameSlot(
+                reader, context: ctx, codestreamCount: parsed.codestream.count)
+        }
+        slot = current
+        referenceSlots = preceding
+    }
+
+    /// Parses one frame header + TOC from `reader` and validates every section
+    /// range against the codestream, so section readers never index out of
+    /// bounds on a malformed TOC.
+    private static func parseFrameSlot(
+        _ reader: BitReader, context ctx: FrameContext, codestreamCount: Int
+    ) throws -> FrameSlot {
+        let header = FrameHeader(reader: reader, context: ctx)
+        let dim = header.frameDimensions(ctx)
 
         let entries = numTocEntries(
             numGroups: dim.numGroups, numDCGroups: dim.numDCGroups,
-            numPasses: Int(frameHeader.numPasses))
+            numPasses: Int(header.numPasses))
         guard let toc = readGroupOffsets(reader, tocEntries: entries) else {
             throw JXLError.malformed("could not read TOC")
         }
         try reader.ensureInBounds("TOC")
-        tocOffsets = toc.offsets
-        tocSizes = toc.sizes.map(Int.init)
-        totalSectionBytes = toc.totalSize
-        dataStart = reader.bitPosition / 8
+        let dataStart = reader.bitPosition / 8
 
-        // Validate every section range against the codestream once, so section
-        // readers never index out of bounds on a malformed TOC.
         for i in 0..<entries {
-            let start = dataStart + tocOffsets[i]
-            guard start >= 0, tocSizes[i] >= 0, start + tocSizes[i] <= parsed.codestream.count
+            let start = dataStart + toc.offsets[i]
+            guard start >= 0, toc.sizes[i] >= 0, start + Int(toc.sizes[i]) <= codestreamCount
             else { throw JXLError.malformed("TOC section \(i) outside codestream") }
         }
+        return FrameSlot(
+            header: header, dim: dim, tocOffsets: toc.offsets,
+            tocSizes: toc.sizes.map(Int.init), totalSectionBytes: toc.totalSize,
+            dataStart: dataStart)
     }
 
     convenience init(data: Data, limits: JXLDecodeLimits = .default) throws {
@@ -197,7 +249,12 @@ final class FrameDecoder {
         if frameHeader.isModular {
             return try decodeModularImage()
         }
-        let xyb = try reconstructXYB()
+        var xyb = try reconstructXYB()
+        // Patches blend in after the restoration filters, before the color
+        // transform (libjxl render pipeline order), in the frame's XYB space.
+        if let patches = patchDictionary, !patches.isEmpty {
+            try renderPatches(patches, into: &xyb) { try self.referenceXYBFrame($0) }
+        }
         if frameHeader.colorTransform == .ycbcr {
             // JPEG transcode: the YCbCr planes convert to the file's *native*
             // encoded RGB (no color management applied), so the embedded
@@ -289,11 +346,34 @@ final class FrameDecoder {
         let extra = metadata.extraChannelCount
         try checkPixelLimits(channels: colorChannels + extra)
 
+        let fullImage = try decodeModularChannels(
+            in: slot, channelCount: colorChannels + extra).image
+
+        // Modular samples are native (no color transform applied here), so the
+        // embedded profile — when present — describes them directly.
+        return JXLDecodedImage(
+            width: dim.xsize, height: dim.ysize, colorChannels: colorChannels,
+            extraChannels: extra, bitsPerSample: Int(metadata.bitDepth.bitsPerSample),
+            isFloat: metadata.bitDepth.isFloatingPoint,
+            planes: fullImage.channels.map { $0.pixels },
+            iccProfile: iccProfile.map { Data($0) })
+    }
+
+    /// The core Modular pipeline for one frame slot: global tree + global
+    /// stream, then the per-group streams, then inverse transforms. Returns the
+    /// decoded channels and the DC-quant factors read from the slot's global
+    /// section (they double as the XYB multipliers of Modular-XYB frames).
+    private func decodeModularChannels(
+        in slot: FrameSlot, channelCount: Int
+    ) throws -> (image: ModularImage, dcQuant: [Float]) {
+        let dim = slot.dim
+
         // Global modular (section 0 = LfGlobal): DequantMatrices.DecodeDC, then
         // has_tree / the global MA tree + code, then the global modular stream.
-        let r0 = sectionReader(0)
+        let r0 = BitReader(parsed.codestream, byteRange: slot.sectionRange(0))
+        var dcQuant: [Float] = [1.0 / 4096.0, 1.0 / 512.0, 1.0 / 256.0]
         if r0.read(1) == 0 {
-            for _ in 0..<3 { _ = r0.readF16() }
+            for c in 0..<3 { dcQuant[c] = r0.readF16() * (1.0 / 128.0) }
         }
         var globalTree: [MATreeNode]? = nil
         var globalCode: ANSCode? = nil
@@ -310,7 +390,7 @@ final class FrameDecoder {
 
         let fullImage = ModularImage(
             w: dim.xsize, h: dim.ysize, bitdepth: Int(metadata.bitDepth.bitsPerSample),
-            channelCount: colorChannels + extra)
+            channelCount: channelCount)
 
         // For a single group the global stream carries every channel; otherwise
         // large channels are decoded per AC group.
@@ -324,9 +404,8 @@ final class FrameDecoder {
             // sub-images, then blit serially (the decode phase only reads the
             // full image's channel layout).
             let codestream = self.codestream
-            let dim = self.dim
             let sectionRanges = (0..<dim.numGroups).map { g in
-                sectionRange(acGroupIndex(
+                slot.sectionRange(acGroupIndex(
                     pass: 0, group: g, numGroups: dim.numGroups, numDCGroups: dim.numDCGroups))
             }
             typealias GroupResult = Result<ModularGroupResult?, Error>
@@ -359,15 +438,75 @@ final class FrameDecoder {
         }
 
         try undoTransforms(fullImage, transforms: globalHeader.transforms)
+        return (fullImage, dcQuant)
+    }
 
-        // Modular samples are native (no color transform applied here), so the
-        // embedded profile — when present — describes them directly.
-        return JXLDecodedImage(
-            width: dim.xsize, height: dim.ysize, colorChannels: colorChannels,
-            extraChannels: extra, bitsPerSample: Int(metadata.bitDepth.bitsPerSample),
-            isFloat: metadata.bitDepth.isFloatingPoint,
-            planes: fullImage.channels.map { $0.pixels },
-            iccProfile: iccProfile.map { Data($0) })
+    // MARK: Reference frames (patch sources)
+
+    private var cachedReferences: [Int: ReferenceXYBFrame] = [:]
+
+    /// Dimensions of the reference frame stored in `index` (0-3), or nil when
+    /// no preceding frame fills that slot. Used to validate the patch
+    /// dictionary before any reference pixels are decoded.
+    func referenceFrameSize(_ index: Int) -> (width: Int, height: Int)? {
+        guard let frame = latestReferenceSlot(index) else { return nil }
+        return (frame.dim.xsize, frame.dim.ysize)
+    }
+
+    private func latestReferenceSlot(_ index: Int) -> FrameSlot? {
+        referenceSlots.last {
+            $0.header.frameType == .referenceOnly && Int($0.header.saveAsReference) == index
+        }
+    }
+
+    /// Decodes (and caches) the reference frame in slot `index` as XYB float
+    /// planes. Patch reference frames are Modular-encoded XYB images stored
+    /// before the color transform: channels arrive as Y, X, (B−Y) and scale by
+    /// the frame's DC-quant factors (libjxl dec_modular `kXYB` finalization).
+    func referenceXYBFrame(_ index: Int) throws -> ReferenceXYBFrame {
+        if let cached = cachedReferences[index] { return cached }
+        guard let frame = latestReferenceSlot(index) else {
+            throw JXLError.malformed("patch reference frame \(index) not present")
+        }
+        let h = frame.header
+        guard h.saveBeforeColorTransform else {
+            throw JXLError.malformed("patches cannot use frames saved post color transform")
+        }
+        guard h.isModular, h.colorTransform == .xyb else {
+            throw JXLError.unsupported("non-Modular-XYB patch reference frame")
+        }
+        guard h.flags == 0, h.numPasses == 1 else {
+            throw JXLError.unsupported("feature-flagged patch reference frame")
+        }
+        let w = frame.dim.xsize
+        let ht = frame.dim.ysize
+        let samples = UInt64(w) * UInt64(ht) * UInt64(3 + metadata.extraChannelCount)
+        if samples > UInt64(limits.maxTotalSamples) {
+            throw JXLError.limitExceeded("reference frame \(w)x\(ht)")
+        }
+
+        let (image, dcQuant) = try decodeModularChannels(
+            in: frame, channelCount: 3 + metadata.extraChannelCount)
+        guard image.channels.count >= 3,
+            image.channels[0].pixels.count >= w * ht,
+            image.channels[1].pixels.count >= w * ht,
+            image.channels[2].pixels.count >= w * ht
+        else { throw JXLError.malformed("reference frame channel layout") }
+
+        var x = [Float](repeating: 0, count: w * ht)
+        var y = [Float](repeating: 0, count: w * ht)
+        var b = [Float](repeating: 0, count: w * ht)
+        let cY = image.channels[0].pixels
+        let cX = image.channels[1].pixels
+        let cB = image.channels[2].pixels
+        for i in 0..<(w * ht) {
+            x[i] = Float(cX[i]) * dcQuant[0]
+            y[i] = Float(cY[i]) * dcQuant[1]
+            b[i] = Float(cB[i] &+ cY[i]) * dcQuant[2]
+        }
+        let ref = ReferenceXYBFrame(width: w, height: ht, x: x, y: y, b: b)
+        cachedReferences[index] = ref
+        return ref
     }
 
     // MARK: VarDCT stages
@@ -390,11 +529,26 @@ final class FrameDecoder {
                 throw JXLError.unsupported("restoration filters with chroma subsampling")
             }
         }
-        // No patches/splines/noise: those precede DequantMatrices.DecodeDC and
-        // are not yet parsed. kSkipAdaptiveDCSmoothing (128) is honored.
-        guard frameHeader.flags & ~UInt64(128) == 0 else {
-            throw JXLError.unsupported("VarDCT frame features (patches/splines/noise)")
+        // kPatches (2) is decoded from the DC-global head; splines (16) and
+        // noise (1) are not yet parsed and would desynchronize the stream.
+        // kSkipAdaptiveDCSmoothing (128) is honored.
+        guard frameHeader.flags & ~UInt64(128 | 2) == 0 else {
+            throw JXLError.unsupported("VarDCT frame features (splines/noise)")
         }
+    }
+
+    /// The patch dictionary, populated by `varDCTDCGlobal` when the frame sets
+    /// kPatches; nil otherwise (and before DC-global runs).
+    private(set) var patchDictionary: PatchDictionary?
+
+    /// Decodes the patch dictionary from the head of the DC-global section
+    /// (before DequantMatrices.DecodeDC). Positions are validated against the
+    /// padded frame and the stored reference-frame dimensions.
+    func parsePatchDictionary(_ r: BitReader) throws -> PatchDictionary {
+        try decodePatchDictionary(
+            r, xsize: divCeil(dim.xsize, 8) * 8, ysize: divCeil(dim.ysize, 8) * 8,
+            numExtraChannels: metadata.extraChannelCount,
+            referenceSize: { self.referenceFrameSize($0) })
     }
 
     /// Stage 1 — `ProcessDCGlobal` (section 0 prefix): quantizer, block context
@@ -402,6 +556,9 @@ final class FrameDecoder {
     func varDCTDCGlobal() throws -> VarDCTDCGlobalDecoded {
         if let cached = cachedDCGlobal { return cached }
         try requireSupportedVarDCT()
+        if frameHeader.flags & 2 != 0 {
+            patchDictionary = try parsePatchDictionary(r0)
+        }
         let dcGlobal = try readVarDCTDCGlobal(r0)
         cachedDCGlobal = dcGlobal
         cachedDCDequant = computeDCDequant(dcGlobal.info)

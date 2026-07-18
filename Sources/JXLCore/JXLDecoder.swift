@@ -253,7 +253,12 @@ public enum JXL {
 
         // Preflight reads use their own section readers (not the staged decode
         // path), so they work on frames the strict pipeline still rejects.
-        let dcGlobal = try readVarDCTDCGlobalInfo(decoder.sectionReader(0))
+        let r0 = decoder.sectionReader(0)
+        if frame.flags & 2 != 0 {
+            // The patch dictionary precedes the DC-global payload.
+            _ = try decoder.parsePatchDictionary(r0)
+        }
+        let dcGlobal = try readVarDCTDCGlobalInfo(r0)
         let acGlobalIndex =
             frame.numGroups == 1 && frame.numPasses == 1 ? nil : frame.numDCGroups + 1
         let acGlobal: VarDCTACGlobalInfo?

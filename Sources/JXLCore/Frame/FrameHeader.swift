@@ -50,6 +50,12 @@ public struct FrameHeader: Sendable {
     public var frameX0: Int32 = 0
     public var frameY0: Int32 = 0
     public var isLast = true
+    /// Slot 0-3 this frame is stored into for later reference (patches,
+    /// blending); meaningful when the frame can be referenced (`!isLast`).
+    public var saveAsReference: UInt32 = 0
+    /// When true the frame is stored in its pre-color-transform space (XYB for
+    /// xyb-encoded files) — required of patch reference frames.
+    public var saveBeforeColorTransform = false
     public var name = ""
     public var chromaChannelMode: [UInt32] = [0, 0, 0]
 
@@ -192,7 +198,7 @@ public struct FrameHeader: Sendable {
         }
 
         if frameType != .dc && !isLast {
-            _ = r.readU32(.value(0), .value(1), .value(2), .value(3))  // save_as_reference
+            saveAsReference = r.readU32(.value(0), .value(1), .value(2), .value(3))
         }
 
         // save_before_color_transform (only in cases not reached by is_last frames).
@@ -200,9 +206,9 @@ public struct FrameHeader: Sendable {
             let canBeReferenced = !isLast
             if canBeReferenced && lastBlendModeWasReplace && !isPartialFrame
                 && (frameType == .regular || frameType == .skipProgressive) {
-                _ = r.readBool()
+                saveBeforeColorTransform = r.readBool()
             } else if frameType == .referenceOnly {
-                _ = r.readBool()
+                saveBeforeColorTransform = r.readBool()
             }
         }
 

@@ -69,6 +69,7 @@ struct TestRunner {
         iccProfile()
         jpegTranscode()
         dct64()
+        patches()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -164,6 +165,43 @@ struct TestRunner {
         }
         let psnr = ppmPSNR(refPPM, rgb, w, h)
         check(psnr > 50, "DCT64 reconstruction matches djxl (PSNR \(Int(psnr)) dB)")
+    }
+
+    // MARK: - Patches (reference frames + patch dictionary)
+
+    /// `256x192_patches.jxl` (cjxl -d 1.0 -e 7, repeated glyph stamps) encodes
+    /// a Modular-XYB referenceOnly frame followed by a VarDCT main frame with
+    /// kPatches: the dictionary places crops of the reference frame back onto
+    /// the image before the color transform. Reconstruction must match djxl.
+    static func patches() {
+        let dir = fixturesDir()
+        guard let jxl = try? Data(contentsOf: dir.appendingPathComponent("256x192_patches.jxl")),
+            let refPPM = try? Data(contentsOf: dir.appendingPathComponent("256x192_patches.ppm"))
+        else {
+            check(false, "patches fixture present")
+            return
+        }
+        // readFrameInfo skips the reference frame and reports the presented
+        // VarDCT frame, whose header sets kPatches (flags bit 2).
+        if let info = try? JXL.readFrameInfo(from: jxl) {
+            check(!info.isModular, "patches presented frame is VarDCT")
+            check(info.frameType == .regular, "patches presented frame is regular")
+            check(info.flags & 2 != 0, "patches presented frame sets kPatches")
+        } else {
+            check(false, "patches readFrameInfo")
+        }
+        guard let img = try? JXL.decodeImage(from: jxl), img.planes.count == 3 else {
+            check(false, "patches fixture decodes")
+            return
+        }
+        var rgb = [UInt8](repeating: 0, count: img.width * img.height * 3)
+        for c in 0..<3 {
+            for i in 0..<(img.width * img.height) {
+                rgb[i * 3 + c] = UInt8(clamping: img.planes[c][i])
+            }
+        }
+        let psnr = ppmPSNR(refPPM, rgb, img.width, img.height)
+        check(psnr > 50, "patches reconstruction matches djxl (PSNR \(Int(psnr)) dB)")
     }
 
     /// PSNR of `rgb` against a P6 PPM's pixel bytes.
