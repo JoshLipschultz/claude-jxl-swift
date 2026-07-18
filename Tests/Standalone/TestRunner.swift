@@ -72,6 +72,7 @@ struct TestRunner {
         patches()
         vardctAlpha()
         epfIters()
+        upsampling()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -220,6 +221,33 @@ struct TestRunner {
                 check(false, "\(name) fixture decodes")
                 continue
             }
+            var rgb = [UInt8](repeating: 0, count: img.width * img.height * 3)
+            for c in 0..<3 {
+                for i in 0..<(img.width * img.height) {
+                    rgb[i * 3 + c] = UInt8(clamping: img.planes[c][i])
+                }
+            }
+            let psnr = ppmPSNR(refPPM, rgb, img.width, img.height)
+            check(psnr > 50, "\(name) matches djxl (PSNR \(Int(psnr)) dB)")
+        }
+    }
+
+    // MARK: - Upsampling (2x/4x/8x)
+
+    /// `256x192_ups{2,4,8}.jxl` (cjxl --resampling=N) encode at reduced size;
+    /// the decoder applies the non-separable 5x5-kernel upsampler after the
+    /// filters. Output dimensions must match the image header and djxl.
+    static func upsampling() {
+        let dir = fixturesDir()
+        for name in ["256x192_ups2", "256x192_ups4", "256x192_ups8"] {
+            guard let jxl = try? Data(contentsOf: dir.appendingPathComponent("\(name).jxl")),
+                let refPPM = try? Data(contentsOf: dir.appendingPathComponent("\(name).ppm")),
+                let img = try? JXL.decodeImage(from: jxl)
+            else {
+                check(false, "\(name) fixture decodes")
+                continue
+            }
+            check(img.width == 256 && img.height == 192, "\(name) upsampled dimensions")
             var rgb = [UInt8](repeating: 0, count: img.width * img.height * 3)
             for c in 0..<3 {
                 for i in 0..<(img.width * img.height) {

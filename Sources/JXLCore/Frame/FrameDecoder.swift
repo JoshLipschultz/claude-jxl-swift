@@ -81,6 +81,8 @@ final class FrameDecoder {
     let limits: JXLDecodeLimits
     /// Decoded embedded ICC profile bytes (present when `want_icc` is set).
     let iccProfile: [UInt8]?
+    /// Custom upsampling kernels from CustomTransformData (defaults otherwise).
+    let upsamplingWeights: UpsamplingCustomWeights
 
     var frameHeader: FrameHeader { slot.header }
     var dim: FrameDimensions { slot.dim }
@@ -116,7 +118,7 @@ final class FrameDecoder {
         reader.skip(16)
         size = SizeHeader(reader)
         metadata = JXLImageMetadata(reader)
-        CustomTransformData.skip(reader, xybEncoded: metadata.xybEncoded)
+        upsamplingWeights = CustomTransformData.parse(reader, xybEncoded: metadata.xybEncoded)
         if metadata.colorEncoding.wantICC {
             // A compressed ICC profile follows the transform data.
             iccProfile = try readICCProfile(reader)
@@ -255,6 +257,11 @@ final class FrameDecoder {
         if let patches = patchDictionary, !patches.isEmpty {
             try renderPatches(patches, into: &xyb) { try self.referenceXYBFrame($0) }
         }
+        // Upsampling (2x/4x/8x) follows patches and precedes the color
+        // transform (libjxl render pipeline order).
+        if frameHeader.upsampling > 1 {
+            xyb = try upsampleXYB(xyb)
+        }
         // Extra channels ride the frame's modular sub-streams and come out as
         // native integer planes alongside the 8-bit color.
         let ecPlanes = try finalizeExtraChannels()
@@ -328,6 +335,31 @@ final class FrameDecoder {
 
     private var channelShifts: (h: [Int], v: [Int]) { frameHeader.channelShifts }
 
+    /// Upsamples the reconstructed planes by the frame's upsampling factor and
+    /// crops to the image dimensions.
+    private func upsampleXYB(_ xyb: XYBImage) throws -> XYBImage {
+        let shift = Int(frameHeader.upsampling).trailingZeroBitCount  // 2→1, 4→2, 8→3
+        let weights: [Float]
+        switch shift {
+        case 1: weights = upsamplingWeights.up2 ?? kUpsampling2Weights
+        case 2: weights = upsamplingWeights.up4 ?? kUpsampling4Weights
+        default: weights = upsamplingWeights.up8 ?? kUpsampling8Weights
+        }
+        let n = 1 << shift
+        let w = dim.xsize
+        let h = dim.ysize
+        let samples = UInt64(w * n) * UInt64(h * n) * 3
+        if samples > UInt64(limits.maxTotalSamples) {
+            throw JXLError.limitExceeded("upsampled \(w * n)x\(h * n)")
+        }
+        let ux = upsamplePlane(xyb.x, w: w, h: h, stride: xyb.stride, shift: shift, weights: weights)
+        let uy = upsamplePlane(xyb.y, w: w, h: h, stride: xyb.stride, shift: shift, weights: weights)
+        let ub = upsamplePlane(xyb.b, w: w, h: h, stride: xyb.stride, shift: shift, weights: weights)
+        return XYBImage(
+            width: min(w * n, Int(size.width)), height: min(h * n, Int(size.height)),
+            stride: w * n, paddedHeight: h * n, x: ux, y: uy, b: ub)
+    }
+
     // MARK: Modular pixels
 
     /// Decodes a Modular (lossless) frame. Supports a single regular frame with
@@ -343,6 +375,9 @@ final class FrameDecoder {
         }
         guard frameHeader.numPasses == 1 else {
             throw JXLError.unsupported("progressive (multi-pass) frames")
+        }
+        guard frameHeader.upsampling == 1 else {
+            throw JXLError.unsupported("upsampled Modular frames")
         }
 
         let isGray = metadata.colorSpace == .grayscale && frameHeader.colorTransform == .none
