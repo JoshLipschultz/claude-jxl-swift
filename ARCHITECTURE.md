@@ -191,6 +191,23 @@ math (lossless is now WP + entropy bound); flat per-group coefficient pooling
 the LF pass; interior/border splits for Gaborish/EPF mirror handling; a
 buffered refill in the ANS symbol reader.
 
+**Metal (GPU) — assessed 2026-07, deferred.** Measured stage split (release,
+6 MP / 26 MP): headers+DC/LF 24.6/97 ms, AC entropy +18.8/+82 ms,
+reconstruct+filters+color +22.6/+63 ms. Decode is ~⅔ serial/branchy entropy
+work that cannot leave the CPU, so Amdahl caps a *free* GPU tail at ~1.5×;
+the GPU-shaped part (Gaborish/EPF/XYB→sRGB — streaming, bandwidth-bound) is
+~15% of decode and already saturates cores via `concurrentPerform`. GPU float
+rounding (FMA contraction) also breaks CPU/oracle bit-parity — fine for the
+>50 dB gates, a new flakiness class otherwise. JXLCore stays pure CPU Swift.
+**Future TODO — revisit Metal at three triggers:** (1) the HDR/display work
+in M8: hand float XYB planes to JXLKit as an `MTLTexture`/IOSurface and do
+XYB→display-space in a shader at draw time (deletes a full-image CPU pass +
+a copy from time-to-pixels; PQ/HLG + EDR want this anyway — the conversion
+belongs to the display, not the decoder); (2) EPF iters ≠ 1 lands and a
+profile shows the ~3× filter tail dominant → fused Gaborish+EPF compute
+kernel; (3) animation playback, where the GPU tail of frame N overlaps CPU
+entropy of frame N+1 and adds real capacity instead of stealing idle cores.
+
 **M3 status (implemented).** The full entropy substrate is ported from libjxl
 v0.11.2: the hybrid-uint integer coder, canonical prefix codes, the rANS
 alias-method decoder (histogram reading, alias-table construction, 32-bit state
