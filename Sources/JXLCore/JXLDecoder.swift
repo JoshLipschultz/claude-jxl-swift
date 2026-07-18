@@ -20,6 +20,8 @@ public struct JXLImageInfo: Equatable, Sendable {
     public let hasAlpha: Bool
     public let orientation: UInt32
     public let hasAnimation: Bool
+    /// Tick rate and loop count when `hasAnimation`.
+    public let animation: JXLAnimationInfo?
     /// `true` if delivered inside an ISOBMFF container, `false` for a bare codestream.
     public let isContainer: Bool
     /// The container's box types in order (empty for a bare codestream).
@@ -115,6 +117,7 @@ public enum JXL {
             hasAlpha: metadata.hasAlpha,
             orientation: metadata.orientation,
             hasAnimation: metadata.hasAnimation,
+            animation: metadata.animation,
             isContainer: parsed.isContainer,
             boxTypes: parsed.boxes.map(\.type)
         )
@@ -207,6 +210,40 @@ public enum JXL {
         -> BitReader
     {
         try readFrameSectionReader(from: try Data(contentsOf: url), sectionIndex: sectionIndex)
+    }
+
+    /// One decoded animation frame.
+    public struct Frame: Sendable {
+        public let image: JXLDecodedImage
+        /// Duration in animation ticks (seconds = ticks × tpsDenominator /
+        /// tpsNumerator); 0 for stills.
+        public let durationTicks: UInt32
+        public let isLast: Bool
+    }
+
+    /// Decodes every presented frame of an animated file (a still yields one
+    /// frame). Frames whose composition is anything other than a full-frame
+    /// replace are not yet supported.
+    public static func decodeFrames(
+        from data: [UInt8], limits: JXLDecodeLimits = .default, maxFrames: Int = 4096
+    ) throws -> [Frame] {
+        var frames: [Frame] = []
+        for index in 0..<maxFrames {
+            let decoder = try FrameDecoder(data: data, limits: limits, skipPresentedFrames: index)
+            let header = decoder.frameHeader
+            frames.append(
+                Frame(
+                    image: try decoder.decodeImage(),
+                    durationTicks: header.duration, isLast: header.isLast))
+            if header.isLast { break }
+        }
+        return frames
+    }
+
+    public static func decodeFrames(
+        from data: Data, limits: JXLDecodeLimits = .default, maxFrames: Int = 4096
+    ) throws -> [Frame] {
+        try decodeFrames(from: [UInt8](data), limits: limits, maxFrames: maxFrames)
     }
 
     /// Decodes a fast 1/8-scale preview of a VarDCT (lossy) frame — the

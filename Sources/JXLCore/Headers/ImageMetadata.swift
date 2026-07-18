@@ -63,11 +63,23 @@ public struct JXLExtraChannelInfo: Equatable, Sendable {
     public let alphaAssociated: Bool
 }
 
+/// AnimationHeader (libjxl headers): tick rate and loop count for animated
+/// files. A frame's duration is in ticks; seconds = ticks × den / num.
+public struct JXLAnimationInfo: Equatable, Sendable {
+    public let tpsNumerator: UInt32
+    public let tpsDenominator: UInt32
+    /// 0 = loop forever.
+    public let numLoops: UInt32
+    public let haveTimecodes: Bool
+}
+
 public struct JXLImageMetadata: Equatable, Sendable {
     public let bitDepth: JXLBitDepth
     public let colorEncoding: JXLColorEncoding
     public let extraChannels: [JXLExtraChannelInfo]
     public let hasAlpha: Bool
+    /// Present when the file is animated.
+    public let animation: JXLAnimationInfo?
 
     public var extraChannelCount: Int { extraChannels.count }
     public let orientation: UInt32
@@ -85,6 +97,7 @@ public struct JXLImageMetadata: Equatable, Sendable {
             self.colorEncoding = ImageMetadataFields.defaultSRGB
             self.extraChannels = []
             self.hasAlpha = false
+            self.animation = nil
             self.orientation = 1
             self.hasAnimation = false
             self.xybEncoded = true
@@ -95,6 +108,7 @@ public struct JXLImageMetadata: Equatable, Sendable {
 
         var parsedOrientation: UInt32 = 1
         var parsedHasAnimation = false
+        var parsedAnimation: JXLAnimationInfo? = nil
         if extraFields {
             parsedOrientation = UInt32(reader.read(3)) + 1
             if reader.readBool() {  // have_intrinsic_size
@@ -105,7 +119,7 @@ public struct JXLImageMetadata: Equatable, Sendable {
             }
             if reader.readBool() {  // have_animation
                 parsedHasAnimation = true
-                ImageMetadataFields.skipAnimationHeader(reader)
+                parsedAnimation = ImageMetadataFields.readAnimationHeader(reader)
             }
         }
 
@@ -135,6 +149,7 @@ public struct JXLImageMetadata: Equatable, Sendable {
         self.colorEncoding = parsedColor
         self.extraChannels = parsedExtra
         self.hasAlpha = alpha
+        self.animation = parsedAnimation
         self.orientation = parsedOrientation
         self.hasAnimation = parsedHasAnimation
         self.xybEncoded = parsedXybEncoded
@@ -284,11 +299,16 @@ private enum ImageMetadataFields {
         _ = reader.readF16()  // linear_below
     }
 
-    static func skipAnimationHeader(_ reader: BitReader) {
-        _ = reader.readU32(.value(100), .value(1000), .bits(10, offset: 1), .bits(30, offset: 1))  // tps_numerator
-        _ = reader.readU32(.value(1), .value(1001), .bits(8, offset: 1), .bits(10, offset: 1))  // tps_denominator
-        _ = reader.readU32(.value(0), .bits(3), .bits(16), .bits(32))  // num_loops
-        _ = reader.readBool()  // have_timecodes
+    static func readAnimationHeader(_ reader: BitReader) -> JXLAnimationInfo {
+        let tpsNumerator = reader.readU32(
+            .value(100), .value(1000), .bits(10, offset: 1), .bits(30, offset: 1))
+        let tpsDenominator = reader.readU32(
+            .value(1), .value(1001), .bits(8, offset: 1), .bits(10, offset: 1))
+        let numLoops = reader.readU32(.value(0), .bits(3), .bits(16), .bits(32))
+        let haveTimecodes = reader.readBool()
+        return JXLAnimationInfo(
+            tpsNumerator: tpsNumerator, tpsDenominator: tpsDenominator,
+            numLoops: numLoops, haveTimecodes: haveTimecodes)
     }
 
     /// PreviewHeader (headers.cc) — its own size encoding, not a SizeHeader.

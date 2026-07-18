@@ -74,6 +74,7 @@ struct TestRunner {
         epfIters()
         upsampling()
         squeeze()
+        animation()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -230,6 +231,51 @@ struct TestRunner {
             }
             let psnr = ppmPSNR(refPPM, rgb, img.width, img.height)
             check(psnr > 50, "\(name) matches djxl (PSNR \(Int(psnr)) dB)")
+        }
+    }
+
+    // MARK: - Animation (multi-frame)
+
+    /// `96x64_anim.jxl` (lossy) and `96x64_anim_lossless.jxl` are 4-frame
+    /// animations (APNG via cjxl, 100 ticks/frame at 1000 ticks/s, full-frame
+    /// replace). Every frame must match djxl's APNG output — bit-exact for the
+    /// lossless file — and durations/tick rate must come through.
+    static func animation() {
+        let dir = fixturesDir()
+        for (name, exact) in [("96x64_anim", false), ("96x64_animll", true)] {
+            guard let jxl = try? Data(contentsOf: dir.appendingPathComponent("\(name).jxl")),
+                let info = try? JXL.readInfo(from: jxl),
+                let frames = try? JXL.decodeFrames(from: jxl)
+            else {
+                check(false, "\(name) decodes")
+                continue
+            }
+            check(info.hasAnimation && info.animation?.tpsNumerator == 1000,
+                "\(name) animation header (1000 ticks/s)")
+            check(frames.count == 4, "\(name) has 4 frames")
+            check(frames.allSatisfy { $0.durationTicks == 100 }, "\(name) frame durations")
+            check(frames.last?.isLast == true, "\(name) last frame flagged")
+            for (i, frame) in frames.enumerated() {
+                guard let refPPM = try? Data(
+                    contentsOf: dir.appendingPathComponent("\(name)_\(i).ppm"))
+                else {
+                    check(false, "\(name) frame \(i) oracle present")
+                    continue
+                }
+                let img = frame.image
+                var rgb = [UInt8](repeating: 0, count: img.width * img.height * 3)
+                for c in 0..<3 {
+                    for j in 0..<(img.width * img.height) {
+                        rgb[j * 3 + c] = UInt8(clamping: img.planes[c][j])
+                    }
+                }
+                let psnr = ppmPSNR(refPPM, rgb, img.width, img.height)
+                if exact {
+                    check(psnr == 999, "\(name) frame \(i) byte-exact vs djxl")
+                } else {
+                    check(psnr > 50, "\(name) frame \(i) matches djxl (PSNR \(Int(psnr)) dB)")
+                }
+            }
         }
     }
 
@@ -1066,10 +1112,14 @@ struct TestRunner {
             guard let data = try? Data(contentsOf: dir.appendingPathComponent(f)) else { continue }
             do {
                 let info = try JXL.readFrameInfo(from: [UInt8](data))
-                // The header + TOC + all section bytes must exactly fill the codestream.
-                eq(
-                    info.dataStartByte + info.totalSectionBytes, info.codestreamLength,
-                    "\(f) TOC sum invariant")
+                // The header + TOC + all section bytes must exactly fill the
+                // codestream — for the last frame only (animations have more
+                // frames after the presented one).
+                if info.isLast {
+                    eq(
+                        info.dataStartByte + info.totalSectionBytes, info.codestreamLength,
+                        "\(f) TOC sum invariant")
+                }
                 check(info.frameType == .regular, "\(f) is a regular frame")
                 eq(info.sectionSizes.count, info.tocEntryCount, "\(f) section count")
                 eq(info.sections.count, info.tocEntryCount, "\(f) section range count")
@@ -1126,7 +1176,7 @@ struct TestRunner {
                     nextByte = range.upperBound
                 }
                 check(
-                    coversPayload && nextByte == info.codestreamLength,
+                    coversPayload && (!info.isLast || nextByte == info.codestreamLength),
                     "\(f) section ranges cover payload")
             } catch {
                 check(false, "\(f) frame parse threw \(error)")

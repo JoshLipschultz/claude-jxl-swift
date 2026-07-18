@@ -113,6 +113,15 @@ do {
             fail("error: cannot write \(args[3]): \(error)")
         }
 
+    case "frames":
+        guard args.count >= 4 else { usage() }
+        let frames = try JXL.decodeFrames(from: bytes)
+        for (i, frame) in frames.enumerated() {
+            let path = "\(args[3])_\(i).ppm"
+            try Data(encodePNM(frame.image)).write(to: URL(fileURLWithPath: path))
+            print("frame \(i): \(frame.image.width) x \(frame.image.height)  duration \(frame.durationTicks) ticks -> \(path)")
+        }
+
     case "vardct":
         let info = try JXL.readVarDCTInfo(from: bytes)
         print(

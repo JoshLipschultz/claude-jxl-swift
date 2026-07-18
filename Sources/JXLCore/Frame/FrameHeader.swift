@@ -23,11 +23,11 @@ public struct FrameContext: Sendable {
     public let imageWidth: Int
     public let imageHeight: Int
 
-    public init(metadata: JXLImageMetadata, width: UInt32, height: UInt32, animationHaveTimecodes: Bool = false) {
+    public init(metadata: JXLImageMetadata, width: UInt32, height: UInt32) {
         self.xybEncoded = metadata.xybEncoded
         self.numExtraChannels = metadata.extraChannelCount
         self.haveAnimation = metadata.hasAnimation
-        self.animationHaveTimecodes = animationHaveTimecodes
+        self.animationHaveTimecodes = metadata.animation?.haveTimecodes ?? false
         self.imageWidth = Int(width)
         self.imageHeight = Int(height)
     }
@@ -52,6 +52,14 @@ public struct FrameHeader: Sendable {
     public var frameX0: Int32 = 0
     public var frameY0: Int32 = 0
     public var isLast = true
+    /// Animation frame duration in ticks (0 for stills).
+    public var duration: UInt32 = 0
+    /// Color-channel blend mode (0=Replace, 1=Add, 2=Blend, 3=AlphaWeightedAdd,
+    /// 4=Mul); the presented frame composites onto the canvas with this.
+    public var blendMode: UInt32 = 0
+    /// True when the color or any extra-channel blending departs from
+    /// full-frame Replace (the only composition currently implemented).
+    public var needsBlending = false
     /// Slot 0-3 this frame is stored into for later reference (patches,
     /// blending); meaningful when the frame can be referenced (`!isLast`).
     public var saveAsReference: UInt32 = 0
@@ -187,12 +195,16 @@ public struct FrameHeader: Sendable {
 
         // Blending / animation / is_last.
         if frameType == .regular || frameType == .skipProgressive {
-            parseBlendingInfo(r, numExtraChannels: ctx.numExtraChannels, isPartial: isPartialFrame)
+            blendMode = parseBlendingInfo(
+                r, numExtraChannels: ctx.numExtraChannels, isPartial: isPartialFrame)
+            if blendMode != 0 || isPartialFrame { needsBlending = true }
             for _ in 0..<ctx.numExtraChannels {
-                parseBlendingInfo(r, numExtraChannels: ctx.numExtraChannels, isPartial: isPartialFrame)
+                let ecMode = parseBlendingInfo(
+                    r, numExtraChannels: ctx.numExtraChannels, isPartial: isPartialFrame)
+                if ecMode != 0 { needsBlending = true }
             }
             if ctx.haveAnimation {
-                _ = r.readU32(.value(0), .value(1), .bits(8), .bits(32))  // duration
+                duration = r.readU32(.value(0), .value(1), .bits(8), .bits(32))
                 if ctx.animationHaveTimecodes { _ = r.read(32) }  // timecode
             }
             isLast = r.readBool()
@@ -236,7 +248,10 @@ public struct FrameHeader: Sendable {
         }
     }
 
-    private mutating func parseBlendingInfo(_ r: BitReader, numExtraChannels: Int, isPartial: Bool) {
+    @discardableResult
+    private mutating func parseBlendingInfo(
+        _ r: BitReader, numExtraChannels: Int, isPartial: Bool
+    ) -> UInt32 {
         let mode = r.readU32(.value(0), .value(1), .value(2), .bits(2, offset: 3))  // BlendMode
         lastBlendModeWasReplace = lastBlendModeWasReplace && (mode == 0)
         let involvesAlpha = mode == 2 || mode == 3  // kBlend / kAlphaWeightedAdd
@@ -249,6 +264,7 @@ public struct FrameHeader: Sendable {
         if mode != 0 || isPartial {
             _ = r.readU32(.value(0), .value(1), .value(2), .value(3))  // source
         }
+        return mode
     }
 
     private mutating func parseLoopFilter(_ r: BitReader, isModular: Bool) {

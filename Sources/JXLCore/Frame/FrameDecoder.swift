@@ -107,7 +107,10 @@ final class FrameDecoder {
     private var cachedACGlobal: VarDCTACGlobal?
     private var cachedCoefficients: VarDCTCoefficients?
 
-    init(data: [UInt8], limits: JXLDecodeLimits = .default) throws {
+    /// `skipPresentedFrames` selects a later animation frame: that many
+    /// presentable frames are skipped (reference-only frames are recorded as
+    /// usual along the way) and the next one becomes this decoder's frame.
+    init(data: [UInt8], limits: JXLDecodeLimits = .default, skipPresentedFrames: Int = 0) throws {
         self.limits = limits
         parsed = try JXLContainer.parse(data)
         guard parsed.codestream.count >= 2,
@@ -135,12 +138,22 @@ final class FrameDecoder {
         // draw from them) are recorded and skipped; the first frame of any
         // other type is the presented one.
         var preceding: [FrameSlot] = []
+        var toSkip = skipPresentedFrames
         var current = try FrameDecoder.parseFrameSlot(
             reader, context: ctx, codestreamCount: parsed.codestream.count)
-        while current.header.frameType == .referenceOnly {
-            preceding.append(current)
-            guard preceding.count <= 8 else {
-                throw JXLError.malformed("too many reference frames")
+        while true {
+            if current.header.frameType == .referenceOnly {
+                preceding.append(current)
+                guard preceding.count <= 8 else {
+                    throw JXLError.malformed("too many reference frames")
+                }
+            } else if toSkip > 0 {
+                guard !current.header.isLast else {
+                    throw JXLError.malformed("frame index past the last frame")
+                }
+                toSkip -= 1
+            } else {
+                break
             }
             // The TOC leaves the reader at the frame's data start; the next
             // frame header begins right after its sections, byte-aligned.
@@ -379,6 +392,9 @@ final class FrameDecoder {
         guard frameHeader.upsampling == 1 else {
             throw JXLError.unsupported("upsampled Modular frames")
         }
+        guard !frameHeader.needsBlending else {
+            throw JXLError.unsupported("frame blending other than full-frame replace")
+        }
 
         let isGray = metadata.colorSpace == .grayscale && frameHeader.colorTransform == .none
         let colorChannels = isGray ? 1 : 3
@@ -604,6 +620,9 @@ final class FrameDecoder {
         }
         guard frameHeader.numPasses == 1 else {
             throw JXLError.unsupported("progressive (multi-pass) VarDCT frames")
+        }
+        guard !frameHeader.needsBlending else {
+            throw JXLError.unsupported("frame blending other than full-frame replace")
         }
         if !frameHeader.chromaIs444 {
             // Subsampled reconstruction is implemented for the JPEG-transcode
