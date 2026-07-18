@@ -75,6 +75,7 @@ struct TestRunner {
         upsampling()
         squeeze()
         animation()
+        brotli()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -231,6 +232,38 @@ struct TestRunner {
             }
             let psnr = ppmPSNR(refPPM, rgb, img.width, img.height)
             check(psnr > 50, "\(name) matches djxl (PSNR \(Int(psnr)) dB)")
+        }
+    }
+
+    // MARK: - Brotli (RFC 7932 decoder, for jbrd JPEG reconstruction)
+
+    /// `brotli_{text,rand,rep}.br` were produced by the reference `brotli` CLI
+    /// (q11 English text — static dictionary + transforms + context modeling;
+    /// q5 random bytes — uncompressed metablocks; q9 repeats — backward
+    /// references). Decompression must be byte-exact.
+    static func brotli() {
+        let dir = fixturesDir()
+        for name in ["brotli_text", "brotli_rand", "brotli_rep"] {
+            guard
+                let compressed = try? Data(contentsOf: dir.appendingPathComponent("\(name).br")),
+                let expected = try? Data(contentsOf: dir.appendingPathComponent("\(name).raw"))
+            else {
+                check(false, "\(name) vectors present")
+                continue
+            }
+            do {
+                let got = try Brotli.decompress([UInt8](compressed), maxOutputSize: 16 << 20)
+                check(got == [UInt8](expected), "\(name) decompresses byte-exact")
+            } catch {
+                check(false, "\(name) decompresses (\(error))")
+            }
+        }
+        // A truncated stream must fail cleanly (throw or finish), never crash;
+        // reaching the check at all is the assertion.
+        if let compressed = try? Data(contentsOf: dir.appendingPathComponent("brotli_text.br")) {
+            let truncated = [UInt8](compressed.prefix(compressed.count / 2))
+            _ = try? Brotli.decompress(truncated, maxOutputSize: 16 << 20)
+            check(true, "brotli truncated stream handled without crashing")
         }
     }
 
