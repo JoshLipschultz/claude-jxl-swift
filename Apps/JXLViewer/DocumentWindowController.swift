@@ -155,11 +155,15 @@ final class DocumentWindowController: NSWindowController, NSMenuItemValidation {
                 DecodePipeline.decodePreview(data)
             }.value
             guard let self, generation == self.decodeGeneration else { return }
-            guard let preview, !self.canvas.hasImage else { return }
+            guard let preview else { return }
             let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
-            self.canvas.setImage(
-                preview.image, sampler: nil, displaySize: preview.fullSize, isPreview: true)
-            self.statusLabel.stringValue = String(format: "%@ — preview %.0f ms…", name, ms)
+            // Stored even if the full decode won: the canvas keeps the preview
+            // around and substitutes it when zoomed out to ≤1/8 scale.
+            let fullAlreadyShown = self.canvas.hasFullImage
+            self.canvas.setPreviewImage(preview.image, fullSize: preview.fullSize)
+            if !fullAlreadyShown {
+                self.statusLabel.stringValue = String(format: "%@ — preview %.0f ms…", name, ms)
+            }
         }
 
         // Stage 2: full decode; swaps in over the preview with no layout jump.

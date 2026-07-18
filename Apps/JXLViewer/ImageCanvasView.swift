@@ -34,25 +34,55 @@ final class ImageCanvasView: NSView {
 
         documentImageView.onHover = { [weak self] in self?.onHover?($0) }
         registerForDraggedTypes([.fileURL])
+
+        // Magnification changes (including trackpad pinch) move the clip view's
+        // bounds; track them so the document view can switch between the full
+        // image and the DC preview as the effective scale crosses 1/8.
+        scrollView.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(clipBoundsChanged),
+            name: NSView.boundsDidChangeNotification, object: scrollView.contentView)
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    var hasImage: Bool { documentImageView.hasImage }
+    deinit { NotificationCenter.default.removeObserver(self) }
 
-    /// Shows `image` rendered at `displaySize` points (defaults to the image's
-    /// own pixel size). A low-res preview passes the full image's size so the
-    /// final image swaps in without any layout jump; `isPreview` selects smooth
-    /// upscaling instead of crisp nearest-neighbour. Zoom-to-fit happens only
-    /// on the first image, so the preview→full swap keeps the user's view.
-    func setImage(
-        _ image: CGImage?, sampler: PixelSampler?, displaySize: CGSize? = nil,
-        isPreview: Bool = false
-    ) {
+    var hasImage: Bool { documentImageView.hasImage }
+    var hasFullImage: Bool { documentImageView.hasFullImage }
+
+    /// Shows the 1/8-scale DC preview, rendered at the full image's size so the
+    /// final image can swap in without any layout jump. The preview is kept
+    /// after the full image arrives: it stands in whenever the view is zoomed
+    /// out far enough that downsampling makes the two indistinguishable.
+    func setPreviewImage(_ image: CGImage, fullSize: CGSize) {
         let hadImage = documentImageView.hasImage
-        documentImageView.configure(
-            image: image, sampler: sampler, displaySize: displaySize, isPreview: isPreview)
+        documentImageView.setPreview(image, displaySize: fullSize)
+        pushEffectiveScale()
         if !hadImage { zoomToFit() }
+    }
+
+    /// Shows the fully decoded image (replacing the preview on screen, though
+    /// the preview stays around for deep zoom-out). `nil` on decode failure
+    /// leaves any preview visible.
+    func setImage(_ image: CGImage?, sampler: PixelSampler?) {
+        let hadImage = documentImageView.hasImage
+        documentImageView.setFull(image, sampler: sampler)
+        pushEffectiveScale()
+        if !hadImage { zoomToFit() }
+    }
+
+    @objc private func clipBoundsChanged(_ note: Notification) { pushEffectiveScale() }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        pushEffectiveScale()
+    }
+
+    /// On-screen device pixels per image point: zoom × backing scale.
+    private func pushEffectiveScale() {
+        let backing = window?.backingScaleFactor ?? 2
+        documentImageView.updateEffectiveScale(scrollView.magnification * backing)
     }
 
     // MARK: - Zoom
@@ -117,42 +147,73 @@ private final class DocumentImageView: NSView {
 
     var onHover: ((String?) -> Void)?
 
-    private var image: CGImage?
+    private var previewImage: CGImage?
+    private var fullImage: CGImage?
+    private var displayed: CGImage?
     private var sampler: PixelSampler?
-    private var isPreview = false
+    private var effectiveScale: CGFloat = 1
 
     override var isFlipped: Bool { true }
-    var hasImage: Bool { image != nil }
+    var hasImage: Bool { fullImage != nil || previewImage != nil }
+    var hasFullImage: Bool { fullImage != nil }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        // Crisp, blocky pixels when magnified rather than a blurry interpolation.
-        layer?.magnificationFilter = .nearest
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    func configure(
-        image: CGImage?, sampler: PixelSampler?, displaySize: CGSize?, isPreview: Bool
-    ) {
-        self.image = image
+    func setPreview(_ image: CGImage, displaySize: CGSize) {
+        previewImage = image
+        if displaySize != frame.size { setFrameSize(displaySize) }
+        refreshDisplayedImage(force: true)
+    }
+
+    func setFull(_ image: CGImage?, sampler: PixelSampler?) {
+        fullImage = image
         self.sampler = sampler
-        self.isPreview = isPreview
-        // Crisp pixels for the real image, smooth scaling for previews.
-        layer?.magnificationFilter = isPreview ? .linear : .nearest
-        let size = displaySize
-            ?? image.map { CGSize(width: $0.width, height: $0.height) } ?? .zero
-        if size != frame.size { setFrameSize(size) }
+        if let image {
+            let size = CGSize(width: image.width, height: image.height)
+            if size != frame.size { setFrameSize(size) }
+        }
+        refreshDisplayedImage(force: true)
+    }
+
+    func updateEffectiveScale(_ scale: CGFloat) {
+        guard scale != effectiveScale else { return }
+        effectiveScale = scale
+        refreshDisplayedImage(force: false)
+    }
+
+    /// Which image draws: the full decode when present, except that the DC
+    /// preview substitutes whenever it still has at least one sample per
+    /// on-screen device pixel — at ≤1/8 effective scale downsampling makes the
+    /// two identical, and the preview is far cheaper to composite.
+    private func chooseImage() -> CGImage? {
+        guard let full = fullImage else { return previewImage }
+        guard let preview = previewImage, bounds.width > 0,
+            CGFloat(preview.width) >= bounds.width * effectiveScale
+        else { return full }
+        return preview
+    }
+
+    private func refreshDisplayedImage(force: Bool) {
+        let choice = chooseImage()
+        guard force || choice !== displayed else { return }
+        displayed = choice
+        // Crisp pixels for the real image, smooth scaling for the preview
+        // (which is only ever shown upscaled-while-waiting or far zoomed out).
+        layer?.magnificationFilter = choice === fullImage ? .nearest : .linear
         needsDisplay = true
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        guard let ctx = NSGraphicsContext.current?.cgContext, let image else { return }
+        guard let ctx = NSGraphicsContext.current?.cgContext, let image = displayed else { return }
         drawCheckerboard(in: ctx)
         // Draw the CGImage right-side-up inside this flipped view.
         ctx.saveGState()
-        ctx.interpolationQuality = isPreview ? .medium : .none
+        ctx.interpolationQuality = image === fullImage ? .none : .medium
         ctx.translateBy(x: 0, y: bounds.height)
         ctx.scaleBy(x: 1, y: -1)
         ctx.draw(image, in: CGRect(origin: .zero, size: bounds.size))
