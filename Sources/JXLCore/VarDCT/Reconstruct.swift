@@ -10,7 +10,7 @@
 // The output is an `XYBImage`; conversion to display pixels is the color
 // pipeline's job (Color/ColorManagement.swift).
 //
-// Restrictions: transforms up to 32x32 (no DCT64+), single pass, 4:4:4.
+// Restrictions: single pass; chroma subsampling for YCbCr frames only.
 
 import Foundation
 
@@ -234,9 +234,6 @@ extension FrameDecoder {
         let meta = lf.metadata
         let dc = lf.dc
 
-        for b in coeffs.blocks where b.strategy >= kStrategyQuantTable.count {
-            throw JXLError.unsupported("VarDCT transforms larger than 32x32")
-        }
 
         // Dequant tables per quant-table kind, computed once for the kinds in use.
         let acGlobal = try varDCTACGlobal()
@@ -314,11 +311,11 @@ extension FrameDecoder {
             DispatchQueue.concurrentPerform(iterations: workers) { worker in
                 let lo = blks.count * worker / workers
                 let hi = blks.count * (worker + 1) / workers
-                // Per-worker scratch (max transform is 32x32 = 1024 coefficients).
-                let bufX = UnsafeMutablePointer<Float>.allocate(capacity: 1024)
-                let bufY = UnsafeMutablePointer<Float>.allocate(capacity: 1024)
-                let bufB = UnsafeMutablePointer<Float>.allocate(capacity: 1024)
-                let tmp = UnsafeMutablePointer<Float>.allocate(capacity: 1024)
+                // Per-worker scratch (max transform is 256x256 = 65536 coefficients).
+                let bufX = UnsafeMutablePointer<Float>.allocate(capacity: 65536)
+                let bufY = UnsafeMutablePointer<Float>.allocate(capacity: 65536)
+                let bufB = UnsafeMutablePointer<Float>.allocate(capacity: 65536)
+                let tmp = UnsafeMutablePointer<Float>.allocate(capacity: 65536)
                 defer {
                     bufX.deallocate()
                     bufY.deallocate()

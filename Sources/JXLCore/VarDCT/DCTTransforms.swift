@@ -37,13 +37,19 @@ nonisolated(unsafe) private let idctBasis4 = makeIDCTBasis(4)
 nonisolated(unsafe) private let idctBasis8 = makeIDCTBasis(8)
 nonisolated(unsafe) private let idctBasis16 = makeIDCTBasis(16)
 nonisolated(unsafe) private let idctBasis32 = makeIDCTBasis(32)
+nonisolated(unsafe) private let idctBasis64 = makeIDCTBasis(64)
+nonisolated(unsafe) private let idctBasis128 = makeIDCTBasis(128)
+nonisolated(unsafe) private let idctBasis256 = makeIDCTBasis(256)
 
 private func idctBasis(_ n: Int) -> UnsafePointer<Float> {
     switch n {
     case 4: return idctBasis4
     case 8: return idctBasis8
     case 16: return idctBasis16
-    default: return idctBasis32
+    case 32: return idctBasis32
+    case 64: return idctBasis64
+    case 128: return idctBasis128
+    default: return idctBasis256
     }
 }
 
@@ -110,12 +116,35 @@ private let kResampleScale2: [Float] = [1.0, 1.108937353592731823]
 private let kResampleScale4: [Float] = [
     1.0, 1.025760096781116015, 1.108937353592731823, 1.270559368765487251,
 ]
+private let kResampleScale8: [Float] = [
+    1.0, 1.0063534990068217, 1.0257600967811158, 1.0593017296817173,
+    1.1089373535927318, 1.1777765381970435, 1.2705593687654873, 1.3944898413647777,
+]
+private let kResampleScale16: [Float] = [
+    1.0, 1.0015830492062623, 1.0063534990068217, 1.0143759095928793,
+    1.0257600967811158, 1.0406645869480142, 1.0593017296817173, 1.0819447744633812,
+    1.1089373535927318, 1.1407059950032632, 1.1777765381970435, 1.2207956782315876,
+    1.2705593687654873, 1.3280505578213306, 1.3944898413647777, 1.4714043176061107,
+]
+private let kResampleScale32: [Float] = [
+    1.0, 1.0003954307206069, 1.0015830492062623, 1.0035668445360069,
+    1.0063534990068217, 1.009952439375063, 1.0143759095928793, 1.0196390660647288,
+    1.0257600967811158, 1.0327603660498115, 1.0406645869480142, 1.049501024072585,
+    1.0593017296817173, 1.0701028169146336, 1.0819447744633812, 1.0948728278734026,
+    1.1089373535927318, 1.124194353004584, 1.1407059950032632, 1.158541237256391,
+    1.1777765381970435, 1.1984966740820495, 1.2207956782315876, 1.244777922949508,
+    1.2705593687654873, 1.2982690107339132, 1.3280505578213306, 1.3600643892400104,
+    1.3944898413647777, 1.4315278911623237, 1.4714043176061107, 1.5143734423314616,
+]
 
 private func resampleScales(_ n: Int) -> [Float] {
     switch n {
     case 1: return [1.0]
     case 2: return kResampleScale2
-    default: return kResampleScale4
+    case 4: return kResampleScale4
+    case 8: return kResampleScale8
+    case 16: return kResampleScale16
+    default: return kResampleScale32
     }
 }
 

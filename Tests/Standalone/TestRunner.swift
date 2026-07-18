@@ -68,6 +68,7 @@ struct TestRunner {
         colorQuantizer()
         iccProfile()
         jpegTranscode()
+        dct64()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -146,6 +147,45 @@ struct TestRunner {
         } else {
             check(false, "icc lossy PSNR oracle")
         }
+    }
+
+    // MARK: - DCT64+ transforms
+
+    /// `256x256_dct64_lossy.jxl` tiles entirely with DCT64 varblocks (smooth
+    /// content at low quality); reconstruction must match djxl's output.
+    static func dct64() {
+        let dir = fixturesDir()
+        guard let jxl = try? Data(contentsOf: dir.appendingPathComponent("256x256_dct64_lossy.jxl")),
+            let refPPM = try? Data(contentsOf: dir.appendingPathComponent("256x256_dct64_lossy.ppm")),
+            let (w, h, rgb) = try? reconstructVarDCTImage(from: [UInt8](jxl))
+        else {
+            check(false, "DCT64 fixture decodes")
+            return
+        }
+        let psnr = ppmPSNR(refPPM, rgb, w, h)
+        check(psnr > 50, "DCT64 reconstruction matches djxl (PSNR \(Int(psnr)) dB)")
+    }
+
+    /// PSNR of `rgb` against a P6 PPM's pixel bytes.
+    static func ppmPSNR(_ refPPM: Data, _ rgb: [UInt8], _ w: Int, _ h: Int) -> Double {
+        var newlines = 0
+        var offset = 0
+        for (i, byte) in refPPM.enumerated() where byte == 0x0A {
+            newlines += 1
+            if newlines == 3 {
+                offset = i + 1
+                break
+            }
+        }
+        let ref = [UInt8](refPPM[offset...])
+        guard ref.count == w * h * 3 && rgb.count == ref.count else { return 0 }
+        var se = 0.0
+        for i in 0..<ref.count {
+            let d = Double(Int(ref[i]) - Int(rgb[i]))
+            se += d * d
+        }
+        let mse = se / Double(ref.count)
+        return mse == 0 ? 999 : 10 * log10(255.0 * 255.0 / mse)
     }
 
     // MARK: - YCbCr / JPEG transcode (chroma subsampling, RAW quant tables)

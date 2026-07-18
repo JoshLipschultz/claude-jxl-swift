@@ -26,6 +26,12 @@ enum QuantTableKind: Int, CaseIterable {
     case dct16x32 = 8   // also DCT32X16
     case dct4x8 = 9     // also DCT8X4
     case afv = 10       // AFV0..3
+    case dct64 = 11
+    case dct32x64 = 12  // also DCT64X32
+    case dct128 = 13
+    case dct64x128 = 14 // also DCT128X64
+    case dct256 = 15
+    case dct128x256 = 16  // also DCT256X128
 }
 
 /// AC strategy (0...17) -> quant table kind (libjxl kAcStrategyToQuantTableMap).
@@ -33,12 +39,20 @@ let kStrategyQuantTable: [QuantTableKind] = [
     .dct, .identity, .dct2x2, .dct4x4, .dct16x16, .dct32x32,
     .dct8x16, .dct8x16, .dct8x32, .dct8x32, .dct16x32, .dct16x32,
     .dct4x8, .dct4x8, .afv, .afv, .afv, .afv,
+    .dct64, .dct32x64, .dct32x64, .dct128, .dct64x128, .dct64x128,
+    .dct256, .dct128x256, .dct128x256,
 ]
 
-/// Pixel rows (height) of each AC strategy's transform, 0...17.
-let kStrategyBlockH: [Int] = [8, 8, 8, 8, 16, 32, 16, 8, 32, 8, 32, 16, 8, 8, 8, 8, 8, 8]
-/// Pixel columns (width) of each AC strategy's transform, 0...17.
-let kStrategyBlockW: [Int] = [8, 8, 8, 8, 16, 32, 8, 16, 8, 32, 16, 32, 8, 8, 8, 8, 8, 8]
+/// Pixel rows (height) of each AC strategy's transform, 0...26.
+let kStrategyBlockH: [Int] = [
+    8, 8, 8, 8, 16, 32, 16, 8, 32, 8, 32, 16, 8, 8, 8, 8, 8, 8,
+    64, 64, 32, 128, 128, 64, 256, 256, 128,
+]
+/// Pixel columns (width) of each AC strategy's transform, 0...26.
+let kStrategyBlockW: [Int] = [
+    8, 8, 8, 8, 16, 32, 8, 16, 8, 32, 16, 32, 8, 8, 8, 8, 8, 8,
+    64, 32, 64, 128, 64, 128, 256, 128, 256,
+]
 
 private let kSqrt2: Float = 1.41421356237
 
@@ -188,6 +202,30 @@ private let kAFVFreqs: [Float] = [
     2.662932286148962, 7.630657783650829, 8.962388608184032, 12.97166202570235,
 ]
 
+// DCT64...DCT256 distance bands (DequantMatricesLibraryDef): identical band
+// tails with per-size scale factors on the seeds; square kinds use one seed
+// triple, rectangular kinds another.
+private func bigDCTDist(scale: Float, square: Bool) -> [[Float]] {
+    let seeds: (Float, Float, Float) = square
+        ? (26629.073922049845, 9311.3238710010046, 4992.2486445538634)
+        : (23629.073922049845, 8611.3238710010046, 4492.2486445538634)
+    let xTail: [Float] = [
+        -1.025, -0.78, -0.65012, -0.19041574084286472, -0.20819395464,
+        -0.421064, -0.32733845535848671,
+    ]
+    let yTail: [Float] = [
+        -0.3041958212306401, -0.3633036457487539, -0.35660379990111464,
+        -0.3443074455424403, -0.33699592683512467, -0.30180866526242109,
+        -0.27321683125358037,
+    ]
+    let bTail: [Float] = [-1.2, -1.2, -0.8, -0.7, -0.7, -0.4, -0.5]
+    return [
+        [scale * seeds.0] + xTail,
+        [scale * seeds.1] + yTail,
+        [scale * seeds.2] + bTail,
+    ]
+}
+
 // MARK: - Table construction (weights, natural quant-table layout)
 
 private func computeWeights(_ kind: QuantTableKind) -> [Float] {
@@ -262,6 +300,18 @@ private func computeWeights(_ kind: QuantTableKind) -> [Float] {
             // Default dct4x8multiplier is 1.0, so no adjustment of (0,1).
         }
         return w
+    case .dct64:
+        return dctQuantWeights(rows: 64, cols: 64, dist: bigDCTDist(scale: 0.9, square: true))
+    case .dct32x64:
+        return dctQuantWeights(rows: 32, cols: 64, dist: bigDCTDist(scale: 0.65, square: false))
+    case .dct128:
+        return dctQuantWeights(rows: 128, cols: 128, dist: bigDCTDist(scale: 1.8, square: true))
+    case .dct64x128:
+        return dctQuantWeights(rows: 64, cols: 128, dist: bigDCTDist(scale: 1.3, square: false))
+    case .dct256:
+        return dctQuantWeights(rows: 256, cols: 256, dist: bigDCTDist(scale: 3.6, square: true))
+    case .dct128x256:
+        return dctQuantWeights(rows: 128, cols: 256, dist: bigDCTDist(scale: 2.6, square: false))
     case .afv:
         let w48 = dctQuantWeights(rows: 4, cols: 8, dist: kDCT4X8Dist)
         let w44 = dctQuantWeights(rows: 4, cols: 4, dist: kDCT4Dist)
