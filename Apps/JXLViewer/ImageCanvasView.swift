@@ -40,9 +40,19 @@ final class ImageCanvasView: NSView {
 
     var hasImage: Bool { documentImageView.hasImage }
 
-    func setImage(_ image: CGImage?, sampler: PixelSampler?) {
-        documentImageView.configure(image: image, sampler: sampler)
-        zoomToFit()
+    /// Shows `image` rendered at `displaySize` points (defaults to the image's
+    /// own pixel size). A low-res preview passes the full image's size so the
+    /// final image swaps in without any layout jump; `isPreview` selects smooth
+    /// upscaling instead of crisp nearest-neighbour. Zoom-to-fit happens only
+    /// on the first image, so the preview→full swap keeps the user's view.
+    func setImage(
+        _ image: CGImage?, sampler: PixelSampler?, displaySize: CGSize? = nil,
+        isPreview: Bool = false
+    ) {
+        let hadImage = documentImageView.hasImage
+        documentImageView.configure(
+            image: image, sampler: sampler, displaySize: displaySize, isPreview: isPreview)
+        if !hadImage { zoomToFit() }
     }
 
     // MARK: - Zoom
@@ -109,6 +119,7 @@ private final class DocumentImageView: NSView {
 
     private var image: CGImage?
     private var sampler: PixelSampler?
+    private var isPreview = false
 
     override var isFlipped: Bool { true }
     var hasImage: Bool { image != nil }
@@ -122,11 +133,17 @@ private final class DocumentImageView: NSView {
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    func configure(image: CGImage?, sampler: PixelSampler?) {
+    func configure(
+        image: CGImage?, sampler: PixelSampler?, displaySize: CGSize?, isPreview: Bool
+    ) {
         self.image = image
         self.sampler = sampler
-        let size = image.map { CGSize(width: $0.width, height: $0.height) } ?? .zero
-        setFrameSize(size)
+        self.isPreview = isPreview
+        // Crisp pixels for the real image, smooth scaling for previews.
+        layer?.magnificationFilter = isPreview ? .linear : .nearest
+        let size = displaySize
+            ?? image.map { CGSize(width: $0.width, height: $0.height) } ?? .zero
+        if size != frame.size { setFrameSize(size) }
         needsDisplay = true
     }
 
@@ -135,7 +152,7 @@ private final class DocumentImageView: NSView {
         drawCheckerboard(in: ctx)
         // Draw the CGImage right-side-up inside this flipped view.
         ctx.saveGState()
-        ctx.interpolationQuality = .none
+        ctx.interpolationQuality = isPreview ? .medium : .none
         ctx.translateBy(x: 0, y: bounds.height)
         ctx.scaleBy(x: 1, y: -1)
         ctx.draw(image, in: CGRect(origin: .zero, size: bounds.size))

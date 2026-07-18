@@ -83,6 +83,22 @@ struct PixelSampler: Sendable {
 
 enum DecodePipeline {
 
+    /// A fast 1/8-scale preview (VarDCT DC image) for immediate display while
+    /// the full decode runs; `nil` when no cheap preview exists (Modular) or
+    /// anything fails — callers just wait for the full image then.
+    static func decodePreview(_ data: Data) -> (image: CGImage, fullSize: CGSize)? {
+        guard let info = try? JXL.readInfo(from: data),
+            let decoded = try? JXL.decodePreview(from: data),
+            let cg = try? JXLImageConverter.makeCGImage(from: decoded, orientation: info.orientation)
+        else { return nil }
+        // Displayed size is the full image's (orientation-swapped when needed).
+        let swapped = info.orientation >= 5
+        let fullSize = CGSize(
+            width: CGFloat(swapped ? info.height : info.width),
+            height: CGFloat(swapped ? info.width : info.height))
+        return (cg, fullSize)
+    }
+
     /// Decodes `data` for display. Never throws: metadata and pixels are each
     /// gathered best-effort so the window can still show a report (and a clear
     /// error) for files we can inspect but not yet fully decode.

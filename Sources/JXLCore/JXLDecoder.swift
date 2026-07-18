@@ -209,6 +209,21 @@ public enum JXL {
         try readFrameSectionReader(from: try Data(contentsOf: url), sectionIndex: sectionIndex)
     }
 
+    /// Decodes a fast 1/8-scale preview of a VarDCT (lossy) frame — the
+    /// dequantized DC image through the normal color path, available in a
+    /// small fraction of full decode time. Returns `nil` for Modular frames.
+    public static func decodePreview(
+        from data: [UInt8], limits: JXLDecodeLimits = .default
+    ) throws -> JXLDecodedImage? {
+        try FrameDecoder(data: data, limits: limits).decodePreviewImage()
+    }
+
+    public static func decodePreview(
+        from data: Data, limits: JXLDecodeLimits = .default
+    ) throws -> JXLDecodedImage? {
+        try decodePreview(from: [UInt8](data), limits: limits)
+    }
+
     /// Returns the embedded ICC profile, decoded from its compressed form, or
     /// `nil` when the file's color encoding does not carry one (`want_icc`
     /// unset). This is the profile as embedded — for XYB-encoded (lossy) files

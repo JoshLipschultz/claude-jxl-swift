@@ -96,7 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let item = NSMenuItem()
         let menu = NSMenu(title: "View")
         menu.addItem(
-            withTitle: "Show Metadata Inspector",
+            withTitle: "Show Info",
             action: #selector(DocumentWindowController.toggleInspector(_:)), keyEquivalent: "i")
         menu.addItem(.separator())
         menu.addItem(

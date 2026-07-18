@@ -218,6 +218,55 @@ final class FrameDecoder {
             planes: xybToRGB8Planes(xyb, spec: spec), iccProfile: nil)
     }
 
+    /// A fast 1/8-scale preview: for VarDCT frames, the dequantized DC image
+    /// converted through the same output path as the full decode. Available
+    /// after only the low-frequency pass — a small fraction of full decode
+    /// time — so callers can put pixels on screen immediately and swap in the
+    /// full image when it lands. Returns `nil` for Modular frames, which have
+    /// no cheap intermediate.
+    func decodePreviewImage() throws -> JXLDecodedImage? {
+        guard !frameHeader.isModular else { return nil }
+        let lf = try varDCTLowFrequency()
+        let dc = lf.dc
+        let bw = dc.widthBlocks
+        let bh = dc.heightBlocks
+        let pw = divCeil(dim.xsize, 8)
+        let ph = divCeil(dim.ysize, 8)
+
+        if frameHeader.colorTransform == .ycbcr {
+            // Chroma DC lives packed at subsampled resolution; expand nearest.
+            let shifts = channelShifts
+            func expand(_ p: [Float], _ h: Int, _ v: Int) -> [Float] {
+                if h == 0 && v == 0 { return p }
+                var out = [Float](repeating: 0, count: bw * bh)
+                for y in 0..<bh {
+                    let src = (y >> v) * bw
+                    let dst = y * bw
+                    for x in 0..<bw { out[dst + x] = p[src + (x >> h)] }
+                }
+                return out
+            }
+            let img = XYBImage(
+                width: pw, height: ph, stride: bw, paddedHeight: bh,
+                x: expand(dc.x, shifts.h[0], shifts.v[0]), y: dc.y,
+                b: expand(dc.b, shifts.h[2], shifts.v[2]))
+            return JXLDecodedImage(
+                width: pw, height: ph, colorChannels: 3, extraChannels: 0,
+                bitsPerSample: 8, isFloat: false, planes: ycbcrToRGB8Planes(img),
+                iccProfile: iccProfile.map { Data($0) })
+        }
+
+        let spec = try makeOutputColorSpec(metadata.colorEncoding)
+        let img = XYBImage(
+            width: pw, height: ph, stride: bw, paddedHeight: bh, x: dc.x, y: dc.y, b: dc.b)
+        return JXLDecodedImage(
+            width: pw, height: ph, colorChannels: 3, extraChannels: 0,
+            bitsPerSample: 8, isFloat: false, planes: xybToRGB8Planes(img, spec: spec),
+            iccProfile: nil)
+    }
+
+    private var channelShifts: (h: [Int], v: [Int]) { frameHeader.channelShifts }
+
     // MARK: Modular pixels
 
     /// Decodes a Modular (lossless) frame. Supports a single regular frame with

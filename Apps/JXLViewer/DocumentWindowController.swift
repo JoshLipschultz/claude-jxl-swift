@@ -1,9 +1,11 @@
 // DocumentWindowController.swift
 //
-// Owns one document window: an image canvas (zoom + pixel readout) beside a
-// toggleable metadata inspector, with a status bar underneath. Builds its window
-// programmatically (no nib) and implements the View/Go menu actions, which reach
-// it through the responder chain when its window is key.
+// Owns one document window, styled after Preview: the image canvas fills the
+// window above a thin status bar, and the metadata report lives in a floating
+// utility panel toggled with ⌘I. Decoding is two-stage for fast
+// time-to-pixels: a 1/8-scale DC preview (VarDCT) appears as soon as the
+// low-frequency pass lands, then the full image swaps in without any layout
+// jump. Menu actions reach this controller through the responder chain.
 
 import AppKit
 import Foundation
@@ -12,12 +14,9 @@ final class DocumentWindowController: NSWindowController, NSMenuItemValidation {
 
     private let canvas = ImageCanvasView()
     private let inspector = InspectorView()
-    private let splitView = NSSplitView()
     private let statusLabel = NSTextField(labelWithString: "")
     private let hoverLabel = NSTextField(labelWithString: "")
-
-    private var inspectorVisible = true
-    private var savedInspectorWidth: CGFloat = 300
+    private var inspectorPanel: NSPanel?
     private var decodeGeneration = 0
 
     // MARK: - Construction
@@ -27,10 +26,9 @@ final class DocumentWindowController: NSWindowController, NSMenuItemValidation {
             contentRect: NSRect(x: 0, y: 0, width: 980, height: 680),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false)
-        // Each document gets its own window (the default). Tabbing stays at the
-        // system default rather than being forced on.
         window.tabbingMode = .automatic
-        window.minSize = NSSize(width: 480, height: 320)
+        window.minSize = NSSize(width: 360, height: 240)
+        window.backgroundColor = .windowBackgroundColor
         super.init(window: window)
         shouldCascadeWindows = true
         buildContent()
@@ -40,14 +38,44 @@ final class DocumentWindowController: NSWindowController, NSMenuItemValidation {
 
     private func buildContent() {
         guard let window, let content = window.contentView else { return }
-        let statusHeight: CGFloat = 28
+        let statusHeight: CGFloat = 26
 
-        splitView.isVertical = true
-        splitView.dividerStyle = .thin
-        splitView.frame = NSRect(
-            x: 0, y: statusHeight,
-            width: content.bounds.width, height: content.bounds.height - statusHeight)
-        splitView.autoresizingMask = [.width, .height]
+        let bar = NSVisualEffectView()
+        bar.material = .titlebar
+        bar.blendingMode = .withinWindow
+
+        for view in [canvas, bar] as [NSView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(view)
+        }
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        hoverLabel.translatesAutoresizingMaskIntoConstraints = false
+        for label in [statusLabel, hoverLabel] {
+            label.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+            label.textColor = .secondaryLabelColor
+            bar.addSubview(label)
+        }
+        statusLabel.lineBreakMode = .byTruncatingMiddle
+        hoverLabel.alignment = .right
+        hoverLabel.lineBreakMode = .byTruncatingTail
+        hoverLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        NSLayoutConstraint.activate([
+            canvas.topAnchor.constraint(equalTo: content.topAnchor),
+            canvas.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            canvas.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            canvas.bottomAnchor.constraint(equalTo: bar.topAnchor),
+            bar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            bar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            bar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            bar.heightAnchor.constraint(equalToConstant: statusHeight),
+            statusLabel.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 10),
+            statusLabel.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            hoverLabel.leadingAnchor.constraint(
+                greaterThanOrEqualTo: statusLabel.trailingAnchor, constant: 12),
+            hoverLabel.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -10),
+            hoverLabel.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+        ])
 
         canvas.onDropFile = { url in
             NSDocumentController.shared.openDocument(
@@ -57,50 +85,60 @@ final class DocumentWindowController: NSWindowController, NSMenuItemValidation {
             self?.hoverLabel.stringValue = text ?? ""
         }
 
-        splitView.addArrangedSubview(canvas)
-        splitView.addArrangedSubview(inspector)
-        content.addSubview(splitView)
-
-        buildStatusBar(in: content, height: statusHeight)
-
-        // Give the inspector its initial width.
-        DispatchQueue.main.async { [weak self] in
-            guard let self, let window = self.window else { return }
-            self.splitView.setPosition(
-                window.contentView!.bounds.width - self.savedInspectorWidth, ofDividerAt: 0)
-        }
+        // Resolve layout before the window animates on screen so the first
+        // frame is drawn content, not an empty backing store.
+        content.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
     }
 
-    private func buildStatusBar(in content: NSView, height: CGFloat) {
-        let bar = NSVisualEffectView(
-            frame: NSRect(x: 0, y: 0, width: content.bounds.width, height: height))
-        bar.autoresizingMask = [.width]
-        bar.material = .titlebar
-        bar.blendingMode = .withinWindow
+    // MARK: - Inspector panel (⌘I)
 
-        statusLabel.frame = NSRect(x: 10, y: 5, width: content.bounds.width * 0.5 - 14, height: 18)
-        statusLabel.autoresizingMask = [.width]
-        statusLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        statusLabel.textColor = .secondaryLabelColor
-        statusLabel.lineBreakMode = .byTruncatingMiddle
-        bar.addSubview(statusLabel)
+    private func makeInspectorPanel() -> NSPanel {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 460),
+            styleMask: [.titled, .closable, .resizable, .utilityWindow],
+            backing: .buffered, defer: false)
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = true
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.title = inspectorTitle()
+        inspector.translatesAutoresizingMaskIntoConstraints = true
+        inspector.frame = panel.contentView!.bounds
+        inspector.autoresizingMask = [.width, .height]
+        panel.contentView!.addSubview(inspector)
+        return panel
+    }
 
-        hoverLabel.frame = NSRect(
-            x: content.bounds.width * 0.5, y: 5, width: content.bounds.width * 0.5 - 10, height: 18)
-        hoverLabel.autoresizingMask = [.width, .minXMargin]
-        hoverLabel.alignment = .right
-        hoverLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        hoverLabel.textColor = .secondaryLabelColor
-        hoverLabel.lineBreakMode = .byTruncatingTail
-        bar.addSubview(hoverLabel)
+    private func inspectorTitle() -> String {
+        let name = (document as? JXLDocument)?.fileURL?.lastPathComponent ?? "Metadata"
+        return "Info — \(name)"
+    }
 
-        content.addSubview(bar)
+    private var inspectorVisible: Bool { inspectorPanel?.isVisible ?? false }
+
+    @objc func toggleInspector(_ sender: Any?) {
+        if inspectorVisible {
+            inspectorPanel?.orderOut(nil)
+            return
+        }
+        let firstShow = inspectorPanel == nil
+        let panel = inspectorPanel ?? makeInspectorPanel()
+        inspectorPanel = panel
+        panel.title = inspectorTitle()
+        if firstShow, let windowFrame = window?.frame {
+            // First show: hug the document window's top-right corner.
+            panel.setFrameTopLeftPoint(
+                NSPoint(x: windowFrame.maxX + 8, y: windowFrame.maxY))
+        }
+        panel.orderFront(nil)
     }
 
     // MARK: - Decoding
 
-    /// Called by the document once this controller is attached. Decodes off the
-    /// main actor and updates the UI when done.
+    /// Called by the document once this controller is attached. Two stages,
+    /// both off the main actor: a DC-resolution preview for immediate pixels,
+    /// then the full decode. The status bar reports both times — the metric
+    /// being optimized is time-to-pixels-displayed.
     func startDecoding() {
         guard let doc = document as? JXLDocument, let data = doc.fileData else { return }
         let name = doc.fileURL?.lastPathComponent ?? "image"
@@ -109,13 +147,32 @@ final class DocumentWindowController: NSWindowController, NSMenuItemValidation {
 
         decodeGeneration += 1
         let generation = decodeGeneration
+        let start = DispatchTime.now().uptimeNanoseconds
+
+        // Stage 1: preview (VarDCT DC). Cheap; lands in tens of milliseconds.
+        Task { [weak self] in
+            let preview = await Task.detached(priority: .userInitiated) {
+                DecodePipeline.decodePreview(data)
+            }.value
+            guard let self, generation == self.decodeGeneration else { return }
+            guard let preview, !self.canvas.hasImage else { return }
+            let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+            self.canvas.setImage(
+                preview.image, sampler: nil, displaySize: preview.fullSize, isPreview: true)
+            self.statusLabel.stringValue = String(format: "%@ — preview %.0f ms…", name, ms)
+        }
+
+        // Stage 2: full decode; swaps in over the preview with no layout jump.
         Task { [weak self] in
             let result = await Task.detached(priority: .userInitiated) {
                 DecodePipeline.decode(data, name: name)
             }.value
             guard let self, generation == self.decodeGeneration else { return }
+            let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
             self.canvas.setImage(result.image, sampler: result.sampler)
-            self.statusLabel.stringValue = result.summary
+            self.statusLabel.stringValue = result.didDecode
+                ? String(format: "%@ — %.0f ms", result.summary, ms)
+                : result.summary
             self.inspector.setReport(result.report)
         }
     }
@@ -126,19 +183,6 @@ final class DocumentWindowController: NSWindowController, NSMenuItemValidation {
     @objc func zoomImageIn(_ sender: Any?) { canvas.zoomIn() }
     @objc func zoomImageOut(_ sender: Any?) { canvas.zoomOut() }
     @objc func zoomImageToFit(_ sender: Any?) { canvas.zoomToFit() }
-
-    @objc func toggleInspector(_ sender: Any?) {
-        guard let window, let content = window.contentView else { return }
-        inspectorVisible.toggle()
-        if inspectorVisible {
-            inspector.isHidden = false
-            splitView.setPosition(content.bounds.width - savedInspectorWidth, ofDividerAt: 0)
-        } else {
-            savedInspectorWidth = max(180, inspector.frame.width)
-            splitView.setPosition(content.bounds.width, ofDividerAt: 0)
-            inspector.isHidden = true
-        }
-    }
 
     @objc func nextImage(_ sender: Any?) { openSibling(offset: 1) }
     @objc func previousImage(_ sender: Any?) { openSibling(offset: -1) }
@@ -171,7 +215,7 @@ final class DocumentWindowController: NSWindowController, NSMenuItemValidation {
             #selector(zoomImageToFit):
             return canvas.hasImage
         case #selector(toggleInspector):
-            item.title = inspectorVisible ? "Hide Metadata Inspector" : "Show Metadata Inspector"
+            item.title = inspectorVisible ? "Hide Info" : "Show Info"
             return true
         case #selector(nextImage), #selector(previousImage):
             guard let url = (document as? JXLDocument)?.fileURL else { return false }
