@@ -70,6 +70,7 @@ struct TestRunner {
         jpegTranscode()
         dct64()
         patches()
+        vardctAlpha()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -202,6 +203,51 @@ struct TestRunner {
         }
         let psnr = ppmPSNR(refPPM, rgb, img.width, img.height)
         check(psnr > 50, "patches reconstruction matches djxl (PSNR \(Int(psnr)) dB)")
+    }
+
+    // MARK: - VarDCT extra channels (alpha)
+
+    /// `160x120_alpha_lossy.jxl` (cjxl -d 1.0 on an RGBA PNG) is a VarDCT
+    /// frame whose alpha rides the modular sub-streams (global + per-group).
+    /// Color must match djxl's PAM output at oracle precision and the alpha
+    /// plane byte-exactly.
+    static func vardctAlpha() {
+        let dir = fixturesDir()
+        guard
+            let jxl = try? Data(contentsOf: dir.appendingPathComponent("160x120_alpha_lossy.jxl")),
+            let pam = try? Data(contentsOf: dir.appendingPathComponent("160x120_alpha_lossy.pam"))
+        else {
+            check(false, "vardct alpha fixture present")
+            return
+        }
+        guard let img = try? JXL.decodeImage(from: jxl), img.extraChannels == 1,
+            img.planes.count == 4
+        else {
+            check(false, "vardct alpha decodes with an extra channel")
+            return
+        }
+        // Parse the PAM header (P7 ... ENDHDR\n, then RGBA interleaved).
+        guard let headerEnd = pam.range(of: Data("ENDHDR\n".utf8)) else {
+            check(false, "vardct alpha oracle header")
+            return
+        }
+        let pixels = [UInt8](pam[headerEnd.upperBound...])
+        let n = img.width * img.height
+        check(pixels.count == n * 4, "vardct alpha oracle size")
+        guard pixels.count == n * 4 else { return }
+        var se = 0.0
+        var alphaExact = true
+        for i in 0..<n {
+            for c in 0..<3 {
+                let d = Double(Int(pixels[i * 4 + c]) - Int(img.planes[c][i]))
+                se += d * d
+            }
+            if Int32(pixels[i * 4 + 3]) != img.planes[3][i] { alphaExact = false }
+        }
+        let mse = se / Double(n * 3)
+        let psnr = mse == 0 ? 999 : 10 * log10(255.0 * 255.0 / mse)
+        check(psnr > 50, "vardct alpha color matches djxl (PSNR \(Int(psnr)) dB)")
+        check(alphaExact, "vardct alpha plane byte-exact vs djxl")
     }
 
     /// PSNR of `rgb` against a P6 PPM's pixel bytes.

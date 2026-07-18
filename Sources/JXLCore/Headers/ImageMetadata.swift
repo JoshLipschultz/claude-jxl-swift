@@ -52,11 +52,24 @@ public struct JXLColorEncoding: Equatable, Sendable {
     public let renderingIntent: UInt32
 }
 
+/// One extra channel's metadata (libjxl `ExtraChannelInfo`).
+public struct JXLExtraChannelInfo: Equatable, Sendable {
+    /// 0=Alpha, 1=Depth, 2=SpotColor, 3=SelectionMask, 4=Black, 5=CFA,
+    /// 6=Thermal, 15=Unknown, 16=Optional.
+    public let type: UInt32
+    public let bitDepth: JXLBitDepth
+    public let dimShift: UInt32
+    /// Alpha only: samples are premultiplied.
+    public let alphaAssociated: Bool
+}
+
 public struct JXLImageMetadata: Equatable, Sendable {
     public let bitDepth: JXLBitDepth
     public let colorEncoding: JXLColorEncoding
-    public let extraChannelCount: Int
+    public let extraChannels: [JXLExtraChannelInfo]
     public let hasAlpha: Bool
+
+    public var extraChannelCount: Int { extraChannels.count }
     public let orientation: UInt32
     public let hasAnimation: Bool
     /// Whether color channels are XYB-encoded (true for lossy/VarDCT defaults).
@@ -70,7 +83,7 @@ public struct JXLImageMetadata: Equatable, Sendable {
         if allDefault {
             self.bitDepth = JXLBitDepth(bitsPerSample: 8, exponentBitsPerSample: 0)
             self.colorEncoding = ImageMetadataFields.defaultSRGB
-            self.extraChannelCount = 0
+            self.extraChannels = []
             self.hasAlpha = false
             self.orientation = 1
             self.hasAnimation = false
@@ -103,9 +116,11 @@ public struct JXLImageMetadata: Equatable, Sendable {
             reader.readU32(.value(0), .value(1), .bits(4, offset: 2), .bits(12, offset: 1)))
 
         var alpha = false
+        var parsedExtra: [JXLExtraChannelInfo] = []
         for _ in 0..<numExtraChannels {
-            let type = ImageMetadataFields.readExtraChannelInfo(reader)
-            if type == 0 { alpha = true }  // kAlpha
+            let info = ImageMetadataFields.readExtraChannelInfo(reader)
+            if info.type == 0 { alpha = true }  // kAlpha
+            parsedExtra.append(info)
         }
 
         let parsedXybEncoded = reader.readBool()  // xyb_encoded
@@ -118,7 +133,7 @@ public struct JXLImageMetadata: Equatable, Sendable {
 
         self.bitDepth = parsedBitDepth
         self.colorEncoding = parsedColor
-        self.extraChannelCount = numExtraChannels
+        self.extraChannels = parsedExtra
         self.hasAlpha = alpha
         self.orientation = parsedOrientation
         self.hasAnimation = parsedHasAnimation
@@ -149,17 +164,21 @@ private enum ImageMetadataFields {
 
     // MARK: ExtraChannelInfo (returns the channel type)
 
-    static func readExtraChannelInfo(_ reader: BitReader) -> UInt32 {
+    static func readExtraChannelInfo(_ reader: BitReader) -> JXLExtraChannelInfo {
         if reader.readBool() {  // all_default
-            return 0  // kAlpha
+            return JXLExtraChannelInfo(
+                type: 0,  // kAlpha
+                bitDepth: JXLBitDepth(bitsPerSample: 8, exponentBitsPerSample: 0),
+                dimShift: 0, alphaAssociated: false)
         }
         let type = reader.readEnum()
-        _ = readBitDepth(reader)
-        _ = reader.readU32(.value(0), .value(3), .value(4), .bits(3, offset: 1))  // dim_shift
+        let bitDepth = readBitDepth(reader)
+        let dimShift = reader.readU32(.value(0), .value(3), .value(4), .bits(3, offset: 1))
         skipNameString(reader)
 
+        var alphaAssociated = false
         if type == 0 {  // kAlpha
-            _ = reader.readBool()  // alpha_associated
+            alphaAssociated = reader.readBool()
         }
         if type == 2 {  // kSpotColor
             for _ in 0..<4 { _ = reader.readF16() }
@@ -167,7 +186,9 @@ private enum ImageMetadataFields {
         if type == 5 {  // kCFA
             _ = reader.readU32(.value(1), .bits(2), .bits(4, offset: 3), .bits(8, offset: 19))
         }
-        return type
+        return JXLExtraChannelInfo(
+            type: type, bitDepth: bitDepth, dimShift: dimShift,
+            alphaAssociated: alphaAssociated)
     }
 
     /// Per libjxl `VisitNameString`: length = U32(Val(0), Bits(4),

@@ -255,14 +255,18 @@ final class FrameDecoder {
         if let patches = patchDictionary, !patches.isEmpty {
             try renderPatches(patches, into: &xyb) { try self.referenceXYBFrame($0) }
         }
+        // Extra channels ride the frame's modular sub-streams and come out as
+        // native integer planes alongside the 8-bit color.
+        let ecPlanes = try finalizeExtraChannels()
         if frameHeader.colorTransform == .ycbcr {
             // JPEG transcode: the YCbCr planes convert to the file's *native*
             // encoded RGB (no color management applied), so the embedded
             // profile — when present — describes the returned samples.
             return JXLDecodedImage(
                 width: xyb.width, height: xyb.height, colorChannels: 3,
-                extraChannels: 0, bitsPerSample: 8, isFloat: false,
-                planes: ycbcrToRGB8Planes(xyb), iccProfile: iccProfile.map { Data($0) })
+                extraChannels: ecPlanes.count, bitsPerSample: 8, isFloat: false,
+                planes: ycbcrToRGB8Planes(xyb) + ecPlanes,
+                iccProfile: iccProfile.map { Data($0) })
         }
         // XYB: converted to the frame's declared numeric encoding (primaries/
         // white point/transfer); files whose encoding is an ICC profile fall
@@ -271,8 +275,8 @@ final class FrameDecoder {
         let spec = try makeOutputColorSpec(metadata.colorEncoding)
         return JXLDecodedImage(
             width: xyb.width, height: xyb.height, colorChannels: 3,
-            extraChannels: 0, bitsPerSample: 8, isFloat: false,
-            planes: xybToRGB8Planes(xyb, spec: spec), iccProfile: nil)
+            extraChannels: ecPlanes.count, bitsPerSample: 8, isFloat: false,
+            planes: xybToRGB8Planes(xyb, spec: spec) + ecPlanes, iccProfile: nil)
     }
 
     /// A fast 1/8-scale preview: for VarDCT frames, the dequantized DC image
@@ -560,9 +564,61 @@ final class FrameDecoder {
             patchDictionary = try parsePatchDictionary(r0)
         }
         let dcGlobal = try readVarDCTDCGlobal(r0)
+        // The DC-global section ends with the global modular stream. For a
+        // frame with extra channels it carries them (color is VarDCT-coded, so
+        // the modular image holds only the ECs); channels no larger than
+        // group_dim decode entirely here, bigger ones per AC group.
+        if metadata.extraChannelCount > 0 {
+            try decodeExtraChannelGlobal(dcGlobal)
+        }
         cachedDCGlobal = dcGlobal
         cachedDCDequant = computeDCDequant(dcGlobal.info)
         return dcGlobal
+    }
+
+    // MARK: VarDCT extra channels (modular sub-streams)
+
+    /// The frame's extra channels as a modular image (full frame resolution),
+    /// plus the global transforms to undo once every group has landed.
+    private(set) var ecImage: ModularImage?
+    private var ecTransforms: [ModularTransform] = []
+    private var ecFinalized = false
+
+    private func decodeExtraChannelGlobal(_ dcGlobal: VarDCTDCGlobalDecoded) throws {
+        // Mirrors ModularFrameDecoder::DecodeGlobalInfo channel geometry:
+        // DivCeil(xsize_upsampled, ecups) with shift log2(ecups)−log2(upsampling).
+        // Only the unshifted full-resolution shape is implemented.
+        guard frameHeader.upsampling == 1,
+            frameHeader.ecUpsampling.allSatisfy({ $0 == 1 }),
+            metadata.extraChannels.allSatisfy({ $0.dimShift == 0 })
+        else { throw JXLError.unsupported("upsampled/shifted extra channels in VarDCT") }
+        // Output planes advertise the color depth (8-bit), so only plain 8-bit
+        // integer extra channels are attached for now.
+        guard metadata.extraChannels.allSatisfy({
+            $0.bitDepth.bitsPerSample == 8 && !$0.bitDepth.isFloatingPoint
+        }) else { throw JXLError.unsupported("non-8-bit extra channels in VarDCT") }
+        try checkPixelLimits(channels: 3 + metadata.extraChannelCount)
+
+        let image = ModularImage(
+            w: dim.xsize, h: dim.ysize, bitdepth: Int(metadata.bitDepth.bitsPerSample),
+            channelCount: metadata.extraChannelCount)
+        let header = try modularDecode(
+            r0, image: image, groupID: 0, globalTree: dcGlobal.tree,
+            globalCode: dcGlobal.code, globalCtxMap: dcGlobal.ctxMap,
+            maxChanSize: dim.groupDim)
+        ecImage = image
+        ecTransforms = header.transforms
+    }
+
+    /// Applies the pending inverse transforms once every group's extra-channel
+    /// data has been decoded, and returns the finished planes.
+    func finalizeExtraChannels() throws -> [[Int32]] {
+        guard let image = ecImage else { return [] }
+        if !ecFinalized {
+            try undoTransforms(image, transforms: ecTransforms)
+            ecFinalized = true
+        }
+        return image.channels.map { $0.pixels }
     }
 
     func varDCTDCDequant() throws -> DCDequant {

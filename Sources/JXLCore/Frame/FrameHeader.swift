@@ -39,6 +39,8 @@ public struct FrameHeader: Sendable {
     public var flags: UInt64 = 0
     public var colorTransform: ColorTransform = .xyb
     public var upsampling: UInt32 = 1
+    /// Per-extra-channel upsampling (defaults to 1 for every channel).
+    public var ecUpsampling: [UInt32] = []
     public var groupSizeShift: UInt32 = 1
     public var xQmScale: UInt32 = 2
     public var bQmScale: UInt32 = 2
@@ -118,6 +120,7 @@ public struct FrameHeader: Sendable {
     }
 
     public init(reader r: BitReader, context ctx: FrameContext) {
+        ecUpsampling = [UInt32](repeating: 1, count: ctx.numExtraChannels)
         let allDefault = r.readBool()
         if allDefault { return }
 
@@ -140,8 +143,8 @@ public struct FrameHeader: Sendable {
         // Upsampling.
         if (flags & kUseDcFrame) == 0 {
             upsampling = r.readU32(.value(1), .value(2), .value(4), .value(8))
-            for _ in 0..<ctx.numExtraChannels {
-                _ = r.readU32(.value(1), .value(2), .value(4), .value(8))  // extra-channel upsampling
+            for i in 0..<ctx.numExtraChannels {
+                ecUpsampling[i] = r.readU32(.value(1), .value(2), .value(4), .value(8))
             }
         }
 

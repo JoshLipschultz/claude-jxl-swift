@@ -101,7 +101,11 @@ do {
     case "decode":
         guard args.count >= 4 else { usage() }
         let image = try JXL.decodeImage(from: bytes)
-        let out = image.isFloat ? encodePFM(image) : encodePNM(image)
+        let wantPAM = args[3].lowercased().hasSuffix(".pam")
+        let out =
+            image.isFloat
+            ? encodePFM(image)
+            : (wantPAM && image.extraChannels > 0 ? encodePAM(image) : encodePNM(image))
         do {
             try Data(out).write(to: URL(fileURLWithPath: args[3]))
             print("decoded \(image.width) x \(image.height) -> \(args[3])")
@@ -289,6 +293,42 @@ func encodePNM(_ image: JXLDecodedImage) -> [UInt8] {
                 let v = UInt32(bitPattern: image.planes[c][y * image.width + x])
                 if twoBytes {
                     out.append(UInt8((v >> 8) & 0xFF))  // PNM is big-endian
+                    out.append(UInt8(v & 0xFF))
+                } else {
+                    out.append(UInt8(v & 0xFF))
+                }
+            }
+        }
+    }
+    return out
+}
+
+/// Encodes a decoded image with alpha as a binary PAM (P7, RGB_ALPHA or
+/// GRAYSCALE_ALPHA): color channels then the first extra channel per pixel.
+func encodePAM(_ image: JXLDecodedImage) -> [UInt8] {
+    let isGray = image.colorChannels == 1
+    let maxval = (1 << image.bitsPerSample) - 1
+    let depth = image.colorChannels + 1
+    let tuple = isGray ? "GRAYSCALE_ALPHA" : "RGB_ALPHA"
+    var out = [UInt8](
+        """
+        P7
+        WIDTH \(image.width)
+        HEIGHT \(image.height)
+        DEPTH \(depth)
+        MAXVAL \(maxval)
+        TUPLTYPE \(tuple)
+        ENDHDR
+
+        """.utf8)
+    let twoBytes = image.bitsPerSample > 8
+    for y in 0..<image.height {
+        for x in 0..<image.width {
+            for c in 0..<depth {
+                let plane = c < image.colorChannels ? c : image.colorChannels
+                let v = UInt32(bitPattern: image.planes[plane][y * image.width + x])
+                if twoBytes {
+                    out.append(UInt8((v >> 8) & 0xFF))  // PAM is big-endian
                     out.append(UInt8(v & 0xFF))
                 } else {
                     out.append(UInt8(v & 0xFF))
