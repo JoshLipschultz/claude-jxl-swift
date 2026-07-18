@@ -35,6 +35,8 @@ targets:
         product: JXLCore
       - package: JXL
         product: JXLKit
+      - target: JXLQuickLook
+        embed: true
     settings:
       base:
         PRODUCT_NAME: JXLViewer
@@ -48,6 +50,32 @@ targets:
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: "-"
         DEVELOPMENT_TEAM: ""
+
+  JXLQuickLook:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Apps/JXLQuickLook
+        excludes:
+          - Info.plist
+    dependencies:
+      - package: JXL
+        product: JXLCore
+      - package: JXL
+        product: JXLKit
+    settings:
+      base:
+        PRODUCT_NAME: JXLQuickLook
+        PRODUCT_BUNDLE_IDENTIFIER: org.jpeg.jxl.viewer.quicklook
+        INFOPLIST_FILE: Apps/JXLQuickLook/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "6.0"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        DEVELOPMENT_TEAM: ""
+        SKIP_INSTALL: YES
 
 schemes:
   JXLViewer:
