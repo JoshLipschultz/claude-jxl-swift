@@ -83,6 +83,10 @@ private let kEpfChannelScaleB: Float = 3.5
 private let kEpfQuantMul: Float = 0.46
 private let kEpfBorderSadMul: Float = 0.6666666666666666
 private let kEpfSadMulSm: Float = 1.65
+// LoopFilter defaults: sigma multipliers of the first (7x7) and last (3x3)
+// EPF passes relative to the middle pass.
+private let kEpfPass0SigmaScale: Float = 0.9
+private let kEpfPass2SigmaScale: Float = 6.5
 
 /// Per-block inverse sigma (`1/sigma`) for EPF, from the quant field and EPF
 /// sharpness (libjxl ComputeSigma). `epfSharpLut[s] = s/7` (default).
@@ -174,6 +178,189 @@ private func epf1(
                     accX += weight * px(sx, cx + dx, cy + dy)
                     accY += weight * px(sy, cx + dx, cy + dy)
                     accB += weight * px(sb, cx + dx, cy + dy)
+                }
+                tap(0, -1)
+                tap(-1, 0)
+                tap(1, 0)
+                tap(0, 1)
+                let invW = 1.0 / wsum
+                dx_[cy * w + cx] = accX * invW
+                dy_[cy * w + cx] = accY * invW
+                db_[cy * w + cx] = accB * invW
+            }
+        }
+    }
+    }
+    }
+    }
+    }
+    }
+    }
+}
+
+/// EPF stage 0 (epf_iters >= 3): 5x5 plus-shaped kernel, each of the 12 taps
+/// weighted by a 3x3 plus-shaped SAD — a 7x7 filter (libjxl EPF0Stage). Sigma
+/// is scaled by epf_pass0_sigma_scale.
+private func epf0(
+    x: inout [Float], y: inout [Float], b: inout [Float], w: Int, h: Int,
+    sigmaInv: [Float], bw: Int
+) {
+    let sxCopy = x, syCopy = y, sbCopy = b
+    sxCopy.withUnsafeBufferPointer { sxBuf in
+    syCopy.withUnsafeBufferPointer { syBuf in
+    sbCopy.withUnsafeBufferPointer { sbBuf in
+    sigmaInv.withUnsafeBufferPointer { sigBuf in
+    x.withUnsafeMutableBufferPointer { xBuf in
+    y.withUnsafeMutableBufferPointer { yBuf in
+    b.withUnsafeMutableBufferPointer { bBuf in
+        nonisolated(unsafe) let sx = sxBuf.baseAddress!
+        nonisolated(unsafe) let sy = syBuf.baseAddress!
+        nonisolated(unsafe) let sb = sbBuf.baseAddress!
+        nonisolated(unsafe) let sig = sigBuf.baseAddress!
+        nonisolated(unsafe) let dx_ = xBuf.baseAddress!
+        nonisolated(unsafe) let dy_ = yBuf.baseAddress!
+        nonisolated(unsafe) let db_ = bBuf.baseAddress!
+
+        DispatchQueue.concurrentPerform(iterations: h) { cy in
+            @inline(__always) func mir(_ i: Int, _ n: Int) -> Int {
+                var v = i
+                if v < 0 { v = -v - 1 }
+                if v >= n { v = 2 * n - 1 - v }
+                return max(0, min(n - 1, v))
+            }
+            @inline(__always) func px(_ p: UnsafePointer<Float>, _ xx: Int, _ yy: Int) -> Float {
+                p[mir(yy, h) * w + mir(xx, w)]
+            }
+            @inline(__always) func sadPlane(
+                _ p: UnsafePointer<Float>, _ cx: Int, _ dx: Int, _ dy: Int
+            ) -> Float {
+                var d: Float = 0
+                d += abs(px(p, cx, cy) - px(p, cx + dx, cy + dy))
+                d += abs(px(p, cx - 1, cy) - px(p, cx + dx - 1, cy + dy))
+                d += abs(px(p, cx + 1, cy) - px(p, cx + dx + 1, cy + dy))
+                d += abs(px(p, cx, cy - 1) - px(p, cx + dx, cy + dy - 1))
+                d += abs(px(p, cx, cy + 1) - px(p, cx + dx, cy + dy + 1))
+                return d
+            }
+            @inline(__always) func sad(_ cx: Int, _ dx: Int, _ dy: Int) -> Float {
+                sadPlane(sx, cx, dx, dy) * kEpfChannelScaleX
+                    + sadPlane(sy, cx, dx, dy) * kEpfChannelScaleY
+                    + sadPlane(sb, cx, dx, dy) * kEpfChannelScaleB
+            }
+
+            let borderRow = (cy % 8 == 0) || (cy % 8 == 7)
+            let sigRow = (cy / 8) * bw
+            for cx in 0..<w {
+                let rowSigma = sig[sigRow + (cx / 8)]
+                if rowSigma < kEpfMinSigma { continue }
+                let onEdge = borderRow || (cx % 8 == 0) || (cx % 8 == 7)
+                let base = kEpfPass0SigmaScale * kEpfSadMulSm
+                let sm = onEdge ? base * kEpfBorderSadMul : base
+                let invSigma = rowSigma * sm
+
+                var wsum: Float = 1
+                var accX = sx[cy * w + cx]
+                var accY = sy[cy * w + cx]
+                var accB = sb[cy * w + cx]
+                @inline(__always) func tap(_ dx: Int, _ dy: Int) {
+                    let weight = max(0, 1 + sad(cx, dx, dy) * invSigma)
+                    wsum += weight
+                    accX += weight * px(sx, cx + dx, cy + dy)
+                    accY += weight * px(sy, cx + dx, cy + dy)
+                    accB += weight * px(sb, cx + dx, cy + dy)
+                }
+                // 5x5 plus shape (dx, dy), libjxl sads_off order.
+                tap(0, -2)
+                tap(-1, -1)
+                tap(0, -1)
+                tap(1, -1)
+                tap(-2, 0)
+                tap(-1, 0)
+                tap(1, 0)
+                tap(2, 0)
+                tap(-1, 1)
+                tap(0, 1)
+                tap(1, 1)
+                tap(0, 2)
+                let invW = 1.0 / wsum
+                dx_[cy * w + cx] = accX * invW
+                dy_[cy * w + cx] = accY * invW
+                db_[cy * w + cx] = accB * invW
+            }
+        }
+    }
+    }
+    }
+    }
+    }
+    }
+    }
+}
+
+/// EPF stage 2 (epf_iters >= 2): 3x3 plus-shaped kernel, each tap weighted by
+/// its single-pixel channel-scaled difference from the center (libjxl
+/// EPF2Stage). Sigma is scaled by epf_pass2_sigma_scale.
+private func epf2(
+    x: inout [Float], y: inout [Float], b: inout [Float], w: Int, h: Int,
+    sigmaInv: [Float], bw: Int
+) {
+    let sxCopy = x, syCopy = y, sbCopy = b
+    sxCopy.withUnsafeBufferPointer { sxBuf in
+    syCopy.withUnsafeBufferPointer { syBuf in
+    sbCopy.withUnsafeBufferPointer { sbBuf in
+    sigmaInv.withUnsafeBufferPointer { sigBuf in
+    x.withUnsafeMutableBufferPointer { xBuf in
+    y.withUnsafeMutableBufferPointer { yBuf in
+    b.withUnsafeMutableBufferPointer { bBuf in
+        nonisolated(unsafe) let sx = sxBuf.baseAddress!
+        nonisolated(unsafe) let sy = syBuf.baseAddress!
+        nonisolated(unsafe) let sb = sbBuf.baseAddress!
+        nonisolated(unsafe) let sig = sigBuf.baseAddress!
+        nonisolated(unsafe) let dx_ = xBuf.baseAddress!
+        nonisolated(unsafe) let dy_ = yBuf.baseAddress!
+        nonisolated(unsafe) let db_ = bBuf.baseAddress!
+
+        DispatchQueue.concurrentPerform(iterations: h) { cy in
+            @inline(__always) func mir(_ i: Int, _ n: Int) -> Int {
+                var v = i
+                if v < 0 { v = -v - 1 }
+                if v >= n { v = 2 * n - 1 - v }
+                return max(0, min(n - 1, v))
+            }
+            @inline(__always) func px(_ p: UnsafePointer<Float>, _ xx: Int, _ yy: Int) -> Float {
+                p[mir(yy, h) * w + mir(xx, w)]
+            }
+
+            let borderRow = (cy % 8 == 0) || (cy % 8 == 7)
+            let sigRow = (cy / 8) * bw
+            for cx in 0..<w {
+                let rowSigma = sig[sigRow + (cx / 8)]
+                if rowSigma < kEpfMinSigma { continue }
+                let onEdge = borderRow || (cx % 8 == 0) || (cx % 8 == 7)
+                let base = kEpfPass2SigmaScale * kEpfSadMulSm
+                let sm = onEdge ? base * kEpfBorderSadMul : base
+                let invSigma = rowSigma * sm
+
+                let cxv = sx[cy * w + cx]
+                let cyv = sy[cy * w + cx]
+                let cbv = sb[cy * w + cx]
+                var wsum: Float = 1
+                var accX = cxv
+                var accY = cyv
+                var accB = cbv
+                @inline(__always) func tap(_ dx: Int, _ dy: Int) {
+                    let tx = px(sx, cx + dx, cy + dy)
+                    let ty = px(sy, cx + dx, cy + dy)
+                    let tb = px(sb, cx + dx, cy + dy)
+                    let sad =
+                        abs(tx - cxv) * kEpfChannelScaleX
+                        + abs(ty - cyv) * kEpfChannelScaleY
+                        + abs(tb - cbv) * kEpfChannelScaleB
+                    let weight = max(0, 1 + sad * invSigma)
+                    wsum += weight
+                    accX += weight * tx
+                    accY += weight * ty
+                    accB += weight * tb
                 }
                 tap(0, -1)
                 tap(-1, 0)
@@ -404,14 +591,25 @@ extension FrameDecoder {
             gaborish(&planeY, w: rowStride, h: paddedH, weight1: fh.gabYWeight1, weight2: fh.gabYWeight2)
             gaborish(&planeB, w: rowStride, h: paddedH, weight1: fh.gabBWeight1, weight2: fh.gabBWeight2)
         }
-        // EPF (edge-preserving filter). For epf_iters == 1 only the single middle
-        // pass (EPF1) runs (libjxl dec_cache.cc). Operates on the block-padded XYB.
+        // EPF (edge-preserving filter). Pass order per libjxl dec_cache.cc:
+        // stage 0 when iters >= 3, stage 1 when iters >= 1, stage 2 when
+        // iters >= 2. Operates on the block-padded XYB.
         if frameHeader.loopFilterEpfIters >= 1 {
             let quantScale = Float(dcGlobalInfo.quantizer.globalScale) / Float(1 << 16)
             let sigmaInv = computeEPFSigma(meta: meta, quantScale: quantScale)
+            if frameHeader.loopFilterEpfIters >= 3 {
+                epf0(
+                    x: &planeX, y: &planeY, b: &planeB, w: rowStride, h: paddedH,
+                    sigmaInv: sigmaInv, bw: dim.xsizeBlocks)
+            }
             epf1(
                 x: &planeX, y: &planeY, b: &planeB, w: rowStride, h: paddedH,
                 sigmaInv: sigmaInv, bw: dim.xsizeBlocks)
+            if frameHeader.loopFilterEpfIters >= 2 {
+                epf2(
+                    x: &planeX, y: &planeY, b: &planeB, w: rowStride, h: paddedH,
+                    sigmaInv: sigmaInv, bw: dim.xsizeBlocks)
+            }
         }
 
         // Subsampled chroma: expand the packed regions to full resolution

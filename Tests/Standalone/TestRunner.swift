@@ -71,6 +71,7 @@ struct TestRunner {
         dct64()
         patches()
         vardctAlpha()
+        epfIters()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -203,6 +204,31 @@ struct TestRunner {
         }
         let psnr = ppmPSNR(refPPM, rgb, img.width, img.height)
         check(psnr > 50, "patches reconstruction matches djxl (PSNR \(Int(psnr)) dB)")
+    }
+
+    // MARK: - EPF pass counts (epf_iters != 1)
+
+    /// `256x192_epf2.jxl` (cjxl --epf=2) runs EPF passes 1+2; `160x120_epf3.jxl`
+    /// (cjxl --epf=3) runs all three (0, 1, 2). Both must match djxl.
+    static func epfIters() {
+        let dir = fixturesDir()
+        for name in ["256x192_epf2", "160x120_epf3"] {
+            guard let jxl = try? Data(contentsOf: dir.appendingPathComponent("\(name).jxl")),
+                let refPPM = try? Data(contentsOf: dir.appendingPathComponent("\(name).ppm")),
+                let img = try? JXL.decodeImage(from: jxl)
+            else {
+                check(false, "\(name) fixture decodes")
+                continue
+            }
+            var rgb = [UInt8](repeating: 0, count: img.width * img.height * 3)
+            for c in 0..<3 {
+                for i in 0..<(img.width * img.height) {
+                    rgb[i * 3 + c] = UInt8(clamping: img.planes[c][i])
+                }
+            }
+            let psnr = ppmPSNR(refPPM, rgb, img.width, img.height)
+            check(psnr > 50, "\(name) matches djxl (PSNR \(Int(psnr)) dB)")
+        }
     }
 
     // MARK: - VarDCT extra channels (alpha)
