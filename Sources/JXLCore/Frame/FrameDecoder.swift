@@ -385,8 +385,39 @@ final class FrameDecoder {
         let extra = metadata.extraChannelCount
         try checkPixelLimits(channels: colorChannels + extra)
 
-        let fullImage = try decodeModularChannels(
-            in: slot, channelCount: colorChannels + extra).image
+        let (fullImage, dcQuant) = try decodeModularChannels(
+            in: slot, channelCount: colorChannels + extra)
+
+        if frameHeader.colorTransform == .xyb {
+            // Modular-XYB (lossy modular / squeeze): channels arrive as Y, X,
+            // B−Y scaled by the DC-quant factors (dec_modular kXYB
+            // finalization); convert through the shared XYB output path.
+            let w = dim.xsize
+            let h = dim.ysize
+            guard fullImage.channels.count >= 3,
+                fullImage.channels[0].pixels.count >= w * h,
+                fullImage.channels[1].pixels.count >= w * h,
+                fullImage.channels[2].pixels.count >= w * h
+            else { throw JXLError.malformed("Modular XYB channel layout") }
+            var x = [Float](repeating: 0, count: w * h)
+            var y = [Float](repeating: 0, count: w * h)
+            var b = [Float](repeating: 0, count: w * h)
+            let cY = fullImage.channels[0].pixels
+            let cX = fullImage.channels[1].pixels
+            let cB = fullImage.channels[2].pixels
+            for i in 0..<(w * h) {
+                x[i] = Float(cX[i]) * dcQuant[0]
+                y[i] = Float(cY[i]) * dcQuant[1]
+                b[i] = Float(cB[i] &+ cY[i]) * dcQuant[2]
+            }
+            let xyb = XYBImage(width: w, height: h, stride: w, paddedHeight: h, x: x, y: y, b: b)
+            let spec = try makeOutputColorSpec(metadata.colorEncoding)
+            let ecPlanes = fullImage.channels.dropFirst(3).map { $0.pixels }
+            return JXLDecodedImage(
+                width: w, height: h, colorChannels: 3,
+                extraChannels: ecPlanes.count, bitsPerSample: 8, isFloat: false,
+                planes: xybToRGB8Planes(xyb, spec: spec) + ecPlanes, iccProfile: nil)
+        }
 
         // Modular samples are native (no color transform applied here), so the
         // embedded profile — when present — describes them directly.
@@ -439,6 +470,19 @@ final class FrameDecoder {
             globalCtxMap: globalCtxMap, maxChanSize: maxChan)
 
         if dim.numGroups > 1 {
+            // DC-group sections carry the channels whose squeeze shift is >= 3
+            // (libjxl ModularStreamId::ModularDC, shift bracket [3, 1000]).
+            // Nothing is read from them when no such channel exists.
+            for dcg in 0..<dim.numDCGroups {
+                if let dcResult = try decodeModularGroupImage(
+                    BitReader(parsed.codestream, byteRange: slot.sectionRange(1 + dcg)),
+                    fullImage: fullImage, group: dcg, dim: dim,
+                    globalTree: globalTree, globalCode: globalCode, globalCtxMap: globalCtxMap,
+                    streamID: 1 + dim.numDCGroups + dcg,
+                    minShift: 3, maxShift: 1000, dcGroup: true) {
+                    blitModularGroup(dcResult, into: fullImage)
+                }
+            }
             // Groups are independent: decode them concurrently into group-local
             // sub-images, then blit serially (the decode phase only reads the
             // full image's channel layout).

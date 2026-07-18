@@ -18,6 +18,13 @@ private let kExtraPropsPerChannel = 4
 
 enum TransformId: UInt32 { case rct = 0, palette = 1, squeeze = 2, invalid = 3 }
 
+struct SqueezeParams {
+    var horizontal: Bool
+    var inPlace: Bool
+    var beginC: UInt32
+    var numC: UInt32
+}
+
 struct ModularTransform {
     var id: TransformId = .rct
     var beginC: UInt32 = 0
@@ -26,7 +33,10 @@ struct ModularTransform {
     var nbColors: UInt32 = 256
     var nbDeltas: UInt32 = 0
     var predictor: UInt32 = 0
-    var numSqueezes: UInt32 = 0
+    /// Squeeze only. Empty means "use the default sequence", which MetaApply
+    /// resolves against the image dimensions (DefaultSqueezeParameters) so the
+    /// inverse sees the concrete list.
+    var squeezes: [SqueezeParams] = []
 }
 
 extension BitReader {
@@ -51,13 +61,14 @@ extension BitReader {
             if t.predictor >= 14 { return nil }
         }
         if id == .squeeze {
-            t.numSqueezes = readU32(.value(0), .bits(4, offset: 1), .bits(6, offset: 9), .bits(8, offset: 41))
-            for _ in 0..<t.numSqueezes {
-                // SqueezeParams: horizontal(1) + in_place(1) + begin_c(U32) + num_c(U32)
-                _ = read(1)
-                _ = read(1)
-                _ = readU32(.bits(3), .bits(6, offset: 8), .bits(10, offset: 72), .bits(13, offset: 1096))
-                _ = readU32(.value(1), .value(2), .value(3), .bits(4, offset: 4))
+            let numSqueezes = readU32(.value(0), .bits(4, offset: 1), .bits(6, offset: 9), .bits(8, offset: 41))
+            for _ in 0..<numSqueezes {
+                let horizontal = read(1) == 1
+                let inPlace = read(1) == 1
+                let beginC = readU32(.bits(3), .bits(6, offset: 8), .bits(10, offset: 72), .bits(13, offset: 1096))
+                let numC = readU32(.value(1), .value(2), .value(3), .bits(4, offset: 4))
+                t.squeezes.append(
+                    SqueezeParams(horizontal: horizontal, inPlace: inPlace, beginC: beginC, numC: numC))
             }
         }
         return t
@@ -222,15 +233,12 @@ func modularDecode(
     globalTree: [MATreeNode]?, globalCode: ANSCode?, globalCtxMap: [UInt8]?,
     maxChanSize: Int = Int.max
 ) throws -> GroupHeader {
-    guard let header = readGroupHeader(br) else { throw ModularDecodeError.badGroupHeader }
-    // RCT and an empty transform list keep the channel layout unchanged; other
-    // transforms change it and aren't applied yet (MetaApply).
-    for t in header.transforms where t.id != .rct && t.id != .palette {
-        throw ModularDecodeError.unsupportedTransform
-    }
-    // MetaApply: Palette changes the channel layout before decoding.
-    for t in header.transforms {
-        try metaApplyTransform(image, transform: t)
+    guard var header = readGroupHeader(br) else { throw ModularDecodeError.badGroupHeader }
+    // MetaApply: Palette and Squeeze change the channel layout before decoding.
+    // Squeeze also resolves an empty parameter list to the default sequence,
+    // which the inverse (undoTransforms) needs — hence the in-place mutation.
+    for i in header.transforms.indices {
+        try metaApplyTransform(image, transform: &header.transforms[i])
     }
 
     let tree: [MATreeNode]
@@ -303,15 +311,20 @@ struct ModularGroupResult {
 /// groups can decode concurrently; the writes happen in `blitModularGroup`.
 func decodeModularGroupImage(
     _ br: BitReader, fullImage: ModularImage, group g: Int, dim: FrameDimensions,
-    globalTree: [MATreeNode]?, globalCode: ANSCode?, globalCtxMap: [UInt8]?, streamID: Int
+    globalTree: [MATreeNode]?, globalCode: ANSCode?, globalCtxMap: [UInt8]?, streamID: Int,
+    minShift: Int = 0, maxShift: Int = 2, dcGroup: Bool = false
 ) throws -> ModularGroupResult? {
-    let minShift = 0
-    let maxShift = 2
     let groupDim = dim.groupDim
-    let rx0 = (g % dim.xsizeGroups) * groupDim
-    let ry0 = (g / dim.xsizeGroups) * groupDim
-    let rectW = min(groupDim, dim.xsize - rx0)
-    let rectH = min(groupDim, dim.ysize - ry0)
+    // AC groups tile at group_dim; DC groups (shift >= 3 channels) at 8x that.
+    let tile = dcGroup ? groupDim * 8 : groupDim
+    let perRow = dcGroup ? dim.xsizeDCGroups : dim.xsizeGroups
+    let rx0 = (g % perRow) * tile
+    let ry0 = (g / perRow) * tile
+    // The rect is NOT clamped to the image here: libjxl clamps per channel
+    // against the channel's own (ceil-rounded, shifted) dimensions, which
+    // differs from shifting an image-clamped rect for squeezed channels.
+    let rectW = min(tile, dim.xsize - rx0)
+    let rectH = min(tile, dim.ysize - ry0)
 
     // Skip meta + small (<= group_dim) channels, which were decoded globally.
     var beginC = fullImage.nbMetaChannels
@@ -326,12 +339,13 @@ func decodeModularGroupImage(
     var mapping: [(fullC: Int, x: Int, y: Int, w: Int, h: Int)] = []
     for c in beginC..<fullImage.channels.count {
         let fc = fullImage.channels[c]
+        guard fc.hshift >= 0, fc.vshift >= 0 else { continue }
         let shift = min(fc.hshift, fc.vshift)
         if shift > maxShift || shift < minShift { continue }
         let rx = rx0 >> fc.hshift
         let ry = ry0 >> fc.vshift
-        let rw = min(rectW >> fc.hshift, fc.w - rx)
-        let rh = min(rectH >> fc.vshift, fc.h - ry)
+        let rw = min(tile >> fc.hshift, fc.w - rx)
+        let rh = min(tile >> fc.vshift, fc.h - ry)
         if rw <= 0 || rh <= 0 { continue }
         gi.channels.append(ModularChannel(w: rw, h: rh, hshift: fc.hshift, vshift: fc.vshift))
         mapping.append((c, rx, ry, rw, rh))

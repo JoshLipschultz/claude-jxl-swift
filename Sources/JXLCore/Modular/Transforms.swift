@@ -24,7 +24,7 @@ private func checkEqualChannels(_ image: ModularImage, _ begin: Int, _ end: Int)
     return true
 }
 
-func metaApplyTransform(_ image: ModularImage, transform t: ModularTransform) throws {
+func metaApplyTransform(_ image: ModularImage, transform t: inout ModularTransform) throws {
     switch t.id {
     case .rct:
         // No layout change, but validate here so decode never reaches an
@@ -38,6 +38,8 @@ func metaApplyTransform(_ image: ModularImage, transform t: ModularTransform) th
         metaPalette(
             image, beginC: Int(t.beginC), endC: Int(t.beginC) + Int(t.numC) - 1,
             nbColors: Int(t.nbColors), nbDeltas: Int(t.nbDeltas))
+    case .squeeze:
+        try metaSqueeze(image, params: &t.squeezes)
     default:
         throw ModularDecodeError.unsupportedTransform
     }
@@ -53,9 +55,278 @@ func undoTransforms(_ image: ModularImage, transforms: [ModularTransform]) throw
             try invPalette(
                 image, beginC: Int(t.beginC), nbColors: Int(t.nbColors), nbDeltas: Int(t.nbDeltas),
                 predictor: Int(t.predictor))
+        case .squeeze:
+            try invSqueeze(image, params: t.squeezes)
         default:
             throw ModularDecodeError.unsupportedTransform
         }
+    }
+}
+
+// MARK: - Squeeze (libjxl modular/transform/squeeze.cc)
+
+private let kMaxFirstPreviewSize = 8
+
+/// The default squeeze sequence for an image with no explicit parameters
+/// (libjxl DefaultSqueezeParameters): optional 4:2:0-style chroma squeezes,
+/// then alternating full-channel-range squeezes until both dimensions are at
+/// most 8.
+private func defaultSqueezeParameters(_ image: ModularImage) -> [SqueezeParams] {
+    let nbChannels = image.channels.count - image.nbMetaChannels
+    var parameters: [SqueezeParams] = []
+    var w = image.channels[image.nbMetaChannels].w
+    var h = image.channels[image.nbMetaChannels].h
+    let wide = w > h
+
+    if nbChannels > 2 && image.channels[image.nbMetaChannels + 1].w == w
+        && image.channels[image.nbMetaChannels + 1].h == h {
+        // Assume channels 1 and 2 are chroma; squeeze them first.
+        let beginC = UInt32(image.nbMetaChannels + 1)
+        parameters.append(
+            SqueezeParams(horizontal: true, inPlace: false, beginC: beginC, numC: 2))
+        parameters.append(
+            SqueezeParams(horizontal: false, inPlace: false, beginC: beginC, numC: 2))
+    }
+    var params = SqueezeParams(
+        horizontal: true, inPlace: true, beginC: UInt32(image.nbMetaChannels),
+        numC: UInt32(nbChannels))
+    if !wide && h > kMaxFirstPreviewSize {
+        params.horizontal = false
+        parameters.append(params)
+        h = (h + 1) / 2
+    }
+    while w > kMaxFirstPreviewSize || h > kMaxFirstPreviewSize {
+        if w > kMaxFirstPreviewSize {
+            params.horizontal = true
+            parameters.append(params)
+            w = (w + 1) / 2
+        }
+        if h > kMaxFirstPreviewSize {
+            params.horizontal = false
+            parameters.append(params)
+            h = (h + 1) / 2
+        }
+    }
+    return parameters
+}
+
+private func checkSqueezeParams(_ p: SqueezeParams, channelCount: Int) throws {
+    let c1 = Int(p.beginC)
+    let c2 = Int(p.beginC) + Int(p.numC) - 1
+    guard c1 >= 0, c1 < channelCount, c2 >= 0, c2 < channelCount, c2 >= c1 else {
+        throw ModularDecodeError.invalidTransform
+    }
+}
+
+/// Channel-layout change for Squeeze (libjxl MetaSqueeze): each parameter
+/// halves the listed channels in one direction and inserts placeholder
+/// residual channels (in place right after the range, or appended).
+func metaSqueeze(_ image: ModularImage, params: inout [SqueezeParams]) throws {
+    if params.isEmpty {
+        guard image.channels.count > image.nbMetaChannels else {
+            throw ModularDecodeError.invalidTransform
+        }
+        params = defaultSqueezeParameters(image)
+    }
+    for parameter in params {
+        try checkSqueezeParams(parameter, channelCount: image.channels.count)
+        let beginC = Int(parameter.beginC)
+        let endC = beginC + Int(parameter.numC) - 1
+        if beginC < image.nbMetaChannels {
+            guard endC < image.nbMetaChannels, parameter.inPlace else {
+                throw ModularDecodeError.invalidTransform
+            }
+            image.nbMetaChannels += Int(parameter.numC)
+        }
+        let offset = parameter.inPlace ? endC + 1 : image.channels.count
+        for c in beginC...endC {
+            guard image.channels[c].hshift <= 30, image.channels[c].vshift <= 30 else {
+                throw ModularDecodeError.invalidTransform
+            }
+            let w = image.channels[c].w
+            let h = image.channels[c].h
+            guard w > 0, h > 0 else { throw ModularDecodeError.invalidTransform }
+            var residualW = w
+            var residualH = h
+            if parameter.horizontal {
+                image.channels[c].w = (w + 1) / 2
+                if image.channels[c].hshift >= 0 { image.channels[c].hshift += 1 }
+                residualW = w - (w + 1) / 2
+            } else {
+                image.channels[c].h = (h + 1) / 2
+                if image.channels[c].vshift >= 0 { image.channels[c].vshift += 1 }
+                residualH = h - (h + 1) / 2
+            }
+            image.channels[c].pixels = [Int32](
+                repeating: 0, count: max(0, image.channels[c].w * image.channels[c].h))
+            var placeholder = ModularChannel(
+                w: residualW, h: residualH,
+                hshift: image.channels[c].hshift, vshift: image.channels[c].vshift)
+            placeholder.pixels = [Int32](repeating: 0, count: max(0, residualW * residualH))
+            image.channels.insert(placeholder, at: offset + (c - beginC))
+        }
+    }
+}
+
+/// The squeeze residual predictor (libjxl SmoothTendency): estimates C−D from
+/// the previous output pixel, this average, and the next average, with
+/// monotonicity clamps that avoid ringing.
+@inline(__always)
+private func smoothTendency(_ B: Int64, _ a: Int64, _ n: Int64) -> Int64 {
+    var diff: Int64 = 0
+    if B >= a && a >= n {
+        diff = (4 * B - 3 * n - a + 6) / 12
+        if diff - (diff & 1) > 2 * (B - a) { diff = 2 * (B - a) + 1 }
+        if diff + (diff & 1) > 2 * (a - n) { diff = 2 * (a - n) }
+    } else if B <= a && a <= n {
+        diff = (4 * B - 3 * n - a - 6) / 12
+        if diff + (diff & 1) < 2 * (B - a) { diff = 2 * (B - a) - 1 }
+        if diff - (diff & 1) < 2 * (a - n) { diff = 2 * (a - n) }
+    }
+    return diff
+}
+
+/// Undoes one horizontal squeeze of channel `c` using residuals in `rc`.
+private func invHSqueeze(_ image: ModularImage, _ c: Int, _ rc: Int) throws {
+    let chin = image.channels[c]
+    let res = image.channels[rc]
+    guard chin.w == (chin.w + res.w + 1) / 2 || chin.w == divCeil(chin.w + res.w, 2),
+        chin.h == res.h || res.w == 0 || res.h == 0
+    else { throw ModularDecodeError.invalidTransform }
+
+    if res.w == 0 {
+        // Output has the same dimensions as the input.
+        image.channels[c].hshift -= 1
+        return
+    }
+    var chout = ModularChannel(
+        w: chin.w + res.w, h: chin.h, hshift: chin.hshift - 1, vshift: chin.vshift)
+    if res.h == 0 {
+        image.channels[c] = chout
+        return
+    }
+    chin.pixels.withUnsafeBufferPointer { avgBuf in
+    res.pixels.withUnsafeBufferPointer { resBuf in
+    chout.pixels.withUnsafeMutableBufferPointer { outBuf in
+        nonisolated(unsafe) let avg = avgBuf.baseAddress!
+        nonisolated(unsafe) let residual = resBuf.baseAddress!
+        nonisolated(unsafe) let out = outBuf.baseAddress!
+        let inW = chin.w
+        let resW = res.w
+        let outW = chin.w + res.w
+        DispatchQueue.concurrentPerform(iterations: chin.h) { y in
+            let pAvg = avg + y * inW
+            let pRes = residual + y * resW
+            let pOut = out + y * outW
+            for x in 0..<resW {
+                let diffMinusTendency = Int64(pRes[x])
+                let a = Int64(pAvg[x])
+                let nextAvg = x + 1 < inW ? Int64(pAvg[x + 1]) : a
+                let left = x > 0 ? Int64(pOut[(x << 1) - 1]) : a
+                let tendency = smoothTendency(left, a, nextAvg)
+                let diff = diffMinusTendency + tendency
+                let A = a + (diff / 2)
+                pOut[x << 1] = Int32(truncatingIfNeeded: A)
+                pOut[(x << 1) + 1] = Int32(truncatingIfNeeded: A - diff)
+            }
+            if outW & 1 == 1 { pOut[outW - 1] = pAvg[inW - 1] }
+        }
+    }
+    }
+    }
+    image.channels[c] = chout
+}
+
+/// Undoes one vertical squeeze of channel `c` using residuals in `rc`.
+private func invVSqueeze(_ image: ModularImage, _ c: Int, _ rc: Int) throws {
+    let chin = image.channels[c]
+    let res = image.channels[rc]
+    guard chin.h == divCeil(chin.h + res.h, 2), chin.w == res.w || res.w == 0 || res.h == 0
+    else { throw ModularDecodeError.invalidTransform }
+
+    if res.h == 0 {
+        image.channels[c].vshift -= 1
+        return
+    }
+    var chout = ModularChannel(
+        w: chin.w, h: chin.h + res.h, hshift: chin.hshift, vshift: chin.vshift - 1)
+    if res.w == 0 {
+        image.channels[c] = chout
+        return
+    }
+    chin.pixels.withUnsafeBufferPointer { avgBuf in
+    res.pixels.withUnsafeBufferPointer { resBuf in
+    chout.pixels.withUnsafeMutableBufferPointer { outBuf in
+        nonisolated(unsafe) let avg = avgBuf.baseAddress!
+        nonisolated(unsafe) let residual = resBuf.baseAddress!
+        nonisolated(unsafe) let out = outBuf.baseAddress!
+        let w = chin.w
+        let inH = chin.h
+        let resH = res.h
+        // Columns are independent; split into 64-wide slices (libjxl
+        // kColsPerThread) since rows carry the vertical dependency.
+        let slices = divCeil(w, 64)
+        DispatchQueue.concurrentPerform(iterations: slices) { task in
+            let x0 = task * 64
+            let x1 = min(x0 + 64, w)
+            for y in 0..<resH {
+                let pRes = residual + y * w
+                let pAvg = avg + y * w
+                let pNavg = avg + (y + 1 < inH ? y + 1 : y) * w
+                let pOut = out + (y << 1) * w
+                let pNout = out + ((y << 1) + 1) * w
+                let pPrev: UnsafePointer<Int32> =
+                    y > 0 ? UnsafePointer(out + ((y << 1) - 1) * w) : pAvg
+                for x in x0..<x1 {
+                    let a = Int64(pAvg[x])
+                    let nextAvg = Int64(pNavg[x])
+                    let top = Int64(pPrev[x])
+                    let tendency = smoothTendency(top, a, nextAvg)
+                    let diff = Int64(pRes[x]) + tendency
+                    let outV = a + (diff / 2)
+                    pOut[x] = Int32(truncatingIfNeeded: outV)
+                    pNout[x] = Int32(truncatingIfNeeded: outV - diff)
+                }
+            }
+        }
+    }
+    }
+    }
+    if chout.h & 1 == 1 {
+        let y = chin.h - 1
+        for x in 0..<chin.w {
+            chout.pixels[(y << 1) * chin.w + x] = chin.pixels[y * chin.w + x]
+        }
+    }
+    image.channels[c] = chout
+}
+
+/// Undoes the whole squeeze sequence in reverse order (libjxl InvSqueeze).
+func invSqueeze(_ image: ModularImage, params: [SqueezeParams]) throws {
+    for parameter in params.reversed() {
+        try checkSqueezeParams(parameter, channelCount: image.channels.count)
+        let beginC = Int(parameter.beginC)
+        let endC = beginC + Int(parameter.numC) - 1
+        let offset = parameter.inPlace ? endC + 1 : image.channels.count + beginC - endC - 1
+        if beginC < image.nbMetaChannels {
+            guard image.nbMetaChannels > Int(parameter.numC) else {
+                throw ModularDecodeError.invalidTransform
+            }
+            image.nbMetaChannels -= Int(parameter.numC)
+        }
+        for c in beginC...endC {
+            let rc = offset + c - beginC
+            guard rc < image.channels.count,
+                image.channels[c].w >= image.channels[rc].w,
+                image.channels[c].h >= image.channels[rc].h
+            else { throw ModularDecodeError.invalidTransform }
+            if parameter.horizontal {
+                try invHSqueeze(image, c, rc)
+            } else {
+                try invVSqueeze(image, c, rc)
+            }
+        }
+        image.channels.removeSubrange(offset..<(offset + (endC - beginC + 1)))
     }
 }
 

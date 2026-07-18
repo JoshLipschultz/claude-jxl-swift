@@ -73,6 +73,7 @@ struct TestRunner {
         vardctAlpha()
         epfIters()
         upsampling()
+        squeeze()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -230,6 +231,52 @@ struct TestRunner {
             let psnr = ppmPSNR(refPPM, rgb, img.width, img.height)
             check(psnr > 50, "\(name) matches djxl (PSNR \(Int(psnr)) dB)")
         }
+    }
+
+    // MARK: - Squeeze (responsive / lossy modular)
+
+    /// `256x192_squeeze.jxl` and `2100x32_squeeze_dc.jxl` (cjxl --responsive=1,
+    /// lossless) must be byte-exact vs djxl — the wide one has squeeze channels
+    /// larger than group_dim at shift >= 3, exercising the ModularDC group
+    /// streams. `256x192_modular_lossy.jxl` (cjxl -m 1 -d 1.0) is Modular-XYB:
+    /// squeeze + DC-quant scaling through the XYB output path, PSNR-gated.
+    static func squeeze() {
+        let dir = fixturesDir()
+        for name in ["256x192_squeeze", "2100x32_squeeze_dc"] {
+            guard let jxl = try? Data(contentsOf: dir.appendingPathComponent("\(name).jxl")),
+                let refPPM = try? Data(contentsOf: dir.appendingPathComponent("\(name).ppm")),
+                let img = try? JXL.decodeImage(from: jxl), img.planes.count == 3
+            else {
+                check(false, "\(name) fixture decodes")
+                continue
+            }
+            var rgb = [UInt8](repeating: 0, count: img.width * img.height * 3)
+            for c in 0..<3 {
+                for i in 0..<(img.width * img.height) {
+                    rgb[i * 3 + c] = UInt8(clamping: img.planes[c][i])
+                }
+            }
+            let psnr = ppmPSNR(refPPM, rgb, img.width, img.height)
+            check(psnr == 999, "\(name) byte-exact vs djxl")
+        }
+        guard
+            let jxl = try? Data(
+                contentsOf: dir.appendingPathComponent("256x192_modular_lossy.jxl")),
+            let refPPM = try? Data(
+                contentsOf: dir.appendingPathComponent("256x192_modular_lossy.ppm")),
+            let img = try? JXL.decodeImage(from: jxl), img.planes.count == 3
+        else {
+            check(false, "modular lossy fixture decodes")
+            return
+        }
+        var rgb = [UInt8](repeating: 0, count: img.width * img.height * 3)
+        for c in 0..<3 {
+            for i in 0..<(img.width * img.height) {
+                rgb[i * 3 + c] = UInt8(clamping: img.planes[c][i])
+            }
+        }
+        let psnr = ppmPSNR(refPPM, rgb, img.width, img.height)
+        check(psnr > 50, "modular lossy (XYB squeeze) matches djxl (PSNR \(Int(psnr)) dB)")
     }
 
     // MARK: - Upsampling (2x/4x/8x)
