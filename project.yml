@@ -68,6 +68,7 @@ targets:
         PRODUCT_NAME: JXLQuickLook
         PRODUCT_BUNDLE_IDENTIFIER: org.jpeg.jxl.viewer.quicklook
         INFOPLIST_FILE: Apps/JXLQuickLook/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Apps/JXLQuickLook/JXLQuickLook.entitlements
         GENERATE_INFOPLIST_FILE: NO
         MARKETING_VERSION: "0.1"
         CURRENT_PROJECT_VERSION: "1"
