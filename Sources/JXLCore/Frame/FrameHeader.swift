@@ -74,6 +74,26 @@ public struct FrameHeader: Sendable {
         return chromaChannelMode.map { vShift[Int($0)] }.max() ?? 0
     }
 
+    /// Per-channel downsampling shifts (libjxl `YCbCrChromaSubsampling`:
+    /// `HShift(c) = maxhs - kHShift[mode_c]`), zero for non-YCbCr frames.
+    /// Channel order matches the plane order (0 = X/Cb, 1 = Y, 2 = B/Cr).
+    public var channelShifts: (h: [Int], v: [Int]) {
+        guard colorTransform == .ycbcr else { return ([0, 0, 0], [0, 0, 0]) }
+        let kH = [0, 1, 1, 0]
+        let kV = [0, 1, 0, 1]
+        let hs = chromaChannelMode.map { kH[Int($0)] }
+        let vs = chromaChannelMode.map { kV[Int($0)] }
+        let mh = hs.max() ?? 0
+        let mv = vs.max() ?? 0
+        return (hs.map { mh - $0 }, vs.map { mv - $0 })
+    }
+
+    /// True when all three channels are full resolution.
+    public var chromaIs444: Bool {
+        let s = channelShifts
+        return s.h == [0, 0, 0] && s.v == [0, 0, 0]
+    }
+
     /// Computes the group/DC-group grid for this frame.
     public func frameDimensions(_ ctx: FrameContext) -> FrameDimensions {
         var xs = customSizeOrOrigin && frameWidth != 0 ? Int(frameWidth) : ctx.imageWidth

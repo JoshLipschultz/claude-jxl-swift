@@ -56,6 +56,9 @@ let kCoveredBlocksY: [Int] = [
     public var varblockCount: Int
     /// Bitmask of AC strategies used (`1 << AcStrategyType`), libjxl `used_acs`.
     public var usedACs: UInt32
+    /// Per-block DC context byte (libjxl `quant_dc`): bucketed quantized DC
+    /// values when the block context map has DC thresholds; all zero otherwise.
+    public var dcQuantContext: [UInt8]
 }
 
 /// Decodes the AC metadata for every DC group of a VarDCT frame, alongside the

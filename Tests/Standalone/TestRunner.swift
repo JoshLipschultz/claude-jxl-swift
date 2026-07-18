@@ -67,6 +67,7 @@ struct TestRunner {
         vardctReconstruct()
         colorQuantizer()
         iccProfile()
+        jpegTranscode()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -144,6 +145,50 @@ struct TestRunner {
             check(psnr > 50, "custom-primaries lossy matches djxl (PSNR \(Int(psnr)) dB)")
         } else {
             check(false, "icc lossy PSNR oracle")
+        }
+    }
+
+    // MARK: - YCbCr / JPEG transcode (chroma subsampling, RAW quant tables)
+
+    /// `32x24_jpegycbcr.jxl` is a cjxl JPEG transcode: YCbCr color transform,
+    /// chroma subsampling, RAW (modular-coded) quant tables, custom block
+    /// context map with DC thresholds, kSkipAdaptiveDCSmoothing. Reconstruction
+    /// must match djxl's output (`32x24_jpegycbcr.ppm`) at oracle precision.
+    static func jpegTranscode() {
+        let dir = fixturesDir()
+        guard let jxl = try? Data(contentsOf: dir.appendingPathComponent("32x24_jpegycbcr.jxl")),
+            let refPPM = try? Data(contentsOf: dir.appendingPathComponent("32x24_jpegycbcr.ppm")),
+            let (w, h, rgb) = try? reconstructVarDCTImage(from: [UInt8](jxl))
+        else {
+            check(false, "jpeg transcode fixture decodes")
+            return
+        }
+        var newlines = 0
+        var offset = 0
+        for (i, byte) in refPPM.enumerated() where byte == 0x0A {
+            newlines += 1
+            if newlines == 3 {
+                offset = i + 1
+                break
+            }
+        }
+        let ref = [UInt8](refPPM[offset...])
+        check(ref.count == w * h * 3 && rgb.count == ref.count, "jpeg transcode size")
+        var se = 0.0
+        for i in 0..<min(ref.count, rgb.count) {
+            let d = Double(Int(ref[i]) - Int(rgb[i]))
+            se += d * d
+        }
+        let mse = se / Double(ref.count)
+        let psnr = mse == 0 ? 999 : 10 * log10(255.0 * 255.0 / mse)
+        check(psnr > 50, "YCbCr JPEG transcode matches djxl (PSNR \(Int(psnr)) dB)")
+
+        // decodeImage carries native samples for YCbCr output.
+        if let img = try? JXL.decodeImage(from: [UInt8](jxl)) {
+            check(img.width == 32 && img.height == 24 && img.planes.count == 3,
+                "jpeg transcode decodeImage shape")
+        } else {
+            check(false, "jpeg transcode decodeImage")
         }
     }
 

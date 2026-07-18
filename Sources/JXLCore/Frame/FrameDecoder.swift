@@ -198,10 +198,19 @@ final class FrameDecoder {
             return try decodeModularImage()
         }
         let xyb = try reconstructXYB()
-        // VarDCT planes are converted to the frame's declared numeric encoding
-        // (primaries/white point/transfer); files whose encoding is an ICC
-        // profile fall back to sRGB output, so the profile (which describes the
-        // original space) is deliberately not attached.
+        if frameHeader.colorTransform == .ycbcr {
+            // JPEG transcode: the YCbCr planes convert to the file's *native*
+            // encoded RGB (no color management applied), so the embedded
+            // profile — when present — describes the returned samples.
+            return JXLDecodedImage(
+                width: xyb.width, height: xyb.height, colorChannels: 3,
+                extraChannels: 0, bitsPerSample: 8, isFloat: false,
+                planes: ycbcrToRGB8Planes(xyb), iccProfile: iccProfile.map { Data($0) })
+        }
+        // XYB: converted to the frame's declared numeric encoding (primaries/
+        // white point/transfer); files whose encoding is an ICC profile fall
+        // back to sRGB output, so the profile (which describes the original
+        // space) is deliberately not attached.
         let spec = try makeOutputColorSpec(metadata.colorEncoding)
         return JXLDecodedImage(
             width: xyb.width, height: xyb.height, colorChannels: 3,
@@ -315,7 +324,8 @@ final class FrameDecoder {
     // MARK: VarDCT stages
 
     /// Guards shared by every VarDCT stage. Restrictions match the current
-    /// pipeline: single pass, 4:4:4, no patches/splines/noise.
+    /// pipeline: single pass, no patches/splines/noise. Chroma subsampling is
+    /// supported for YCbCr frames (JPEG transcodes) without restoration filters.
     func requireSupportedVarDCT() throws {
         guard !frameHeader.isModular else { throw JXLError.unsupported("Modular frame is not VarDCT") }
         guard frameHeader.frameType == .regular else {
@@ -324,12 +334,16 @@ final class FrameDecoder {
         guard frameHeader.numPasses == 1 else {
             throw JXLError.unsupported("progressive (multi-pass) VarDCT frames")
         }
-        guard frameHeader.chromaChannelMode == [0, 0, 0] else {
-            throw JXLError.unsupported("chroma-subsampled VarDCT frames")
+        if !frameHeader.chromaIs444 {
+            // Subsampled reconstruction is implemented for the JPEG-transcode
+            // shape: no Gaborish/EPF (their windows assume full-res planes).
+            guard !frameHeader.loopFilterGab && frameHeader.loopFilterEpfIters == 0 else {
+                throw JXLError.unsupported("restoration filters with chroma subsampling")
+            }
         }
         // No patches/splines/noise: those precede DequantMatrices.DecodeDC and
-        // are not yet parsed.
-        guard frameHeader.flags == 0 else {
+        // are not yet parsed. kSkipAdaptiveDCSmoothing (128) is honored.
+        guard frameHeader.flags & ~UInt64(128) == 0 else {
             throw JXLError.unsupported("VarDCT frame features (patches/splines/noise)")
         }
     }
@@ -367,10 +381,11 @@ final class FrameDecoder {
         if let cached = cachedACGlobal { return cached }
         let lf = try varDCTLowFrequency()
         let reader = coalesced ? r0 : sectionReader(dim.numDCGroups + 1)
+        let dcGlobal = try varDCTDCGlobal()
         let acGlobal = try decodeVarDCTACGlobal(
             reader, dim: dim, numPasses: Int(frameHeader.numPasses),
-            blockContextMap: try varDCTDCGlobal().info.blockContextMap,
-            usedACs: lf.metadata.usedACs)
+            blockContextMap: dcGlobal.info.blockContextMap,
+            usedACs: lf.metadata.usedACs, dcGlobal: dcGlobal)
         cachedACGlobal = acGlobal
         return acGlobal
     }

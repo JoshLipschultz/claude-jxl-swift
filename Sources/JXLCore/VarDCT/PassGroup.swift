@@ -134,6 +134,7 @@ func decodeVarDCTCoefficients(_ d: FrameDecoder) throws -> VarDCTCoefficients {
     let dim = d.dim
     let bgDim = dim.groupDim >> 3  // group dimension in blocks
     let blockW = dim.xsizeBlocks
+    let shifts = d.frameHeader.channelShifts
 
     let groupBounds: @Sendable (Int) -> (bx0: Int, by0: Int, gw: Int, gh: Int) = { g in
         let bx0 = (g % dim.xsizeGroups) * bgDim
@@ -148,7 +149,7 @@ func decodeVarDCTCoefficients(_ d: FrameDecoder) throws -> VarDCTCoefficients {
         let (blocks, nz) = try decodeACGroup(
             d.acGroupReader(0), meta: meta, acGlobal: acGlobal, bctx: bctx, ctxMap: ctxMap,
             histoSelectorBits: histoSelectorBits, bx0: bx0, by0: by0, gw: gw, gh: gh,
-            blockW: blockW)
+            blockW: blockW, shifts: shifts)
         return VarDCTCoefficients(blocks: blocks, totalNonZeros: nz)
     }
 
@@ -174,7 +175,7 @@ func decodeVarDCTCoefficients(_ d: FrameDecoder) throws -> VarDCTCoefficients {
                     BitReader(codestream, byteRange: sectionRanges[g]),
                     meta: meta, acGlobal: acGlobal, bctx: bctx, ctxMap: ctxMap,
                     histoSelectorBits: histoSelectorBits, bx0: bx0, by0: by0, gw: gw, gh: gh,
-                    blockW: blockW)
+                    blockW: blockW, shifts: shifts)
             }
         }
     }
@@ -196,7 +197,7 @@ func decodeVarDCTCoefficients(_ d: FrameDecoder) throws -> VarDCTCoefficients {
 private func decodeACGroup(
     _ br: BitReader, meta: VarDCTACMetadata, acGlobal: VarDCTACGlobal,
     bctx: VarDCTBlockContextMap, ctxMap: [UInt8], histoSelectorBits: Int,
-    bx0: Int, by0: Int, gw: Int, gh: Int, blockW: Int
+    bx0: Int, by0: Int, gw: Int, gh: Int, blockW: Int, shifts: (h: [Int], v: [Int])
 ) throws -> (blocks: [VarDCTBlock], nonZeros: Int) {
     var blocks: [VarDCTBlock] = []
     var totalNonZeros = 0
@@ -208,8 +209,12 @@ private func decodeACGroup(
     let ctxOffset = curHistogram * bctx.numACContexts
     let reader = ANSSymbolReader(code: acGlobal.codes[0], reader: br)
 
-    // Group-local non-zero prediction planes (per channel).
-    var nzeros = [[Int32]](repeating: [Int32](repeating: 0, count: gw * gh), count: 3)
+    // Group-local non-zero prediction planes, per channel at that channel's
+    // subsampled resolution (libjxl num_nzeroes planes).
+    let is444 = shifts.h == [0, 0, 0] && shifts.v == [0, 0, 0]
+    let nzW = (0..<3).map { divCeil(gw, 1 << shifts.h[$0]) }
+    let nzH = (0..<3).map { divCeil(gh, 1 << shifts.v[$0]) }
+    var nzeros = (0..<3).map { [Int32](repeating: 0, count: nzW[$0] * nzH[$0]) }
     let orders = acGlobal.orders[0]
 
     for byl in 0..<gh {
@@ -226,15 +231,29 @@ private func decodeACGroup(
             let size = covered * kDCTBlockSize
             let ord = kStrategyOrder[strategy]
 
-            var coeff = [[Int32]](repeating: [Int32](repeating: 0, count: size), count: 3)
-            let qf = meta.quantField[pos]
-            // DC context index: quant_dc field; 0 when num_dc_ctxs == 1.
-            let dcIdx = 0
+            var coeff: [[Int32]] = [[], [], []]
+            // DC context index (libjxl qdc_row[lbx], full-res position).
+            let dcIdx = Int(meta.dcQuantContext[pos])
 
-            // Channels in Y, X, B order.
+            // Channels in Y, X, B order; subsampled channels carry
+            // coefficients only at aligned block positions.
             for c in [1, 0, 2] {
+                let hs = shifts.h[c]
+                let vs = shifts.v[c]
+                let sbxl = bxl >> hs
+                let sbyl = byl >> vs
+                if (sbxl << hs) != bxl || (sbyl << vs) != byl { continue }
+                if !is444 && (hs != 0 || vs != 0) && covered != 1 {
+                    throw JXLError.unsupported("multi-block AC strategy on subsampled channel")
+                }
+                coeff[c] = [Int32](repeating: 0, count: size)
+
+                // Block context: libjxl's GetBlockFromBitstream reads the raw
+                // quant field at (full-res row, rect.x0 + subsampled x).
+                let qf = meta.quantField[by * blockW + bx0 + sbxl]
                 let blockCtx = blockCtxContext(bctx, dcIdx: dcIdx, qf: qf, ord: ord, c: c)
-                let predicted = Int(predictFromTopAndLeft(nz: nzeros[c], w: gw, bx: bxl, by: byl))
+                let predicted = Int(
+                    predictFromTopAndLeft(nz: nzeros[c], w: nzW[c], bx: sbxl, by: sbyl))
                 let nzeroCtx = blockCtxNonZeroContext(bctx, nonZeros: predicted, blockCtx: blockCtx)
                     + ctxOffset
                 var nz = Int(reader.readHybridUintClustered(Int(ctxMap[nzeroCtx]), br))
@@ -243,7 +262,7 @@ private func decodeACGroup(
                 }
                 let stored = Int32((nz + covered - 1) >> log2Covered)
                 for y in 0..<cy {
-                    for x in 0..<cx { nzeros[c][(byl + y) * gw + (bxl + x)] = stored }
+                    for x in 0..<cx { nzeros[c][(sbyl + y) * nzW[c] + (sbxl + x)] = stored }
                 }
                 totalNonZeros += nz
 

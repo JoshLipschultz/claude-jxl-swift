@@ -95,21 +95,23 @@ func decodeVarDCTLowFrequency(_ d: FrameDecoder) throws -> VarDCTLowFrequency {
         epfSharpness: [UInt8](repeating: 0, count: bw * bh),
         ytoxMap: [Int8](repeating: 0, count: ctw * cth),
         ytobMap: [Int8](repeating: 0, count: ctw * cth),
-        colorTileWidth: ctw, colorTileHeight: cth, varblockCount: 0, usedACs: 0)
+        colorTileWidth: ctw, colorTileHeight: cth, varblockCount: 0, usedACs: 0,
+        dcQuantContext: [UInt8](repeating: 0, count: bw * bh))
     // `valid[i]` mirrors libjxl AcStrategyImage validity: a block is valid once
     // covered by a placed varblock.
     var valid = [Bool](repeating: false, count: bw * bh)
     var totalVarblocks = 0
     var usedACs: UInt32 = 0
 
+    let shifts = d.frameHeader.channelShifts
     for dcg in 0..<dim.numDCGroups {
         let rect = d.dcGroupRect(dcg)
         let reader = d.dcGroupReader(dcg)
         try decodeVarDCTDC(
             reader, groupIndex: dcg, rectW: rect.w, rectH: rect.h,
-            dcGlobal: dcGlobal, dequant: dequant,
+            dcGlobal: dcGlobal, dequant: dequant, shifts: shifts,
             destX: &planeX, destY: &planeY, destB: &planeB,
-            destW: bw, x0: rect.x0, y0: rect.y0)
+            destW: bw, x0: rect.x0, y0: rect.y0, dcQuantContext: &meta.dcQuantContext)
         // (ModularDC reads nothing without extra channels.)
         try decodeAcMetadataGroup(
             reader, groupIndex: dcg, rect: rect, dim: dim,
@@ -119,8 +121,12 @@ func decodeVarDCTLowFrequency(_ d: FrameDecoder) throws -> VarDCTLowFrequency {
     meta.varblockCount = totalVarblocks
     meta.usedACs = usedACs
 
-    adaptiveDCSmoothing(
-        dcFactors: dequant.mulDC, w: bw, h: bh, x: &planeX, y: &planeY, b: &planeB)
+    // libjxl runs adaptive smoothing only for 4:4:4 frames without the
+    // kSkipAdaptiveDCSmoothing flag (JPEG transcodes set it).
+    if d.frameHeader.flags & 128 == 0 && d.frameHeader.chromaIs444 {
+        adaptiveDCSmoothing(
+            dcFactors: dequant.mulDC, w: bw, h: bh, x: &planeX, y: &planeY, b: &planeB)
+    }
 
     let dc = VarDCTDCImage(widthBlocks: bw, heightBlocks: bh, x: planeX, y: planeY, b: planeB)
     return VarDCTLowFrequency(dc: dc, metadata: meta)
@@ -140,49 +146,118 @@ func decodeVarDCTLowFrequency(_ d: FrameDecoder) throws -> VarDCTLowFrequency {
 }
 
 /// Decodes and dequantizes one DC group's `VarDCTDC` stream into the planes.
-/// Mirrors `ModularFrameDecoder::DecodeVarDCTDC` + `DequantDC` (4:4:4 path).
+/// Mirrors `ModularFrameDecoder::DecodeVarDCTDC` + `DequantDC`. Subsampled
+/// channels occupy the top-left `(w >> h, h >> v)` region of their full-stride
+/// plane, exactly like libjxl's shifted rects into the shared DC image.
 private func decodeVarDCTDC(
     _ br: BitReader, groupIndex: Int, rectW: Int, rectH: Int,
-    dcGlobal: VarDCTDCGlobalDecoded, dequant: DCDequant,
+    dcGlobal: VarDCTDCGlobalDecoded, dequant: DCDequant, shifts: (h: [Int], v: [Int]),
     destX: inout [Float], destY: inout [Float], destB: inout [Float],
-    destW: Int, x0: Int, y0: Int
+    destW: Int, x0: Int, y0: Int, dcQuantContext: inout [UInt8]
 ) throws {
     // extra_precision: 2 bits; mul = 1 / (1 << extra_precision).
     let extraPrecision = Int(br.read(2))
     let mul = 1.0 / Float(1 << extraPrecision)
 
-    // 3 channels at block resolution. libjxl reorders channels via
-    // `c < 2 ? c^1 : c`; for 4:4:4 that only affects which channel index gets a
-    // subsampling shift, so with no subsampling we decode channels 0,1,2 in
-    // order. After decode: channel[0]=Y(luma), channel[1]=X, channel[2]=B.
+    // 3 channels at block resolution, modular order [Y, X, B]: libjxl assigns
+    // plane channel c to modular channel `c < 2 ? c^1 : c` and shrinks it by
+    // that plane channel's subsampling shift (floor).
     let image = ModularImage(
         w: rectW, h: rectH, bitdepth: 8, channelCount: 3)
+    for c in 0..<3 {
+        let mc = c < 2 ? c ^ 1 : c
+        image.channels[mc] = ModularChannel(
+            w: rectW >> shifts.h[c], h: rectH >> shifts.v[c])
+    }
     // group_id property (props[1]) = ModularStreamId::VarDCTDC(group).ID = 1 + group.
     let streamID = 1 + groupIndex
     _ = try modularDecode(
         br, image: image, groupID: streamID,
         globalTree: dcGlobal.tree, globalCode: dcGlobal.code, globalCtxMap: dcGlobal.ctxMap)
 
-    // DequantDC (4:4:4): in.channel[0]=Y, [1]=X, [2]=B.
-    let facX = dequant.mulDC[0] * mul
-    let facY = dequant.mulDC[1] * mul
-    let facB = dequant.mulDC[2] * mul
-    let cflX = dequant.cfl[0]
-    let cflB = dequant.cfl[2]
-    let qY = image.channels[0].pixels
-    let qX = image.channels[1].pixels
-    let qB = image.channels[2].pixels
+    let is444 = shifts.h == [0, 0, 0] && shifts.v == [0, 0, 0]
+    if is444 {
+        // DequantDC (4:4:4): in.channel[0]=Y, [1]=X, [2]=B, with DC CfL.
+        let facX = dequant.mulDC[0] * mul
+        let facY = dequant.mulDC[1] * mul
+        let facB = dequant.mulDC[2] * mul
+        let cflX = dequant.cfl[0]
+        let cflB = dequant.cfl[2]
+        let qY = image.channels[0].pixels
+        let qX = image.channels[1].pixels
+        let qB = image.channels[2].pixels
 
-    for yy in 0..<rectH {
-        let srcRow = yy * rectW
-        let dstRow = (y0 + yy) * destW + x0
-        for xx in 0..<rectW {
-            let inY = Float(qY[srcRow + xx]) * facY
-            let inX = Float(qX[srcRow + xx]) * facX
-            let inB = Float(qB[srcRow + xx]) * facB
-            destY[dstRow + xx] = inY
-            destX[dstRow + xx] = inY * cflX + inX
-            destB[dstRow + xx] = inY * cflB + inB
+        for yy in 0..<rectH {
+            let srcRow = yy * rectW
+            let dstRow = (y0 + yy) * destW + x0
+            for xx in 0..<rectW {
+                let inY = Float(qY[srcRow + xx]) * facY
+                let inX = Float(qX[srcRow + xx]) * facX
+                let inB = Float(qB[srcRow + xx]) * facB
+                destY[dstRow + xx] = inY
+                destX[dstRow + xx] = inY * cflX + inX
+                destB[dstRow + xx] = inY * cflB + inB
+            }
+        }
+    } else {
+        // Subsampled (libjxl DequantDC non-444 path): per-channel factor, no
+        // DC CfL, shifted rects.
+        func dequantChannel(_ c: Int, _ dest: inout [Float]) {
+            let mc = c < 2 ? c ^ 1 : c
+            let q = image.channels[mc].pixels
+            let w = rectW >> shifts.h[c]
+            let h = rectH >> shifts.v[c]
+            let dx0 = x0 >> shifts.h[c]
+            let dy0 = y0 >> shifts.v[c]
+            let fac = dequant.mulDC[c] * mul
+            for yy in 0..<h {
+                let srcRow = yy * w
+                let dstRow = (dy0 + yy) * destW + dx0
+                for xx in 0..<w {
+                    dest[dstRow + xx] = Float(q[srcRow + xx]) * fac
+                }
+            }
+        }
+        dequantChannel(1, &destY)
+        dequantChannel(0, &destX)
+        dequantChannel(2, &destB)
+    }
+
+    // quant_dc (libjxl DequantDC tail): per-block DC context byte from the
+    // quantized values, bucketed by the block context map's DC thresholds.
+    // Channel mapping mirrors libjxl: plane c reads modular channel
+    // `c < 2 ? c^1 : c` at that plane's subsampling shift.
+    let bctx = dcGlobal.info.blockContextMap
+    if bctx.numDCContexts > 1 {
+        let tX = bctx.dcThresholds[0]
+        let tY = bctx.dcThresholds[1]
+        let tB = bctx.dcThresholds[2]
+        let qX = image.channels[1].pixels
+        let qY = image.channels[0].pixels
+        let qB = image.channels[2].pixels
+        let wX = rectW >> shifts.h[0]
+        let wY = rectW >> shifts.h[1]
+        let wB = rectW >> shifts.h[2]
+        for y in 0..<rectH {
+            let rowX = (y >> shifts.v[0]) * wX
+            let rowY = (y >> shifts.v[1]) * wY
+            let rowB = (y >> shifts.v[2]) * wB
+            let dstRow = (y0 + y) * destW + x0
+            for x in 0..<rectW {
+                var bucketX = 0
+                var bucketY = 0
+                var bucketB = 0
+                let vX = qX[rowX + (x >> shifts.h[0])]
+                let vY = qY[rowY + (x >> shifts.h[1])]
+                let vB = qB[rowB + (x >> shifts.h[2])]
+                for t in tX where vX > t { bucketX += 1 }
+                for t in tY where vY > t { bucketY += 1 }
+                for t in tB where vB > t { bucketB += 1 }
+                var bucket = bucketX
+                bucket = bucket * (tB.count + 1) + bucketB
+                bucket = bucket * (tY.count + 1) + bucketY
+                dcQuantContext[dstRow + x] = UInt8(truncatingIfNeeded: bucket)
+            }
         }
     }
 }

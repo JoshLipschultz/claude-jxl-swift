@@ -382,6 +382,93 @@ private struct ConvertState: @unchecked Sendable {
     }
 }
 
+// MARK: - YCbCr output (JPEG transcodes; libjxl stage_ycbcr.cc)
+
+/// Full-range BT.601 as defined by JFIF Clause 7. The planes hold Cb (x slot),
+/// Y' (y slot), Cr (b slot); the result is already display-encoded (no
+/// transfer function), so quantization is a plain round to 8 bits.
+@inline(__always)
+private func ycbcrPixel(_ cb: Float, _ y: Float, _ cr: Float) -> (UInt8, UInt8, UInt8) {
+    let c128: Float = 128.0 / 255
+    let yy = y + c128
+    let r = yy + 1.402 * cr
+    let g = yy + (-0.114 * 1.772 / 0.587) * cb + (-0.299 * 1.402 / 0.587) * cr
+    let b = yy + 1.772 * cb
+    @inline(__always) func to8(_ v: Float) -> UInt8 {
+        UInt8(max(0, min(255, (v * 255).rounded())))
+    }
+    return (to8(r), to8(g), to8(b))
+}
+
+/// Converts YCbCr planes to three planar 8-bit RGB channels, row-parallel.
+func ycbcrToRGB8Planes(_ img: XYBImage) -> [[Int32]] {
+    let width = img.width
+    let stride = img.stride
+    var planeR = [Int32](repeating: 0, count: img.width * img.height)
+    var planeG = planeR
+    var planeB = planeR
+    planeR.withUnsafeMutableBufferPointer { rBuf in
+    planeG.withUnsafeMutableBufferPointer { gBuf in
+    planeB.withUnsafeMutableBufferPointer { bBuf in
+    img.x.withUnsafeBufferPointer { xBuf in
+    img.y.withUnsafeBufferPointer { yBuf in
+    img.b.withUnsafeBufferPointer { bSrcBuf in
+        nonisolated(unsafe) let pr = rBuf.baseAddress!
+        nonisolated(unsafe) let pg = gBuf.baseAddress!
+        nonisolated(unsafe) let pbOut = bBuf.baseAddress!
+        nonisolated(unsafe) let pcb = xBuf.baseAddress!
+        nonisolated(unsafe) let py = yBuf.baseAddress!
+        nonisolated(unsafe) let pcr = bSrcBuf.baseAddress!
+        DispatchQueue.concurrentPerform(iterations: img.height) { y in
+            let row = y * stride
+            let dstRow = y * width
+            for x in 0..<width {
+                let (r, g, b) = ycbcrPixel(pcb[row + x], py[row + x], pcr[row + x])
+                pr[dstRow + x] = Int32(r)
+                pg[dstRow + x] = Int32(g)
+                pbOut[dstRow + x] = Int32(b)
+            }
+        }
+    }
+    }
+    }
+    }
+    }
+    }
+    return [planeR, planeG, planeB]
+}
+
+/// Converts YCbCr planes to interleaved 8-bit RGB, row-parallel.
+func ycbcrToRGB8Interleaved(_ img: XYBImage) -> [UInt8] {
+    var rgb = [UInt8](repeating: 0, count: img.width * img.height * 3)
+    let width = img.width
+    let stride = img.stride
+    img.x.withUnsafeBufferPointer { xBuf in
+    img.y.withUnsafeBufferPointer { yBuf in
+    img.b.withUnsafeBufferPointer { bBuf in
+    rgb.withUnsafeMutableBufferPointer { outBuf in
+        nonisolated(unsafe) let pcb = xBuf.baseAddress!
+        nonisolated(unsafe) let py = yBuf.baseAddress!
+        nonisolated(unsafe) let pcr = bBuf.baseAddress!
+        nonisolated(unsafe) let out = outBuf.baseAddress!
+        DispatchQueue.concurrentPerform(iterations: img.height) { y in
+            let row = y * stride
+            var dst = y * width * 3
+            for x in 0..<width {
+                let (r, g, b) = ycbcrPixel(pcb[row + x], py[row + x], pcr[row + x])
+                out[dst] = r
+                out[dst + 1] = g
+                out[dst + 2] = b
+                dst += 3
+            }
+        }
+    }
+    }
+    }
+    }
+    return rgb
+}
+
 /// Converts XYB planes to interleaved 8-bit output (RGB, row-major, unpadded),
 /// row-parallel.
 func xybToRGB8Interleaved(_ img: XYBImage, spec: OutputColorSpec) -> [UInt8] {

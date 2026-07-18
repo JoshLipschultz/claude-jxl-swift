@@ -32,6 +32,9 @@ let kStrategyOrder: [Int] = [
     public let orders: [[[UInt32]]]
     public let codes: [ANSCode]
     public let contextMaps: [[UInt8]]
+    /// RAW-encoded dequant tables by quant-table index (nil = library default).
+    /// JPEG transcodes carry their original quant tables this way.
+    public let customDequant: [[Float]?]
 }
 
 /// Hybrid-uint token of `val` under config(0,0,0), clamped — libjxl
@@ -203,16 +206,55 @@ private let kOrderEnc1 = U32Choice.value(0x13)
 private let kOrderEnc2 = U32Choice.value(0)
 private let kOrderEnc3 = U32Choice.bits(13)
 
-/// libjxl `FrameDecoder::ProcessACGlobal` (parse only; dequant weights deferred).
-/// `br` is positioned at the start of the HfGlobal/AC-global section.
+/// libjxl `FrameDecoder::ProcessACGlobal`. `br` is positioned at the start of
+/// the HfGlobal/AC-global section. `dcGlobal` supplies the global modular
+/// tree, which RAW quant tables (JPEG transcodes) are coded with.
 func decodeVarDCTACGlobal(
     _ br: BitReader, dim: FrameDimensions, numPasses: Int,
-    blockContextMap: VarDCTBlockContextMap, usedACs: UInt32
+    blockContextMap: VarDCTBlockContextMap, usedACs: UInt32,
+    dcGlobal: VarDCTDCGlobalDecoded
 ) throws -> VarDCTACGlobal {
-    // DequantMatrices::Decode — default tables read just the "all default" bit;
-    // custom tables (not in the fixtures) would parse encodings here.
+    // DequantMatrices::Decode: default tables read just the "all default" bit;
+    // otherwise all 17 table encodings follow. Library (mode 0) and RAW
+    // (mode 7, modular-coded original quant tables) are supported.
     let dequantDefault = br.read(1) == 1
-    guard dequantDefault else { throw JXLError.unsupported("custom VarDCT dequant matrices") }
+    var customDequant = [[Float]?](repeating: nil, count: kNumQuantTablesTotal)
+    if !dequantDefault {
+        for idx in 0..<kNumQuantTablesTotal {
+            let mode = br.read(3)
+            switch mode {
+            case 0:  // Library (kCeilLog2NumPredefinedTables == 0: no index bits)
+                break
+            case 7:  // RAW: F16 denominator + modular-coded 3-channel table
+                let den = br.readF16()
+                guard den > 1e-8 else { throw JXLError.malformed("invalid qtable_den") }
+                let w = kRequiredQuantSizeX[idx] * 8
+                let h = kRequiredQuantSizeY[idx] * 8
+                let image = ModularImage(w: w, h: h, bitdepth: 8, channelCount: 3)
+                // ModularStreamId::QuantTable(idx).ID
+                let streamID = 1 + 3 * dim.numDCGroups + idx
+                _ = try modularDecode(
+                    br, image: image, groupID: streamID,
+                    globalTree: dcGlobal.tree, globalCode: dcGlobal.code,
+                    globalCtxMap: dcGlobal.ctxMap)
+                // ComputeQuantTable RAW: inverse weights are 1/(den*qtable) and
+                // the final dequant table inverts them, i.e. den * qtable, in
+                // the same layout the coefficient storage uses.
+                let num = w * h
+                var weights = [Float](repeating: 0, count: 3 * num)
+                for c in 0..<3 {
+                    let q = image.channels[c].pixels
+                    for i in 0..<num {
+                        guard q[i] > 0 else { throw JXLError.malformed("invalid raw qtable") }
+                        weights[c * num + i] = den * Float(q[i])
+                    }
+                }
+                customDequant[idx] = weights
+            default:
+                throw JXLError.unsupported("custom VarDCT quant mode \(mode)")
+            }
+        }
+    }
 
     let numHistograms = 1 + Int(br.read(ceilLog2Nonzero(UInt32(dim.numGroups))))
 
@@ -231,5 +273,13 @@ func decodeVarDCTACGlobal(
     }
     try br.ensureInBounds("VarDCT AC global")
     return VarDCTACGlobal(
-        numHistograms: numHistograms, orders: orders, codes: codes, contextMaps: ctxMaps)
+        numHistograms: numHistograms, orders: orders, codes: codes, contextMaps: ctxMaps,
+        customDequant: customDequant)
 }
+
+/// Total quant tables in the codestream (libjxl kNumQuantTables), including
+/// the DCT64+ kinds beyond the reconstruction's supported range.
+let kNumQuantTablesTotal = 17
+/// libjxl `DequantMatrices::required_size_x/y` (in 8x8 blocks) per table index.
+let kRequiredQuantSizeX = [1, 1, 1, 1, 2, 4, 1, 1, 2, 1, 1, 8, 4, 16, 8, 32, 16]
+let kRequiredQuantSizeY = [1, 1, 1, 1, 2, 4, 2, 4, 4, 1, 1, 8, 8, 16, 16, 32, 32]

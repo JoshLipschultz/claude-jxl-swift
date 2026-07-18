@@ -11,10 +11,12 @@ private let kNumQuantTables = 17
 private let kLog2NumQuantModes = 3
 private let kCeilLog2NumPredefinedTables = 0
 private let kNumPredefinedTables = 1
-private let kColorFactorDist0 = U32Choice.bits(2, offset: 84)
-private let kColorFactorDist1 = U32Choice.bits(3, offset: 88)
-private let kColorFactorDist2 = U32Choice.bits(4, offset: 72)
-private let kColorFactorDist3 = U32Choice.bits(6, offset: 0)
+// kColorFactorDist (chroma_from_luma.h): U32Enc(Val(84), Val(256),
+// BitsOffset(8, 2), BitsOffset(16, 258)).
+private let kColorFactorDist0 = U32Choice.value(84)
+private let kColorFactorDist1 = U32Choice.value(256)
+private let kColorFactorDist2 = U32Choice.bits(8, offset: 2)
+private let kColorFactorDist3 = U32Choice.bits(16, offset: 258)
 // kOrderEnc = U32Enc(Val(0x5F), Val(0x13), Val(0), Bits(kNumOrders=13)).
 private let kOrderEnc0 = U32Choice.value(0x5F)
 private let kOrderEnc1 = U32Choice.value(0x13)
@@ -276,8 +278,9 @@ private func readColorCorrelationDC(_ br: BitReader) -> VarDCTColorCorrelationIn
         kColorFactorDist0, kColorFactorDist1, kColorFactorDist2, kColorFactorDist3)
     let baseX = br.readF16()
     let baseB = br.readF16()
-    let yToX = Int8(bitPattern: UInt8(truncatingIfNeeded: br.read(8)))
-    let yToB = Int8(bitPattern: UInt8(truncatingIfNeeded: br.read(8)))
+    // libjxl: ytox_dc = ReadFixedBits<8>() - 128 (biased, not two's complement).
+    let yToX = Int8(truncatingIfNeeded: Int(br.read(8)) - 128)
+    let yToB = Int8(truncatingIfNeeded: Int(br.read(8)) - 128)
     return VarDCTColorCorrelationInfo(
         allDefault: false, colorFactor: colorFactor, baseCorrelationX: baseX,
         baseCorrelationB: baseB, yToXDC: yToX, yToBDC: yToB)
