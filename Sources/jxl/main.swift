@@ -122,6 +122,9 @@ do {
             print("frame \(i): \(frame.image.width) x \(frame.image.height)  duration \(frame.durationTicks) ticks -> \(path)")
         }
 
+    case "jbrd":
+        print(try describeJBRD(from: bytes))
+
     case "vardct":
         let info = try JXL.readVarDCTInfo(from: bytes)
         print(

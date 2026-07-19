@@ -76,6 +76,7 @@ struct TestRunner {
         squeeze()
         animation()
         brotli()
+        jbrdParse()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -264,6 +265,35 @@ struct TestRunner {
             let truncated = [UInt8](compressed.prefix(compressed.count / 2))
             _ = try? Brotli.decompress(truncated, maxOutputSize: 16 << 20)
             check(true, "brotli truncated stream handled without crashing")
+        }
+    }
+
+    // MARK: - jbrd (JPEG reconstruction metadata)
+
+    /// `256x192_jbrd.jxl` is a cjxl --lossless_jpeg=1 transcode of
+    /// `256x192_jbrd.jpg` (sips, quality 85). The jbrd bundle + Brotli tail
+    /// must parse with the structure of that JPEG; byte-exact reconstruction
+    /// lands with the JPEG writer.
+    static func jbrdParse() {
+        let dir = fixturesDir()
+        guard let jxl = try? Data(contentsOf: dir.appendingPathComponent("256x192_jbrd.jxl")),
+            let parsed = try? JXLContainer.parse([UInt8](jxl)),
+            let box = parsed.boxes.first(where: { $0.type == "jbrd" })
+        else {
+            check(false, "jbrd fixture has a jbrd box")
+            return
+        }
+        do {
+            let d = try parseJPEGReconData(Array([UInt8](jxl)[box.payload]))
+            check(d.markerOrder.last == 0xD9, "jbrd marker order ends at EOI")
+            check(d.components.count == 3 && d.components.map(\.id) == [1, 2, 3],
+                "jbrd YCbCr components")
+            check(d.quant.count == 2 && d.huffmanCodes.count == 4, "jbrd tables")
+            check(d.scans.count == 1 && d.scans[0].ss == 0 && d.scans[0].se == 63,
+                "jbrd sequential scan")
+            check(d.restartInterval > 0, "jbrd restart interval")
+        } catch {
+            check(false, "jbrd parses (\(error))")
         }
     }
 
