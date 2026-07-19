@@ -80,6 +80,7 @@ struct TestRunner {
         hdrOutput()
         frameBlending()
         float32Modular()
+        orientationBaking()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -157,6 +158,36 @@ struct TestRunner {
             }
         }
         return (w, h, planes)
+    }
+
+    // MARK: - EXIF orientation baking
+
+    /// `JXL.applyOrientation` against hand-computed expectations on a 3x2
+    /// raster (values = source index, so every position is distinguishable).
+    static func orientationBaking() {
+        // Source (w=3, h=2): 0 1 2 / 3 4 5.
+        let src = JXLDecodedImage(
+            width: 3, height: 2, colorChannels: 1, extraChannels: 0,
+            bitsPerSample: 8, isFloat: false, planes: [[0, 1, 2, 3, 4, 5]],
+            iccProfile: nil)
+        let expected: [UInt32: (w: Int, h: Int, px: [Int32])] = [
+            1: (3, 2, [0, 1, 2, 3, 4, 5]),
+            2: (3, 2, [2, 1, 0, 5, 4, 3]),  // mirror horizontal
+            3: (3, 2, [5, 4, 3, 2, 1, 0]),  // rotate 180
+            4: (3, 2, [3, 4, 5, 0, 1, 2]),  // mirror vertical
+            5: (2, 3, [0, 3, 1, 4, 2, 5]),  // transpose
+            6: (2, 3, [3, 0, 4, 1, 5, 2]),  // rotate 90 CW
+            7: (2, 3, [5, 2, 4, 1, 3, 0]),  // transverse
+            8: (2, 3, [2, 5, 1, 4, 0, 3]),  // rotate 90 CCW
+        ]
+        for (o, exp) in expected.sorted(by: { $0.key < $1.key }) {
+            let out = JXL.applyOrientation(src, orientation: o)
+            eq(out.width, exp.w, "orientation \(o) width")
+            eq(out.height, exp.h, "orientation \(o) height")
+            eq(out.planes[0], exp.px, "orientation \(o) pixels")
+        }
+        FileHandle.standardError.write(
+            Data("  [orientation] all 8 EXIF orientations verified\n".utf8))
     }
 
     // MARK: - Embedded ICC profiles (M8)

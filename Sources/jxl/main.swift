@@ -108,7 +108,11 @@ do {
             default: usage()
             }
         }
-        let image = try JXL.decodeImage(from: bytes, format: format)
+        var image = try JXL.decodeImage(from: bytes, format: format)
+        // Match djxl: EXIF orientation is applied to the output raster.
+        if let info = try? JXL.readInfo(from: bytes), info.orientation != 1 {
+            image = JXL.applyOrientation(image, orientation: info.orientation)
+        }
         let wantPAM = args[3].lowercased().hasSuffix(".pam")
         let out =
             image.isFloat

@@ -166,7 +166,73 @@ public enum JXL {
         from data: [UInt8], limits: JXLDecodeLimits = .default,
         format: JXLSampleFormat = .uint8
     ) throws -> JXLDecodedImage {
-        try FrameDecoder(data: data, limits: limits).decodeImage(format: format)
+        let decoder = try FrameDecoder(data: data, limits: limits)
+        let header = decoder.frameHeader
+        // Layered stills: the presented frame may be one of several layers,
+        // cropped/offset against the canvas, or blended onto a background —
+        // libjxl renders the full layer sequence. Composite through the frame
+        // pipeline and return the finished canvas. Animations keep first-frame
+        // semantics (decodeFrames is the animation API).
+        let coversCanvas =
+            !header.customSizeOrOrigin
+            || (header.frameX0 == 0 && header.frameY0 == 0
+                && (header.frameWidth == 0 || header.frameWidth == decoder.size.width)
+                && (header.frameHeight == 0 || header.frameHeight == decoder.size.height))
+        if !decoder.metadata.hasAnimation
+            && (!header.isLast || !coversCanvas || header.needsBlending)
+        {
+            let frames = try decodeFrames(
+                from: data, limits: limits, maxFrames: 256, format: format)
+            guard let last = frames.last, last.isLast else {
+                throw JXLError.unsupported("layered still with too many layers")
+            }
+            return last.image
+        }
+        return try decoder.decodeImage(format: format)
+    }
+
+    /// Returns `image` with an EXIF orientation baked into the pixel planes
+    /// (the raster equivalent of libjxl's default orientation handling).
+    /// Orientation 1 (or anything unrecognised) returns the image unchanged;
+    /// orientations 5–8 swap the output dimensions.
+    public static func applyOrientation(
+        _ image: JXLDecodedImage, orientation: UInt32
+    ) -> JXLDecodedImage {
+        guard (2...8).contains(orientation) else { return image }
+        let w = image.width
+        let h = image.height
+        let swap = orientation >= 5
+        let outW = swap ? h : w
+        let outH = swap ? w : h
+        // Source coordinates for display pixel (ox, oy).
+        @inline(__always) func source(_ ox: Int, _ oy: Int) -> Int {
+            let sx: Int
+            let sy: Int
+            switch orientation {
+            case 2: sx = w - 1 - ox; sy = oy
+            case 3: sx = w - 1 - ox; sy = h - 1 - oy
+            case 4: sx = ox; sy = h - 1 - oy
+            case 5: sx = oy; sy = ox
+            case 6: sx = oy; sy = h - 1 - ox
+            case 7: sx = w - 1 - oy; sy = h - 1 - ox
+            case 8: sx = w - 1 - oy; sy = ox
+            default: sx = ox; sy = oy
+            }
+            return sy * w + sx
+        }
+        let planes = image.planes.map { plane -> [Int32] in
+            var out = [Int32](repeating: 0, count: outW * outH)
+            for oy in 0..<outH {
+                for ox in 0..<outW {
+                    out[oy * outW + ox] = plane[source(ox, oy)]
+                }
+            }
+            return out
+        }
+        return JXLDecodedImage(
+            width: outW, height: outH, colorChannels: image.colorChannels,
+            extraChannels: image.extraChannels, bitsPerSample: image.bitsPerSample,
+            isFloat: image.isFloat, planes: planes, iccProfile: image.iccProfile)
     }
 
     public static func decodeImage(
