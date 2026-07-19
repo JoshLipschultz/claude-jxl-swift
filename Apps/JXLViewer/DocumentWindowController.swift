@@ -19,6 +19,22 @@ final class DocumentWindowController: NSWindowController, NSMenuItemValidation {
     private var inspectorPanel: NSPanel?
     private var decodeGeneration = 0
 
+    // Animation playback state (all main-actor). One-shot timers chained per
+    // frame honor the file's variable per-frame durations.
+    private var animationTimer: Timer?
+    private var animationFrames: [CGImage] = []
+    private var animationDurations: [TimeInterval] = []
+    private var animationIndex = 0
+    /// Full passes still to play; 0 stands for "forever" (file numLoops == 0).
+    private var animationLoopsRemaining: UInt32 = 0
+    private var animationLoopsForever = false
+    /// The status text playback annotations append to ("… — frame 3/12").
+    private var baseStatus = ""
+
+    // No deinit invalidation needed: timers are one-shot with a weak self, so
+    // after the controller goes away the single pending fire no-ops and the
+    // chain ends.
+
     // MARK: - Construction
 
     init() {
@@ -145,6 +161,7 @@ final class DocumentWindowController: NSWindowController, NSMenuItemValidation {
         window?.title = name
         statusLabel.stringValue = "Decoding \(name)…"
 
+        stopAnimation()
         decodeGeneration += 1
         let generation = decodeGeneration
         let start = DispatchTime.now().uptimeNanoseconds
@@ -174,11 +191,98 @@ final class DocumentWindowController: NSWindowController, NSMenuItemValidation {
             guard let self, generation == self.decodeGeneration else { return }
             let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
             self.canvas.setImage(result.image, sampler: result.sampler)
-            self.statusLabel.stringValue = result.didDecode
+            self.baseStatus = result.didDecode
                 ? String(format: "%@ — %.0f ms", result.summary, ms)
                 : result.summary
+            self.statusLabel.stringValue = self.baseStatus
             self.inspector.setReport(result.report)
+            // Stage 3 (animated files only): decode all frames in the
+            // background, then play. The still first frame above already
+            // landed, so this never delays first pixels; for stills the stage
+            // exits after a header read.
+            if result.didDecode { self.startAnimationDecode(data, generation: generation) }
         }
+    }
+
+    // MARK: - Animation playback
+
+    private func startAnimationDecode(_ data: Data, generation: Int) {
+        Task { [weak self] in
+            let outcome = await Task.detached(priority: .utility) {
+                DecodePipeline.decodeAnimation(data)
+            }.value
+            guard let self, generation == self.decodeGeneration else { return }
+            switch outcome {
+            case .animation(let animation):
+                self.startAnimation(animation, generation: generation)
+            case .tooLarge:
+                self.statusLabel.stringValue =
+                    self.baseStatus + " — animation too large; showing first frame"
+            case .notAnimated, .failed:
+                break  // the still first frame stays; decode() already reported
+            }
+        }
+    }
+
+    private func startAnimation(_ animation: AnimationResult, generation: Int) {
+        guard animation.frames.count > 1 else { return }
+        animationFrames = animation.frames
+        animationDurations = animation.durations
+        animationIndex = 0
+        animationLoopsForever = animation.numLoops == 0
+        animationLoopsRemaining = animation.numLoops
+        showCurrentAnimationFrame()
+        scheduleNextAnimationFrame(generation: generation)
+    }
+
+    private func showCurrentAnimationFrame() {
+        canvas.setAnimationFrame(animationFrames[animationIndex])
+        statusLabel.stringValue =
+            baseStatus + " — frame \(animationIndex + 1)/\(animationFrames.count)"
+    }
+
+    private func scheduleNextAnimationFrame(generation: Int) {
+        // Clamp pathological zero/near-zero durations the way browsers do for
+        // GIFs, so a malformed file can't spin the main run loop.
+        let duration = max(animationDurations[animationIndex], 0.02)
+        let timer = Timer(timeInterval: duration, repeats: false) { [weak self] _ in
+            self?.advanceAnimation(generation: generation)
+        }
+        // .common keeps frames advancing during scroll and live zoom.
+        RunLoop.main.add(timer, forMode: .common)
+        animationTimer = timer
+    }
+
+    private func advanceAnimation(generation: Int) {
+        guard generation == decodeGeneration, window != nil, !animationFrames.isEmpty else {
+            stopAnimation()
+            return
+        }
+        if animationIndex == animationFrames.count - 1 {
+            // A full pass just finished. Finite loop counts tick down and end
+            // by holding the last frame on screen.
+            if !animationLoopsForever {
+                animationLoopsRemaining -= 1
+                if animationLoopsRemaining == 0 {
+                    animationTimer = nil
+                    statusLabel.stringValue = baseStatus + " — \(animationFrames.count) frames"
+                    return
+                }
+            }
+            animationIndex = 0
+        } else {
+            animationIndex += 1
+        }
+        showCurrentAnimationFrame()
+        scheduleNextAnimationFrame(generation: generation)
+    }
+
+    private func stopAnimation() {
+        animationTimer?.invalidate()
+        animationTimer = nil
+        animationFrames = []
+        animationDurations = []
+        animationIndex = 0
     }
 
     // MARK: - Menu actions (reached via the responder chain)

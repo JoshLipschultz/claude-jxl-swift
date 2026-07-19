@@ -27,6 +27,31 @@ struct DecodeResult: @unchecked Sendable {
     var didDecode: Bool { image != nil }
 }
 
+/// A fully decoded animation ready for playback. `@unchecked` for the same
+/// reason as `DecodeResult`: `CGImage` is immutable.
+struct AnimationResult: @unchecked Sendable {
+    /// One CGImage per presented frame, in presentation order.
+    let frames: [CGImage]
+    /// Per-frame durations in seconds (parallel to `frames`).
+    let durations: [TimeInterval]
+    /// Number of times to play the sequence; 0 = loop forever.
+    let numLoops: UInt32
+}
+
+/// What the third (animation) decode stage produced.
+enum AnimationDecodeOutcome: @unchecked Sendable {
+    /// Still image (or single presented frame) — nothing to play.
+    case notAnimated
+    /// All frames decoded; start playback.
+    case animation(AnimationResult)
+    /// The frames would exceed the decoded-frame memory cap; the still first
+    /// frame stays up and the status bar notes why.
+    case tooLarge
+    /// Frame decoding failed (e.g. non-replace composition is unsupported);
+    /// the still first frame stays up.
+    case failed
+}
+
 /// Read-only view over the decoded planes so the inspector can report the native
 /// sample values under the cursor. A value type, hence Sendable.
 struct PixelSampler: Sendable {
@@ -130,6 +155,57 @@ enum DecodePipeline {
                 image: nil, sampler: nil,
                 summary: "✗ \(name): \(reason)", report: report)
         }
+    }
+
+    /// Cap on total retained CGImage frame memory for an animation (~512 MB).
+    /// Beyond it we keep the still first frame rather than risk ballooning.
+    private static let animationMemoryCap = 512 << 20
+
+    /// Decodes every frame of an animated file into CGImages plus per-frame
+    /// durations. Cheap for stills: a header read answers `.notAnimated`
+    /// before any pixel work. Never throws — any failure means the caller
+    /// keeps showing the still first frame it already has.
+    static func decodeAnimation(_ data: Data) -> AnimationDecodeOutcome {
+        guard let info = try? JXL.readInfo(from: data),
+            info.hasAnimation, let anim = info.animation,
+            anim.tpsNumerator > 0
+        else { return .notAnimated }
+
+        // Bound the number of frames we retain so total CGImage memory stays
+        // under the cap (RGBA8 = 4 bytes/px; HDR frames convert at 16-bit).
+        let isHDR =
+            info.colorEncoding.transferFunction == 16
+            || info.colorEncoding.transferFunction == 18
+        let bytesPerFrame = max(1, Int(info.width) * Int(info.height) * (isHDR ? 8 : 4))
+        let maxFrames = max(1, animationMemoryCap / bytesPerFrame)
+
+        let frames: [JXL.Frame]
+        do {
+            frames = try JXL.decodeFrames(from: data, maxFrames: maxFrames)
+        } catch {
+            return .failed
+        }
+        guard frames.count > 1 else { return .notAnimated }
+        // decodeFrames stopped at maxFrames before reaching the last frame:
+        // the full sequence would blow the memory cap.
+        guard frames.last?.isLast == true else { return .tooLarge }
+
+        let secondsPerTick = Double(anim.tpsDenominator) / Double(anim.tpsNumerator)
+        var images: [CGImage] = []
+        var durations: [TimeInterval] = []
+        images.reserveCapacity(frames.count)
+        durations.reserveCapacity(frames.count)
+        for frame in frames {
+            guard
+                let cg = try? JXLImageConverter.makeCGImage(
+                    from: frame.image, orientation: info.orientation,
+                    colorEncoding: info.colorEncoding)
+            else { return .failed }
+            images.append(cg)
+            durations.append(Double(frame.durationTicks) * secondsPerTick)
+        }
+        return .animation(
+            AnimationResult(frames: images, durations: durations, numLoops: anim.numLoops))
     }
 
     private static func summarize(info: JXLImageInfo, image: JXLDecodedImage) -> String {

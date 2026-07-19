@@ -77,6 +77,18 @@ final class ImageCanvasView: NSView {
         if !hadImage { zoomToFit() }
     }
 
+    /// Swaps the displayed animation frame: a layer-contents update only, no
+    /// layout, zoom, or scroll change. Frames are full-image-sized, so the
+    /// document view's geometry is already correct.
+    func setAnimationFrame(_ image: CGImage) {
+        documentImageView.setAnimationFrame(image)
+    }
+
+    /// Ends animation display; the still full image (or preview) shows again.
+    func clearAnimationFrame() {
+        documentImageView.clearAnimationFrame()
+    }
+
     @objc private func clipBoundsChanged(_ note: Notification) { pushEffectiveScale() }
 
     override func viewDidMoveToWindow() {
@@ -166,6 +178,8 @@ private final class DocumentImageView: NSView {
 
     private var previewImage: CGImage?
     private var fullImage: CGImage?
+    /// Current animation frame; overrides preview/full while playback runs.
+    private var animationFrame: CGImage?
     private var displayed: CGImage?
     private var sampler: PixelSampler?
     private var effectiveScale: CGFloat = 1
@@ -213,7 +227,8 @@ private final class DocumentImageView: NSView {
         layer.backgroundColor = displayed == nil ? nil : Self.checkerboard
         // Crisp pixels when zoomed in on the real image, smooth scaling for the
         // preview (only ever shown upscaled-while-waiting or far zoomed out).
-        layer.magnificationFilter = displayed === fullImage ? .nearest : .linear
+        layer.magnificationFilter =
+            (displayed === fullImage || displayed === animationFrame) ? .nearest : .linear
         layer.minificationFilter = .linear
     }
 
@@ -221,12 +236,14 @@ private final class DocumentImageView: NSView {
 
     func setPreview(_ image: CGImage, displaySize: CGSize) {
         previewImage = image
+        animationFrame = nil  // a new document's decode supersedes any playback
         if displaySize != frame.size { setFrameSize(displaySize) }
         refreshDisplayedImage(force: true)
     }
 
     func setFull(_ image: CGImage?, sampler: PixelSampler?) {
         fullImage = image
+        animationFrame = nil  // a new document's decode supersedes any playback
         self.sampler = sampler
         if let image {
             let size = CGSize(width: image.width, height: image.height)
@@ -241,11 +258,23 @@ private final class DocumentImageView: NSView {
         refreshDisplayedImage(force: false)
     }
 
+    func setAnimationFrame(_ image: CGImage) {
+        animationFrame = image
+        refreshDisplayedImage(force: false)
+    }
+
+    func clearAnimationFrame() {
+        guard animationFrame != nil else { return }
+        animationFrame = nil
+        refreshDisplayedImage(force: false)
+    }
+
     /// Which image draws: the full decode when present, except that the DC
     /// preview substitutes whenever it still has at least one sample per
     /// on-screen device pixel — at ≤1/8 effective scale downsampling makes the
     /// two identical, and the preview is far cheaper to composite.
     private func chooseImage() -> CGImage? {
+        if let frame = animationFrame { return frame }
         guard let full = fullImage else { return previewImage }
         guard let preview = previewImage, bounds.width > 0,
             CGFloat(preview.width) >= bounds.width * effectiveScale
