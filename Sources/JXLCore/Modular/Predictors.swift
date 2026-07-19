@@ -161,8 +161,11 @@ final class WPState {
 
         @inline(__always) func weight(_ plane: Int, _ maxw: UInt32) -> UInt32 {
             let base = predErrors + plane * planeSize
-            let s = UInt64(base[posN]) + UInt64(base[posNE]) + UInt64(base[posNW])
-            return errorWeight(s, maxw)
+            // libjxl sums the three neighbour errors in uint32, wrapping mod
+            // 2^32 — reachable with 32-bit (float bit-pattern) samples, where
+            // per-pixel errors approach 2^32. The wrap must be reproduced.
+            let s = base[posN] &+ base[posNE] &+ base[posNW]
+            return errorWeight(UInt64(s), maxw)
         }
         let w0In = weight(0, hw0)
         let w1In = weight(1, hw1)
@@ -205,9 +208,11 @@ final class WPState {
         let w2 = w2In >> downShift
         let w3 = w3In >> downShift
         weightSum = w0 + w1 + w2 + w3
+        // Wrapping ops: with 32-bit samples the products can exceed Int64
+        // (C++ wraps in practice; Swift must not trap).
         var sum = Int(weightSum >> 1) - 1
-        sum += pr0 * Int(w0) + pr1 * Int(w1) + pr2 * Int(w2) + pr3 * Int(w3)
-        pred = (sum * Int(Self.divlookup[Int(weightSum) - 1])) >> 24
+        sum &+= pr0 &* Int(w0) &+ pr1 &* Int(w1) &+ pr2 &* Int(w2) &+ pr3 &* Int(w3)
+        pred = (sum &* Int(Self.divlookup[Int(weightSum) - 1])) >> 24
 
         if ((teN ^ teW) | (teN ^ teNW)) > 0 {
             return (pred + kPredictionRound) >> kPredExtraBits

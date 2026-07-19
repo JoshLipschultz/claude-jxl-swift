@@ -103,14 +103,82 @@ private func numProps(for tree: [MATreeNode]) -> Int {
     return max(kNumNonrefProperties, maxProp)
 }
 
+/// libjxl decodes certain simple trees through specialized "fast track"
+/// kernels whose property arithmetic differs from the generic path at the
+/// extremes of the 32-bit sample range (reachable with float bit patterns):
+/// the gradient track clamps the *64-bit* local gradient to
+/// ±kPropRangeFast where the generic path wraps it to int32, and the WP
+/// track truncates the weighted prediction itself to int32. cjxl encodes
+/// with the same kernel selection, so bit-exact decoding requires
+/// reproducing both the selection rules and the divergent arithmetic
+/// (encoding.cc DecodeModularChannelMAANS, FilterTree, TreeToLookupTable).
+enum ChannelFastTrack {
+    case none
+    /// Tree splits only on static props / property 9, all reachable leaves
+    /// are Gradient with multiplier 1 / offset 0, splitvals in LUT range.
+    case gradientClamp
+    /// Same shape but property 15 / Weighted leaves; libjxl additionally
+    /// requires no LZ77 and width > 8.
+    case wpClamp
+}
+
+private let kPropRangeFast: Int64 = 512 << 4  // 8192, encoding.h
+
+func channelFastTrack(
+    tree: [MATreeNode], chan: Int, groupID: Int, usesLZ77: Bool, width: Int
+) -> ChannelFastTrack {
+    if tree.count == 1 { return .none }  // single-leaf tracks match generic semantics
+    let statics: [Int32] = [
+        Int32(truncatingIfNeeded: chan), Int32(truncatingIfNeeded: groupID),
+    ]
+    var stack = [0]
+    var dynamicProps = Set<Int>()
+    var allGradient = true
+    var allWeighted = true
+    var simpleLeaves = true
+    var splitvalsInRange = true
+    var sawLeaf = false
+    while let pos = stack.popLast() {
+        let node = tree[pos]
+        if node.isLeaf {
+            sawLeaf = true
+            if node.predictor != 5 { allGradient = false }
+            if node.predictor != 6 { allWeighted = false }
+            if node.multiplier != 1 || node.predictorOffset != 0 { simpleLeaves = false }
+            continue
+        }
+        if node.property < kNumStaticProperties {
+            // Static property: the branch is decided by chan/group alone, so
+            // only one side is reachable (libjxl FilterTree).
+            stack.append(statics[node.property] > node.splitVal ? node.lchild : node.rchild)
+            continue
+        }
+        dynamicProps.insert(node.property)
+        if node.splitVal < Int32(-kPropRangeFast - 1) || node.splitVal > Int32(kPropRangeFast - 2) {
+            splitvalsInRange = false
+        }
+        stack.append(node.lchild)
+        stack.append(node.rchild)
+    }
+    guard sawLeaf, simpleLeaves, splitvalsInRange else { return .none }
+    if dynamicProps.isSubset(of: [9]) && allGradient { return .gradientClamp }
+    if dynamicProps.isSubset(of: [15]) && allWeighted && !usesLZ77 && width > 8 {
+        return .wpClamp
+    }
+    return .none
+}
+
 /// Decodes one channel's samples (the general PredictTreeWP path).
 private func decodeChannel(
     _ br: BitReader, _ reader: ANSSymbolReader, contextMap: [UInt8], tree: [MATreeNode],
-    wpHeader: WPHeader, chan: Int, groupID: Int, image: ModularImage, propCount: Int
+    wpHeader: WPHeader, chan: Int, groupID: Int, image: ModularImage, propCount: Int,
+    usesLZ77: Bool
 ) {
     let w = image.channels[chan].w
     let h = image.channels[chan].h
     if w == 0 || h == 0 { return }
+    let fastTrack = channelFastTrack(
+        tree: tree, chan: chan, groupID: groupID, usesLZ77: usesLZ77, width: w)
 
     let refCount = propCount - kNumNonrefProperties
     let references = refCount > 0 ? precomputeReferenceChannels(image: image, chan: chan, refCount: refCount) : []
@@ -149,16 +217,29 @@ private func decodeChannel(
                 props[6] = Int32(truncatingIfNeeded: top)
                 props[7] = Int32(truncatingIfNeeded: left)
                 props[8] = Int32(truncatingIfNeeded: left - Int(props[9]))
-                props[9] = Int32(truncatingIfNeeded: left + top - topleft)
+                if fastTrack == .gradientClamp {
+                    // libjxl's gradient fast track clamps the 64-bit local
+                    // gradient to the LUT range instead of wrapping to int32.
+                    let g = Int64(left) + Int64(top) - Int64(topleft)
+                    props[9] = Int32(min(max(g, -kPropRangeFast), kPropRangeFast - 1))
+                } else {
+                    props[9] = Int32(truncatingIfNeeded: left + top - topleft)
+                }
                 props[10] = Int32(truncatingIfNeeded: left - topleft)
                 props[11] = Int32(truncatingIfNeeded: topleft - top)
                 props[12] = Int32(truncatingIfNeeded: top - topright)
                 props[13] = Int32(truncatingIfNeeded: top - toptop)
                 props[14] = Int32(truncatingIfNeeded: left - leftleft)
 
-                let wpPred = wpState?.predict(
+                var wpPred = wpState?.predict(
                     x: x, y: y, xsize: w, N: top, W: left, NE: topright, NW: topleft, NN: toptop,
                     computeProperties: true, properties: &props, offset: 15) ?? 0
+                if fastTrack == .wpClamp {
+                    // libjxl's WP fast track truncates the prediction to int32
+                    // and clamps the WP property to the LUT range.
+                    wpPred = Int(Int32(truncatingIfNeeded: wpPred))
+                    props[15] = min(max(props[15], Int32(-kPropRangeFast)), Int32(kPropRangeFast - 1))
+                }
 
                 for i in 0..<refCount { props[16 + i] = references[i][rowBase + x] }
 
@@ -191,7 +272,10 @@ private func precomputeReferenceChannels(image: ModularImage, chan: Int, refCoun
     var refs = [[Int32]](repeating: [Int32](repeating: 0, count: w * h), count: refCount)
     var offset = 0
     var j = chan - 1
-    while j >= 0 && offset + kExtraPropsPerChannel <= refCount {
+    // libjxl PrecomputeReferences loops while `offset < num_extra_props`, so
+    // when refCount is not a multiple of 4 the last matching channel fills a
+    // partial block (its remaining slots are simply cut off).
+    while j >= 0 && offset < refCount {
         let cj = image.channels[j]
         if cj.w != w || cj.h != h || cj.hshift != image.channels[chan].hshift
             || cj.vshift != image.channels[chan].vshift {
@@ -207,9 +291,9 @@ private func precomputeReferenceChannels(image: ModularImage, chan: Int, refCoun
                 let grad = clampedGradient(vleft, vtop, vtopleft)
                 let base = y * w + x
                 refs[offset + 0][base] = Int32(truncatingIfNeeded: abs(v))
-                refs[offset + 1][base] = Int32(truncatingIfNeeded: v)
-                refs[offset + 2][base] = Int32(truncatingIfNeeded: abs(v - grad))
-                refs[offset + 3][base] = Int32(truncatingIfNeeded: v - grad)
+                if offset + 1 < refCount { refs[offset + 1][base] = Int32(truncatingIfNeeded: v) }
+                if offset + 2 < refCount { refs[offset + 2][base] = Int32(truncatingIfNeeded: abs(v - grad)) }
+                if offset + 3 < refCount { refs[offset + 3][base] = Int32(truncatingIfNeeded: v - grad) }
             }
         }
         offset += kExtraPropsPerChannel
@@ -286,7 +370,8 @@ func modularDecode(
         if isSkippedLargeChannel(c) { break }
         decodeChannel(
             br, reader, contextMap: ctxMap, tree: tree, wpHeader: header.wpHeader,
-            chan: c, groupID: groupID, image: image, propCount: propCount)
+            chan: c, groupID: groupID, image: image, propCount: propCount,
+            usesLZ77: code.lz77.enabled)
         if !br.allReadsWithinBounds { throw ModularDecodeError.finalState }
     }
 

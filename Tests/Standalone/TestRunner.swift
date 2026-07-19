@@ -79,9 +79,84 @@ struct TestRunner {
         jbrdParse()
         hdrOutput()
         frameBlending()
+        float32Modular()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
+    }
+
+    // MARK: - Lossless float32 modular (conformance: lossless_pfm)
+
+    /// `64x64_f32e{1,3,7}.jxl` are the same random float image (values in
+    /// [-0.5, 1.5), so bit patterns span nearly the full int32 range) encoded
+    /// losslessly at cjxl efforts 1, 3, and 7. They pin down the arithmetic
+    /// edge cases that only 32-bit samples reach: the uint32 wrap in the WP
+    /// error-weight sum, and libjxl's gradient/WP "fast track" kernels whose
+    /// property clamping differs from the generic path (e1 hits the gradient
+    /// track, e3 the WP track, e7 the generic WP path). Oracles are djxl PFM
+    /// output; every sample must match bit-for-bit.
+    static func float32Modular() {
+        let dir = fixturesDir()
+        for effort in [1, 3, 7] {
+            let base = "64x64_f32e\(effort)"
+            guard let jxl = try? Data(contentsOf: dir.appendingPathComponent(base + ".jxl")),
+                let pfm = try? Data(contentsOf: dir.appendingPathComponent(base + ".pfm")),
+                let oracle = parsePFM(pfm)
+            else {
+                check(false, "\(base) fixtures present")
+                continue
+            }
+            guard let img = try? JXL.decodeImage(from: [UInt8](jxl)) else {
+                check(false, "\(base) decodes")
+                continue
+            }
+            check(img.isFloat && img.bitsPerSample == 32, "\(base) is float32")
+            eq(img.width, oracle.width, "\(base) width")
+            eq(img.height, oracle.height, "\(base) height")
+            var mismatches = 0
+            for c in 0..<3 {
+                for i in 0..<(img.width * img.height)
+                where img.planes[c][i] != oracle.planes[c][i] {
+                    mismatches += 1
+                }
+            }
+            eq(mismatches, 0, "\(base) bit-exact vs djxl PFM")
+        }
+        FileHandle.standardError.write(
+            Data("  [float32-modular] lossless float images bit-exact=3\n".utf8))
+    }
+
+    /// Minimal PFM reader (color, either endianness) returning int32 bit
+    /// patterns per plane in top-down row order.
+    static func parsePFM(_ data: Data) -> (width: Int, height: Int, planes: [[Int32]])? {
+        let bytes = [UInt8](data)
+        var pos = 0
+        func line() -> String? {
+            guard let nl = bytes[pos...].firstIndex(of: 0x0A) else { return nil }
+            defer { pos = nl + 1 }
+            return String(bytes: bytes[pos..<nl], encoding: .utf8)
+        }
+        guard line() == "PF", let dims = line()?.split(separator: " "),
+            dims.count == 2, let w = Int(dims[0]), let h = Int(dims[1]),
+            let scaleStr = line(), let scale = Float(scaleStr)
+        else { return nil }
+        let littleEndian = scale < 0
+        guard bytes.count - pos >= w * h * 12 else { return nil }
+        var planes = [[Int32]](repeating: [Int32](repeating: 0, count: w * h), count: 3)
+        for row in 0..<h {
+            let y = h - 1 - row  // PFM rows are bottom-up
+            for x in 0..<w {
+                for c in 0..<3 {
+                    let o = pos + (row * w + x) * 12 + c * 4
+                    var v =
+                        UInt32(bytes[o]) | UInt32(bytes[o + 1]) << 8
+                        | UInt32(bytes[o + 2]) << 16 | UInt32(bytes[o + 3]) << 24
+                    if !littleEndian { v = v.byteSwapped }
+                    planes[c][y * w + x] = Int32(bitPattern: v)
+                }
+            }
+        }
+        return (w, h, planes)
     }
 
     // MARK: - Embedded ICC profiles (M8)
