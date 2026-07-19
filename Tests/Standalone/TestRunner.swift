@@ -85,6 +85,7 @@ struct TestRunner {
         iccOutput()
         progressiveAC()
         progressiveDC()
+        wideExtraChannels()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -191,6 +192,59 @@ struct TestRunner {
         }
         FileHandle.standardError.write(
             Data("  [progressive] multi-pass AC fixtures match djxl=2\n".utf8))
+    }
+
+    // MARK: - Wide / upsampled extra channels in VarDCT
+
+    /// `96x64_alpha16.jxl` (16-bit RGBA, cjxl -d 1) — non-8-bit extra
+    /// channels decode at native depth and scale to the output format (16-bit
+    /// output: alpha byte-exact vs djxl). `96x64_ecups.jxl` (cjxl
+    /// --resampling=2 --ec_resampling=2) — the alpha channel is coded at half
+    /// resolution and goes through the triangular upsampler.
+    static func wideExtraChannels() {
+        let dir = fixturesDir()
+        func comparePAM(_ name: String, format: JXLSampleFormat, alphaExactRequired: Bool) {
+            guard let jxl = try? Data(contentsOf: dir.appendingPathComponent("\(name).jxl")),
+                let pam = try? Data(contentsOf: dir.appendingPathComponent("\(name).pam")),
+                let img = try? JXL.decodeImage(from: [UInt8](jxl), format: format),
+                img.planes.count == 4,
+                let headerEnd = pam.range(of: Data("ENDHDR\n".utf8))
+            else {
+                check(false, "\(name) fixture decodes")
+                return
+            }
+            let bytes = [UInt8](pam[headerEnd.upperBound...])
+            let n = img.width * img.height
+            let is16 = format == .uint16
+            let maxVal = is16 ? 65535.0 : 255.0
+            guard bytes.count == n * 4 * (is16 ? 2 : 1) else {
+                check(false, "\(name) oracle size")
+                return
+            }
+            func sample(_ i: Int, _ c: Int) -> Int {
+                let idx = (i * 4 + c) * (is16 ? 2 : 1)
+                return is16 ? Int(bytes[idx]) << 8 | Int(bytes[idx + 1]) : Int(bytes[idx])
+            }
+            var se = 0.0
+            var alphaExact = true
+            for i in 0..<n {
+                for c in 0..<3 {
+                    let d = Double(sample(i, c) - Int(img.planes[c][i]))
+                    se += d * d
+                }
+                if sample(i, 3) != Int(img.planes[3][i]) { alphaExact = false }
+            }
+            let mse = se / Double(n * 3)
+            let psnr = mse == 0 ? 999 : 10 * log10(maxVal * maxVal / mse)
+            check(psnr > 50, "\(name) color matches djxl (PSNR \(Int(psnr)) dB)")
+            if alphaExactRequired {
+                check(alphaExact, "\(name) alpha byte-exact vs djxl")
+            }
+        }
+        comparePAM("96x64_alpha16", format: .uint16, alphaExactRequired: true)
+        comparePAM("96x64_ecups", format: .uint8, alphaExactRequired: false)
+        FileHandle.standardError.write(
+            Data("  [wide-ec] 16-bit + upsampled extra channels verified\n".utf8))
     }
 
     // MARK: - DC frames + progressive modular / extra channels

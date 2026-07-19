@@ -302,7 +302,10 @@ final class FrameDecoder {
         }
         // Extra channels ride the frame's modular sub-streams (8-bit native);
         // they are rescaled to match wider color formats.
-        let ecPlanes = try finalizeExtraChannels().map { scaleECPlane($0, to: format) }
+        let ecPlanes = try finalizeExtraChannels().enumerated().map { e, plane in
+            scaleECPlane(
+                plane, bits: Int(metadata.extraChannels[e].bitDepth.bitsPerSample), to: format)
+        }
         if frameHeader.colorTransform == .ycbcr {
             // JPEG transcode: the YCbCr planes are inherently 8-bit and
             // convert to the file's *native* encoded RGB (no color management
@@ -400,22 +403,29 @@ final class FrameDecoder {
         var planes = xybToRGBFloatPlanes(xyb, spec: spec).map { plane in
             plane.map { Float(bitPattern: UInt32(bitPattern: $0)) }
         }
-        for plane in try finalizeExtraChannels() {
-            planes.append(plane.map { Float($0) / 255 })
+        for (e, plane) in (try finalizeExtraChannels()).enumerated() {
+            let bits = Int(metadata.extraChannels[e].bitDepth.bitsPerSample)
+            let ecMax = Float((1 << bits) - 1)
+            planes.append(plane.map { Float($0) / ecMax })
         }
         return FloatFrame(width: xyb.width, height: xyb.height, planes: planes)
     }
 
     /// Rescales an 8-bit extra-channel plane to the requested color format so
     /// every plane of the result shares one sample representation.
-    private func scaleECPlane(_ plane: [Int32], to format: JXLSampleFormat) -> [Int32] {
+    private func scaleECPlane(
+        _ plane: [Int32], bits: Int, to format: JXLSampleFormat
+    ) -> [Int32] {
+        let maxVal = Float((1 << bits) - 1)
         switch format {
         case .uint8:
-            return plane
+            if bits == 8 { return plane }
+            return plane.map { Int32((Float($0) * 255 / maxVal).rounded()) }
         case .uint16:
-            return plane.map { $0 * 257 }  // 0...255 -> 0...65535
+            if bits == 16 { return plane }
+            return plane.map { Int32((Float($0) * 65535 / maxVal).rounded()) }
         case .float32:
-            return plane.map { Int32(bitPattern: (Float($0) / 255).bitPattern) }
+            return plane.map { Int32(bitPattern: (Float($0) / maxVal).bitPattern) }
         }
     }
 
@@ -554,8 +564,10 @@ final class FrameDecoder {
             let spec = try makeOutputColorSpec(
                 metadata.colorEncoding, toneMapping: metadata.toneMapping, customOpsin: customOpsin,
             icc: iccOutput)
-            let ecPlanes = fullImage.channels.dropFirst(3).map {
-                scaleECPlane($0.pixels, to: format)
+            let ecPlanes = fullImage.channels.dropFirst(3).enumerated().map { e, ch in
+                scaleECPlane(
+                    ch.pixels, bits: Int(metadata.extraChannels[e].bitDepth.bitsPerSample),
+                    to: format)
             }
             let colorPlanes: [[Int32]]
             let bits: Int
@@ -901,23 +913,33 @@ final class FrameDecoder {
     private var ecFinalized = false
 
     private func decodeExtraChannelGlobal(_ dcGlobal: VarDCTDCGlobalDecoded) throws {
-        // Mirrors ModularFrameDecoder::DecodeGlobalInfo channel geometry:
-        // DivCeil(xsize_upsampled, ecups) with shift log2(ecups)−log2(upsampling).
-        // Only the unshifted full-resolution shape is implemented.
-        guard frameHeader.upsampling == 1,
-            frameHeader.ecUpsampling.allSatisfy({ $0 == 1 }),
-            metadata.extraChannels.allSatisfy({ $0.dimShift == 0 })
-        else { throw JXLError.unsupported("upsampled/shifted extra channels in VarDCT") }
-        // Output planes advertise the color depth (8-bit), so only plain 8-bit
-        // integer extra channels are attached for now.
-        guard metadata.extraChannels.allSatisfy({
-            $0.bitDepth.bitsPerSample == 8 && !$0.bitDepth.isFloatingPoint
-        }) else { throw JXLError.unsupported("non-8-bit extra channels in VarDCT") }
+        guard metadata.extraChannels.allSatisfy({ !$0.bitDepth.isFloatingPoint }) else {
+            throw JXLError.unsupported("floating-point extra channels in VarDCT")
+        }
         try checkPixelLimits(channels: 3 + metadata.extraChannelCount)
 
+        // Channel geometry (ModularFrameDecoder::DecodeGlobalInfo): each EC is
+        // coded at DivCeil(xsize_upsampled, ecups) with shift
+        // ceilLog2(ecups) − ceilLog2(upsampling); ecups already folds the
+        // channel's dim_shift and is >= the color upsampling.
+        let ups = Int(frameHeader.upsampling)
+        let xsizeUpsampled = dim.xsize * ups
+        let ysizeUpsampled = dim.ysize * ups
         let image = ModularImage(
             w: dim.xsize, h: dim.ysize, bitdepth: Int(metadata.bitDepth.bitsPerSample),
             channelCount: metadata.extraChannelCount)
+        for e in 0..<metadata.extraChannelCount {
+            let ecups = Int(e < frameHeader.ecUpsampling.count ? frameHeader.ecUpsampling[e] : 1)
+            guard ecups >= ups, ecups <= 8 else {
+                throw JXLError.malformed("invalid extra-channel upsampling \(ecups)")
+            }
+            let shift = ceilLog2Nonzero(UInt32(ecups)) - ceilLog2Nonzero(UInt32(ups))
+            var ch = ModularChannel(
+                w: divCeil(xsizeUpsampled, ecups), h: divCeil(ysizeUpsampled, ecups),
+                hshift: shift, vshift: shift)
+            ch.pixels = [Int32](repeating: 0, count: ch.w * ch.h)
+            image.channels[e] = ch
+        }
         let header = try modularDecode(
             r0, image: image, groupID: 0, globalTree: dcGlobal.tree,
             globalCode: dcGlobal.code, globalCtxMap: dcGlobal.ctxMap,
@@ -933,6 +955,44 @@ final class FrameDecoder {
         guard let image = ecImage else { return [] }
         if !ecFinalized {
             try undoTransforms(image, transforms: ecTransforms, wpHeader: ecWPHeader)
+            // Coded-below-output-resolution channels (ec_upsampling > color
+            // upsampling) go through the same triangular upsampler as color,
+            // then round back to integers (render pipeline stage_upsampling).
+            let ups = Int(frameHeader.upsampling)
+            let outW = dim.xsize * ups
+            let outH = dim.ysize * ups
+            for e in 0..<image.channels.count {
+                let ch = image.channels[e]
+                guard ch.w < outW || ch.h < outH else { continue }
+                // The channel is coded at DivCeil(out, ecups); the upsampler
+                // takes it straight to output resolution.
+                let ecups = Int(
+                    e < frameHeader.ecUpsampling.count ? frameHeader.ecUpsampling[e] : 1)
+                let shift = ceilLog2Nonzero(UInt32(max(ecups, 1)))
+                guard shift >= 1, shift <= 3 else {
+                    throw JXLError.malformed("inconsistent extra-channel upsampling")
+                }
+                let weights: [Float]
+                switch shift {
+                case 1: weights = upsamplingWeights.up2 ?? kUpsampling2Weights
+                case 2: weights = upsamplingWeights.up4 ?? kUpsampling4Weights
+                default: weights = upsamplingWeights.up8 ?? kUpsampling8Weights
+                }
+                let f = ch.pixels.map(Float.init)
+                let up = upsamplePlane(
+                    f, w: ch.w, h: ch.h, stride: ch.w, shift: shift, weights: weights)
+                // Crop the n-multiple result to the output rect.
+                let upW = ch.w << shift
+                var out = [Int32](repeating: 0, count: outW * outH)
+                for y in 0..<outH {
+                    for x in 0..<outW {
+                        out[y * outW + x] = Int32(up[y * upW + x].rounded())
+                    }
+                }
+                var newCh = ModularChannel(w: outW, h: outH)
+                newCh.pixels = out
+                image.channels[e] = newCh
+            }
             ecFinalized = true
         }
         return image.channels.map { $0.pixels }

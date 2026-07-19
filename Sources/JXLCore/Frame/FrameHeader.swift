@@ -22,6 +22,8 @@ public struct FrameContext: Sendable {
     public let animationHaveTimecodes: Bool
     public let imageWidth: Int
     public let imageHeight: Int
+    /// Per-extra-channel dim_shift (folded into the serialized ec_upsampling).
+    public let ecDimShifts: [UInt32]
 
     public init(metadata: JXLImageMetadata, width: UInt32, height: UInt32) {
         self.xybEncoded = metadata.xybEncoded
@@ -30,6 +32,7 @@ public struct FrameContext: Sendable {
         self.animationHaveTimecodes = metadata.animation?.haveTimecodes ?? false
         self.imageWidth = Int(width)
         self.imageHeight = Int(height)
+        self.ecDimShifts = metadata.extraChannels.map(\.dimShift)
     }
 }
 
@@ -193,7 +196,11 @@ public struct FrameHeader: Sendable {
         if (flags & kUseDcFrame) == 0 {
             upsampling = r.readU32(.value(1), .value(2), .value(4), .value(8))
             for i in 0..<ctx.numExtraChannels {
-                ecUpsampling[i] = r.readU32(.value(1), .value(2), .value(4), .value(8))
+                // The serialized value is pre-shifted by the channel's
+                // dim_shift (frame_header.cc): effective = raw << dim_shift.
+                ecUpsampling[i] =
+                    r.readU32(.value(1), .value(2), .value(4), .value(8))
+                    << (i < ctx.ecDimShifts.count ? ctx.ecDimShifts[i] : 0)
             }
         }
 
