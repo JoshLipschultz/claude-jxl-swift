@@ -25,6 +25,10 @@ public struct FrameDimensions: Equatable, Sendable {
     public var numDCGroups = 0
     public var groupDim = 0
     public var dcGroupDim = 0
+    /// Frame dimensions before the upsampling division (libjxl
+    /// `xsize_upsampled` / `ysize_upsampled`).
+    public var xsizeUpsampled = 0
+    public var ysizeUpsampled = 0
 
     /// Mirrors `FrameDimensions::Set`.
     public mutating func set(
@@ -33,6 +37,8 @@ public struct FrameDimensions: Equatable, Sendable {
     ) {
         groupDim = (kGroupDim >> 1) << groupSizeShift
         dcGroupDim = groupDim * kBlockDim
+        xsizeUpsampled = xs
+        ysizeUpsampled = ys
         xsize = divCeil(xs, upsampling)
         ysize = divCeil(ys, upsampling)
         xsizeBlocks = divCeil(xsize, kBlockDim << maxHShift) << maxHShift

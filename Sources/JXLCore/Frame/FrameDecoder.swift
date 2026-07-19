@@ -120,6 +120,11 @@ final class FrameDecoder {
     /// Set by the compositing path (`decodeFrames`) so the per-frame pixel
     /// decode proceeds even when the frame blends onto a canvas.
     var allowBlendingDecode = false
+    /// Visible/nonvisible frame counters after this frame's own header
+    /// (libjxl dec_state visible_frame_index / nonvisible_frame_index); they
+    /// seed the noise synthesis RNG.
+    let visibleFrameIndex: Int
+    let nonvisibleFrameIndex: Int
 
     /// `skipPresentedFrames` selects a later animation frame: that many
     /// presentable frames are skipped (reference-only frames are recorded as
@@ -152,13 +157,29 @@ final class FrameDecoder {
         let ctx = FrameContext(metadata: metadata, width: size.width, height: size.height)
 
         // Walk the frame sequence: reference-only frames (patch dictionaries
-        // draw from them) and DC frames (kUseDcFrame sources) are recorded
+// draw from them) and DC frames (kUseDcFrame sources) are recorded
         // and skipped; the first frame of any other type is the presented one.
+        // Along the way, track the visible/nonvisible frame counters exactly
+        // as libjxl's FrameDecoder does (dec_frame.cc InitFrame) — they seed
+        // the noise RNG.
         var preceding: [FrameSlot] = []
         var dcSlots: [FrameSlot] = []
         var toSkip = skipPresentedFrames
+        var visIndex = 0
+        var nonvisIndex = 0
+        func accountFrame(_ h: FrameHeader) {
+            if (h.isLast || h.duration > 0)
+                && (h.frameType == .regular || h.frameType == .skipProgressive)
+            {
+                visIndex += 1
+                nonvisIndex = 0
+            } else {
+                nonvisIndex += 1
+            }
+        }
         var current = try FrameDecoder.parseFrameSlot(
             reader, context: ctx, codestreamCount: parsed.codestream.count)
+        accountFrame(current.header)
         while true {
             if current.header.frameType == .referenceOnly {
                 preceding.append(current)
@@ -183,10 +204,13 @@ final class FrameDecoder {
             reader.skip(current.totalSectionBytes * 8)
             current = try FrameDecoder.parseFrameSlot(
                 reader, context: ctx, codestreamCount: parsed.codestream.count)
+            accountFrame(current.header)
         }
         slot = current
         referenceSlots = preceding
-        dcFrameSlots = dcSlots
+dcFrameSlots = dcSlots
+        visibleFrameIndex = visIndex
+        nonvisibleFrameIndex = nonvisIndex
     }
 
     /// Parses one frame header + TOC from `reader` and validates every section
@@ -295,11 +319,15 @@ final class FrameDecoder {
         if let patches = patchDictionary, !patches.isEmpty {
             try renderPatches(patches, into: &xyb) { try self.referenceXYBFrame($0) }
         }
+        // Splines draw after patches, before upsampling (libjxl SplineStage).
+        try renderSplines(into: &xyb)
         // Upsampling (2x/4x/8x) follows patches and precedes the color
         // transform (libjxl render pipeline order).
         if frameHeader.upsampling > 1 {
             xyb = try upsampleXYB(xyb)
         }
+        // Noise lands after upsampling, right before the color transform.
+        try renderNoise(into: &xyb)
         // Extra channels ride the frame's modular sub-streams (8-bit native);
         // they are rescaled to match wider color formats.
         let ecPlanes = try finalizeExtraChannels().enumerated().map { e, plane in
@@ -394,9 +422,11 @@ final class FrameDecoder {
         if let patches = patchDictionary, !patches.isEmpty {
             try renderPatches(patches, into: &xyb) { try self.referenceXYBFrame($0) }
         }
+        try renderSplines(into: &xyb)
         if frameHeader.upsampling > 1 {
             xyb = try upsampleXYB(xyb)
         }
+        try renderNoise(into: &xyb)
         let spec = try makeOutputColorSpec(
             metadata.colorEncoding, toneMapping: metadata.toneMapping, customOpsin: customOpsin,
             icc: iccOutput)
@@ -513,7 +543,11 @@ final class FrameDecoder {
     /// through the color pipeline at the requested format.
     func decodeModularImage(format: JXLSampleFormat = .uint8) throws -> JXLDecodedImage {
         guard frameHeader.isModular else { throw JXLError.unsupported("VarDCT frame is not Modular") }
-        guard frameHeader.frameType == .regular, frameHeader.flags == 0 else {
+        // Splines (16) and noise (1) are supported on Modular-XYB frames,
+        // where the pipeline float planes exist; other feature flags (and any
+        // flags on native-space Modular frames) remain unsupported.
+        let allowedFlags: UInt64 = frameHeader.colorTransform == .xyb ? (16 | 1) : 0
+        guard frameHeader.frameType == .regular, frameHeader.flags & ~allowedFlags == 0 else {
             throw JXLError.unsupported("non-regular or feature-flagged frames")
         }
         if metadata.bitDepth.isFloatingPoint && metadata.bitDepth.bitsPerSample != 32 {
@@ -560,7 +594,11 @@ final class FrameDecoder {
             // Lossy modular frames carry the same restoration filters as
             // VarDCT (gaborish/EPF with a uniform modular sigma).
             modularRestorationFilters(x: &x, y: &y, b: &b, w: w, h: h, header: frameHeader)
-            let xyb = XYBImage(width: w, height: h, stride: w, paddedHeight: h, x: x, y: y, b: b)
+            var xyb = XYBImage(width: w, height: h, stride: w, paddedHeight: h, x: x, y: y, b: b)
+            // Splines and noise apply to Modular-XYB frames the same way as to
+            // VarDCT frames (with a default color correlation map).
+            try renderSplines(into: &xyb)
+            try renderNoise(into: &xyb)
             let spec = try makeOutputColorSpec(
                 metadata.colorEncoding, toneMapping: metadata.toneMapping, customOpsin: customOpsin,
             icc: iccOutput)
@@ -638,9 +676,21 @@ final class FrameDecoder {
     ) throws -> (image: ModularImage, dcQuant: [Float]) {
         let dim = slot.dim
 
-        // Global modular (section 0 = LfGlobal): DequantMatrices.DecodeDC, then
-        // has_tree / the global MA tree + code, then the global modular stream.
+        // Global modular (section 0 = LfGlobal): the feature-flag payloads
+        // (patches/splines/noise, in libjxl ProcessDCGlobal order), then
+        // DequantMatrices.DecodeDC, then has_tree / the global MA tree + code,
+        // then the global modular stream.
         let r0 = BitReader(parsed.codestream, byteRange: slot.sectionRange(0))
+        let flags = slot.header.flags
+        guard flags & 2 == 0 else {
+            throw JXLError.unsupported("patches on Modular frames")
+        }
+        if flags & 16 != 0 {
+            splinesData = try decodeSplines(r0, numPixels: dim.xsize * dim.ysize)
+        }
+        if flags & 1 != 0 {
+            noiseParams = decodeNoiseParams(r0)
+        }
         var dcQuant: [Float] = [1.0 / 4096.0, 1.0 / 512.0, 1.0 / 256.0]
         if r0.read(1) == 0 {
             for c in 0..<3 { dcQuant[c] = r0.readF16() * (1.0 / 128.0) }
@@ -860,17 +910,48 @@ final class FrameDecoder {
                 throw JXLError.unsupported("restoration filters with chroma subsampling")
             }
         }
-        // kPatches (2) is decoded from the DC-global head; splines (16) and
-        // noise (1) are not yet parsed and would desynchronize the stream.
-        // kSkipAdaptiveDCSmoothing (128) is honored.
-        guard frameHeader.flags & ~UInt64(128 | 32 | 2) == 0 else {
-            throw JXLError.unsupported("VarDCT frame features (splines/noise)")
+// kPatches (2), kSplines (16), kNoise (1), and kUseDcFrame (32) are
+        // handled; kSkipAdaptiveDCSmoothing (128) is honored.
+        guard frameHeader.flags & ~UInt64(128 | 32 | 16 | 2 | 1) == 0 else {
+            throw JXLError.unsupported("VarDCT frame feature flags \(frameHeader.flags)")
         }
     }
 
     /// The patch dictionary, populated by `varDCTDCGlobal` when the frame sets
     /// kPatches; nil otherwise (and before DC-global runs).
     private(set) var patchDictionary: PatchDictionary?
+
+    /// The frame's splines (flags bit 16) and noise parameters (flags bit 1),
+    /// populated when the LfGlobal section is parsed; nil otherwise.
+    private(set) var splinesData: SplinesData?
+    private(set) var noiseParams: NoiseParams?
+
+    /// Draws the frame's splines onto the pre-upsampling XYB planes (libjxl
+    /// SplineStage; runs after patches and before upsampling).
+    func renderSplines(into xyb: inout XYBImage) throws {
+        guard let data = splinesData else { return }
+        // The draw cache needs the color correlation map's base values, which
+        // land with DC-global for VarDCT frames (default map for Modular).
+        let cc = frameHeader.isModular ? nil : try varDCTDCGlobal().info.colorCorrelation
+        let cache = try initializeSplineDrawCache(
+            data, imageXsize: dim.xsizeUpsampled, imageYsize: dim.ysizeUpsampled,
+            yToX: cc?.baseCorrelationX ?? 0.0, yToB: cc?.baseCorrelationB ?? 1.0)
+        drawSplines(cache, into: &xyb)
+    }
+
+    /// Adds synthetic noise onto the post-upsampling XYB planes (libjxl
+    /// ConvolveNoiseStage + AddNoiseStage; the last stage before the color
+    /// transform).
+    func renderNoise(into xyb: inout XYBImage) throws {
+        guard let params = noiseParams, params.hasAny else { return }
+        let cc = frameHeader.isModular ? nil : try varDCTDCGlobal().info.colorCorrelation
+        applyNoise(
+            params, into: &xyb,
+            groupDim: dim.groupDim, xsizeGroups: dim.xsizeGroups, ysizeGroups: dim.ysizeGroups,
+            upsampling: Int(frameHeader.upsampling),
+            visibleFrameIndex: visibleFrameIndex, nonvisibleFrameIndex: nonvisibleFrameIndex,
+            yToX: cc?.baseCorrelationX ?? 0.0, yToB: cc?.baseCorrelationB ?? 1.0)
+    }
 
     /// Decodes the patch dictionary from the head of the DC-global section
     /// (before DequantMatrices.DecodeDC). Positions are validated against the
@@ -889,6 +970,15 @@ final class FrameDecoder {
         try requireSupportedVarDCT()
         if frameHeader.flags & 2 != 0 {
             patchDictionary = try parsePatchDictionary(r0)
+        }
+        // Splines and noise parameters follow the patch dictionary in the
+        // LfGlobal section (libjxl ProcessDCGlobal order: patches, splines,
+        // noise, then DequantMatrices.DecodeDC).
+        if frameHeader.flags & 16 != 0 {
+            splinesData = try decodeSplines(r0, numPixels: dim.xsize * dim.ysize)
+        }
+        if frameHeader.flags & 1 != 0 {
+            noiseParams = decodeNoiseParams(r0)
         }
         let dcGlobal = try readVarDCTDCGlobal(r0)
         // The DC-global section ends with the global modular stream. For a

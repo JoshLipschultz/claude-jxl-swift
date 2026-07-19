@@ -73,6 +73,7 @@ struct TestRunner {
         vardctAlpha()
         epfIters()
         upsampling()
+        splinesAndNoise()
         squeeze()
         animation()
         brotli()
@@ -858,6 +859,38 @@ struct TestRunner {
                 continue
             }
             check(img.width == 256 && img.height == 192, "\(name) upsampled dimensions")
+            var rgb = [UInt8](repeating: 0, count: img.width * img.height * 3)
+            for c in 0..<3 {
+                for i in 0..<(img.width * img.height) {
+                    rgb[i * 3 + c] = UInt8(clamping: img.planes[c][i])
+                }
+            }
+            let psnr = ppmPSNR(refPPM, rgb, img.width, img.height)
+            check(psnr > 50, "\(name) matches djxl (PSNR \(Int(psnr)) dB)")
+        }
+    }
+
+    // MARK: - Splines + noise synthesis
+
+    /// `96x64_spline.jxl` (jxl_from_tree: Modular-XYB base + one 4-point
+    /// spline with varying color/sigma DCTs) exercises the spline decode,
+    /// Catmull-Rom resampling, and Gaussian drawing; `96x64_noise_modular.jxl`
+    /// (jxl_from_tree Noise directive) and `96x64_noise_vardct.jxl` (cjxl
+    /// --photon_noise_iso=3200, VarDCT) exercise the seeded XorShift128+
+    /// noise planes, the 5x5 convolution, and the LUT-modulated application.
+    /// Oracles are djxl PPM output; noise is random but deterministically
+    /// seeded, so parity is at normal lossy-oracle levels.
+    static func splinesAndNoise() {
+        let dir = fixturesDir()
+        for name in ["96x64_spline", "96x64_noise_modular", "96x64_noise_vardct"] {
+            guard let jxl = try? Data(contentsOf: dir.appendingPathComponent("\(name).jxl")),
+                let refPPM = try? Data(contentsOf: dir.appendingPathComponent("\(name).ppm")),
+                let img = try? JXL.decodeImage(from: jxl)
+            else {
+                check(false, "\(name) fixture decodes")
+                continue
+            }
+            check(img.width == 96 && img.height == 64, "\(name) dimensions")
             var rgb = [UInt8](repeating: 0, count: img.width * img.height * 3)
             for c in 0..<3 {
                 for i in 0..<(img.width * img.height) {
