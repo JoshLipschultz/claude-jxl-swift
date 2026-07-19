@@ -84,6 +84,7 @@ struct TestRunner {
         deltaPalette()
         iccOutput()
         progressiveAC()
+        progressiveDC()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -190,6 +191,68 @@ struct TestRunner {
         }
         FileHandle.standardError.write(
             Data("  [progressive] multi-pass AC fixtures match djxl=2\n".utf8))
+    }
+
+    // MARK: - DC frames + progressive modular / extra channels
+
+    /// LF-frame and pass-bracket coverage: `96x64_pdc.jxl` (cjxl
+    /// --progressive_dc=1: a Modular-XYB DC frame feeds the main frame's
+    /// kUseDcFrame flag), `384x256_pdcac.jxl` (DC frame + 3 HF passes,
+    /// multi-group — the DC frame is itself multi-pass modular),
+    /// `384x256_mprog.jxl` (progressive *modular* presented frame: squeeze
+    /// channels bracketed by shift across pass sections; lossless, so
+    /// byte-exact), and `96x64_alphaprog.jxl` (VarDCT + alpha + 3 passes:
+    /// the extra channel rides the per-pass bracket walk; alpha byte-exact).
+    static func progressiveDC() {
+        let dir = fixturesDir()
+        for (name, exact) in [("96x64_pdc", false), ("384x256_pdcac", false), ("384x256_mprog", true)] {
+            guard let jxl = try? Data(contentsOf: dir.appendingPathComponent("\(name).jxl")),
+                let refPPM = try? Data(contentsOf: dir.appendingPathComponent("\(name).ppm")),
+                let img = try? JXL.decodeImage(from: [UInt8](jxl))
+            else {
+                check(false, "\(name) fixture decodes")
+                continue
+            }
+            var rgb = [UInt8](repeating: 0, count: img.width * img.height * 3)
+            for c in 0..<3 {
+                for i in 0..<(img.width * img.height) {
+                    rgb[i * 3 + c] = UInt8(clamping: img.planes[c][i])
+                }
+            }
+            let psnr = ppmPSNR(refPPM, rgb, img.width, img.height)
+            if exact {
+                check(psnr == 999, "\(name) byte-exact vs djxl")
+            } else {
+                check(psnr > 50, "\(name) matches djxl (PSNR \(Int(psnr)) dB)")
+            }
+        }
+        // Alpha through the pass-bracketed extra-channel walk.
+        if let jxl = try? Data(contentsOf: dir.appendingPathComponent("96x64_alphaprog.jxl")),
+            let pam = try? Data(contentsOf: dir.appendingPathComponent("96x64_alphaprog.pam")),
+            let img = try? JXL.decodeImage(from: [UInt8](jxl)), img.planes.count == 4,
+            let headerEnd = pam.range(of: Data("ENDHDR\n".utf8))
+        {
+            let pixels = [UInt8](pam[headerEnd.upperBound...])
+            let n = img.width * img.height
+            var se = 0.0
+            var alphaExact = pixels.count == n * 4
+            if alphaExact {
+                for i in 0..<n {
+                    for c in 0..<3 {
+                        let d = Double(Int(pixels[i * 4 + c]) - Int(img.planes[c][i]))
+                        se += d * d
+                    }
+                    if Int32(pixels[i * 4 + 3]) != img.planes[3][i] { alphaExact = false }
+                }
+            }
+            let mse = se / Double(n * 3)
+            check(mse > 0 && 10 * log10(255.0 * 255.0 / mse) > 50, "alphaprog color matches djxl")
+            check(alphaExact, "alphaprog alpha byte-exact vs djxl")
+        } else {
+            check(false, "alphaprog fixture decodes")
+        }
+        FileHandle.standardError.write(
+            Data("  [progressive-dc] DC frames + modular passes + EC brackets verified\n".utf8))
     }
 
     // MARK: - ICC output (matrix + TRC CMS)

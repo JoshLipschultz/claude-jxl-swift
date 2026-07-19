@@ -150,7 +150,10 @@ func decodeVarDCTCoefficients(_ d: FrameDecoder) throws -> VarDCTCoefficients {
     // ModularStreamId::ModularAC). Nothing is read when there are none.
     let dcGlobal = try d.varDCTDCGlobal()
     let ecImage = d.ecImage
-    let ecStreamID: @Sendable (Int) -> Int = { g in 1 + 3 * dim.numDCGroups + 17 + g }
+    let ecStreamID: @Sendable (Int, Int) -> Int = { g, pass in
+        1 + 3 * dim.numDCGroups + 17 + pass * dim.numGroups + g
+    }
+    let brackets = (0..<numPasses).map { d.frameHeader.downsamplingBracket(pass: $0) }
 
     // A coalesced frame has a single group read sequentially from the shared
     // section-0 reader.
@@ -166,7 +169,7 @@ func decodeVarDCTCoefficients(_ d: FrameDecoder) throws -> VarDCTCoefficients {
             let ecResult = try decodeModularGroupImage(
                 reader, fullImage: ecImage, group: 0, dim: dim,
                 globalTree: dcGlobal.tree, globalCode: dcGlobal.code,
-                globalCtxMap: dcGlobal.ctxMap, streamID: ecStreamID(0)) {
+                globalCtxMap: dcGlobal.ctxMap, streamID: ecStreamID(0, 0)) {
             blitModularGroup(ecResult, into: ecImage)
         }
         return VarDCTCoefficients(blocks: blocks, totalNonZeros: nz)
@@ -178,7 +181,7 @@ func decodeVarDCTCoefficients(_ d: FrameDecoder) throws -> VarDCTCoefficients {
     // writes one distinct pre-allocated slot. The extra-channel image is only
     // read (channel layout) during the concurrent phase; blits are serial.
     typealias GroupResult = Result<
-        (blocks: [VarDCTBlock], nonZeros: Int, ec: ModularGroupResult?), Error>
+        (blocks: [VarDCTBlock], nonZeros: Int, ec: [ModularGroupResult]), Error>
     let codestream = d.codestream
     // Row-major [group][pass] section ranges.
     let sectionRanges = (0..<dim.numGroups).map { g in
@@ -200,9 +203,11 @@ func decodeVarDCTCoefficients(_ d: FrameDecoder) throws -> VarDCTCoefficients {
             let (bx0, by0, gw, gh) = groupBounds(g)
             out[g] = GroupResult {
                 // Passes accumulate into the same block list, in pass order.
+                // Each pass's section also carries that pass's shift bracket
+                // of the group's modular (extra-channel) data.
                 var groupBlocks: [VarDCTBlock] = []
                 var nonZeros = 0
-                var lastReader: BitReader? = nil
+                var ecResults: [ModularGroupResult] = []
                 for pass in 0..<numPasses {
                     let reader = BitReader(codestream, byteRange: sectionRanges[g][pass])
                     nonZeros += try decodeACGroupPass(
@@ -211,15 +216,15 @@ func decodeVarDCTCoefficients(_ d: FrameDecoder) throws -> VarDCTCoefficients {
                         histoSelectorBits: histoSelectorBits, bx0: bx0, by0: by0, gw: gw, gh: gh,
                         blockW: blockW, shifts: shifts, pass: pass,
                         coeffShift: passShifts[pass], blocks: &groupBlocks)
-                    lastReader = reader
-                }
-                let ecResult = try ec.flatMap {
-                    try decodeModularGroupImage(
-                        lastReader!, fullImage: $0, group: g, dim: dim,
+                    if let ec, let ecResult = try decodeModularGroupImage(
+                        reader, fullImage: ec, group: g, dim: dim,
                         globalTree: tree, globalCode: code, globalCtxMap: treeCtxMap,
-                        streamID: ecStreamID(g))
+                        streamID: ecStreamID(g, pass),
+                        minShift: brackets[pass].minShift, maxShift: brackets[pass].maxShift) {
+                        ecResults.append(ecResult)
+                    }
                 }
-                return (groupBlocks, nonZeros, ecResult)
+                return (groupBlocks, nonZeros, ecResults)
             }
         }
     }
@@ -227,11 +232,11 @@ func decodeVarDCTCoefficients(_ d: FrameDecoder) throws -> VarDCTCoefficients {
     var blocks: [VarDCTBlock] = []
     var totalNonZeros = 0
     for result in results {
-        let (groupBlocks, nz, ecResult) = try result!.get()
+        let (groupBlocks, nz, ecResults) = try result!.get()
         blocks.append(contentsOf: groupBlocks)
         totalNonZeros += nz
-        if let ecResult, let ecImage {
-            blitModularGroup(ecResult, into: ecImage)
+        if let ecImage {
+            for ecResult in ecResults { blitModularGroup(ecResult, into: ecImage) }
         }
     }
     return VarDCTCoefficients(blocks: blocks, totalNonZeros: totalNonZeros)

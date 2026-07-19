@@ -56,6 +56,31 @@ public struct FrameHeader: Sendable {
     public var numPasses: UInt32 = 1
     /// Per-pass coefficient shifts (Passes header); the last pass is 0.
     public var passShifts: [UInt32] = [0]
+    /// Passes header downsample[] / last_pass[] pairs (for shift brackets).
+    public var passDownsample: [UInt32] = []
+    public var passLastPass: [UInt32] = []
+
+    /// libjxl `Passes::GetDownsamplingBracket`: the modular channel shift
+    /// bracket [minShift, maxShift] decoded by `pass`.
+    public func downsamplingBracket(pass: Int) -> (minShift: Int, maxShift: Int) {
+        var maxShift = 2
+        var minShift = 3
+        var i = 0
+        while true {
+            for j in 0..<passDownsample.count where i == Int(passLastPass[j]) {
+                switch passDownsample[j] {
+                case 8: minShift = 3
+                case 4: minShift = 2
+                case 2: minShift = 1
+                default: minShift = 0
+                }
+            }
+            if i == Int(numPasses) - 1 { minShift = 0 }
+            if i == pass { return (minShift, maxShift) }
+            maxShift = minShift - 1
+            i += 1
+        }
+    }
     public var dcLevel: UInt32 = 0
     public var customSizeOrOrigin = false
     public var frameWidth: UInt32 = 0
@@ -265,8 +290,12 @@ public struct FrameHeader: Sendable {
             let numDownsample = r.readU32(.value(0), .value(1), .value(2), .bits(1, offset: 3))
             // Coefficient shifts for all passes but the last (which is 0).
             for i in 0..<(Int(numPasses) - 1) { passShifts[i] = UInt32(r.read(2)) }
-            for _ in 0..<numDownsample { _ = r.readU32(.value(1), .value(2), .value(4), .value(8)) }  // downsample
-            for _ in 0..<numDownsample { _ = r.readU32(.value(0), .value(1), .value(2), .bits(3)) }  // last_pass
+            for _ in 0..<numDownsample {
+                passDownsample.append(r.readU32(.value(1), .value(2), .value(4), .value(8)))
+            }
+            for _ in 0..<numDownsample {
+                passLastPass.append(r.readU32(.value(0), .value(1), .value(2), .bits(3)))
+            }
         }
     }
 

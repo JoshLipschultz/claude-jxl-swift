@@ -113,15 +113,18 @@ func decodeVarDCTLowFrequency(_ d: FrameDecoder) throws -> VarDCTLowFrequency {
     var usedACs: UInt32 = 0
 
     let shifts = d.frameHeader.channelShifts
+    let useDCFrame = d.frameHeader.flags & 32 != 0
     for dcg in 0..<dim.numDCGroups {
         let rect = d.dcGroupRect(dcg)
         let reader = d.dcGroupReader(dcg)
-        try decodeVarDCTDC(
-            reader, groupIndex: dcg, rectW: rect.w, rectH: rect.h,
-            dcGlobal: dcGlobal, dequant: dequant, shifts: shifts,
-            destX: &planeX, destY: &planeY, destB: &planeB,
-            destQX: &quantX, destQY: &quantY, destQB: &quantB,
-            destW: bw, x0: rect.x0, y0: rect.y0, dcQuantContext: &meta.dcQuantContext)
+        if !useDCFrame {
+            try decodeVarDCTDC(
+                reader, groupIndex: dcg, rectW: rect.w, rectH: rect.h,
+                dcGlobal: dcGlobal, dequant: dequant, shifts: shifts,
+                destX: &planeX, destY: &planeY, destB: &planeB,
+                destQX: &quantX, destQY: &quantY, destQB: &quantB,
+                destW: bw, x0: rect.x0, y0: rect.y0, dcQuantContext: &meta.dcQuantContext)
+        }
         // (ModularDC reads nothing without extra channels.)
         try decodeAcMetadataGroup(
             reader, groupIndex: dcg, rect: rect, dim: dim,
@@ -131,9 +134,33 @@ func decodeVarDCTLowFrequency(_ d: FrameDecoder) throws -> VarDCTLowFrequency {
     meta.varblockCount = totalVarblocks
     meta.usedACs = usedACs
 
-    // libjxl runs adaptive smoothing only for 4:4:4 frames without the
-    // kSkipAdaptiveDCSmoothing flag (JPEG transcodes set it).
-    if d.frameHeader.flags & 128 == 0 && d.frameHeader.chromaIs444 {
+    if useDCFrame {
+        // kUseDcFrame: the DC image is the decoded DC frame's XYB planes
+        // (already dequantized). The section's VarDCTDC stream is absent,
+        // quant_dc stays zero (dcQuantContext above), and adaptive smoothing
+        // is implied off.
+        guard d.frameHeader.chromaIs444 else {
+            throw JXLError.unsupported("kUseDcFrame with chroma subsampling")
+        }
+        let ref = try d.dcXYBFrame()
+        guard ref.width >= divCeil(dim.xsize, 8), ref.height >= divCeil(dim.ysize, 8) else {
+            throw JXLError.malformed("DC frame smaller than the DC image")
+        }
+        // Copy with edge replication into the block-padded planes.
+        for by in 0..<bh {
+            let sy = min(by, ref.height - 1)
+            for bx in 0..<bw {
+                let sx = min(bx, ref.width - 1)
+                let s = sy * ref.width + sx
+                let t = by * bw + bx
+                planeX[t] = ref.x[s]
+                planeY[t] = ref.y[s]
+                planeB[t] = ref.b[s]
+            }
+        }
+    } else if d.frameHeader.flags & 128 == 0 && d.frameHeader.chromaIs444 {
+        // libjxl runs adaptive smoothing only for 4:4:4 frames without the
+        // kSkipAdaptiveDCSmoothing flag (JPEG transcodes set it).
         adaptiveDCSmoothing(
             dcFactors: dequant.mulDC, w: bw, h: bh, x: &planeX, y: &planeY, b: &planeB)
     }

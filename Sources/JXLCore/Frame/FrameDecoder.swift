@@ -78,6 +78,9 @@ final class FrameDecoder {
     /// Frames stored for later reference (`frameType == .referenceOnly`), in
     /// codestream order. Decoded lazily when the patch dictionary needs them.
     let referenceSlots: [FrameSlot]
+    /// DC frames (`frameType == .dc`) preceding the presented frame, decoded
+    /// lazily when its kUseDcFrame flag asks for one.
+    let dcFrameSlots: [FrameSlot]
     let limits: JXLDecodeLimits
     /// Decoded embedded ICC profile bytes (present when `want_icc` is set).
     let iccProfile: [UInt8]?
@@ -149,9 +152,10 @@ final class FrameDecoder {
         let ctx = FrameContext(metadata: metadata, width: size.width, height: size.height)
 
         // Walk the frame sequence: reference-only frames (patch dictionaries
-        // draw from them) are recorded and skipped; the first frame of any
-        // other type is the presented one.
+        // draw from them) and DC frames (kUseDcFrame sources) are recorded
+        // and skipped; the first frame of any other type is the presented one.
         var preceding: [FrameSlot] = []
+        var dcSlots: [FrameSlot] = []
         var toSkip = skipPresentedFrames
         var current = try FrameDecoder.parseFrameSlot(
             reader, context: ctx, codestreamCount: parsed.codestream.count)
@@ -160,6 +164,11 @@ final class FrameDecoder {
                 preceding.append(current)
                 guard preceding.count <= 8 else {
                     throw JXLError.malformed("too many reference frames")
+                }
+            } else if current.header.frameType == .dc {
+                dcSlots.append(current)
+                guard dcSlots.count <= 4 else {
+                    throw JXLError.malformed("too many DC frames")
                 }
             } else if toSkip > 0 {
                 guard !current.header.isLast else {
@@ -177,6 +186,7 @@ final class FrameDecoder {
         }
         slot = current
         referenceSlots = preceding
+        dcFrameSlots = dcSlots
     }
 
     /// Parses one frame header + TOC from `reader` and validates every section
@@ -499,9 +509,6 @@ final class FrameDecoder {
         if metadata.bitDepth.isFloatingPoint && metadata.bitDepth.bitsPerSample != 32 {
             throw JXLError.unsupported("non-binary32 floating-point samples")
         }
-        guard frameHeader.numPasses == 1 else {
-            throw JXLError.unsupported("progressive (multi-pass) frames")
-        }
         guard frameHeader.upsampling == 1 else {
             throw JXLError.unsupported("upsampled Modular frames")
         }
@@ -643,14 +650,16 @@ final class FrameDecoder {
             w: dim.xsize, h: dim.ysize, bitdepth: Int(metadata.bitDepth.bitsPerSample),
             channelCount: channelCount)
 
-        // For a single group the global stream carries every channel; otherwise
-        // large channels are decoded per AC group.
-        let maxChan = dim.numGroups == 1 ? Int.max : dim.groupDim
+        // For a coalesced frame the global stream carries every channel;
+        // otherwise large channels are decoded per AC group (and, for
+        // multi-pass frames, bracketed by squeeze shift across pass sections).
+        let numPasses = Int(slot.header.numPasses)
+        let maxChan = dim.numGroups == 1 && numPasses == 1 ? Int.max : dim.groupDim
         let globalHeader = try modularDecode(
             r0, image: fullImage, groupID: 0, globalTree: globalTree, globalCode: globalCode,
             globalCtxMap: globalCtxMap, maxChanSize: maxChan)
 
-        if dim.numGroups > 1 {
+        if dim.numGroups > 1 || numPasses > 1 {
             // DC-group sections carry the channels whose squeeze shift is >= 3
             // (libjxl ModularStreamId::ModularDC, shift bracket [3, 1000]).
             // Nothing is read from them when no such channel exists.
@@ -668,11 +677,17 @@ final class FrameDecoder {
             // sub-images, then blit serially (the decode phase only reads the
             // full image's channel layout).
             let codestream = self.codestream
+            let header = slot.header
+            // Row-major [group][pass] section ranges + shift brackets.
             let sectionRanges = (0..<dim.numGroups).map { g in
-                slot.sectionRange(acGroupIndex(
-                    pass: 0, group: g, numGroups: dim.numGroups, numDCGroups: dim.numDCGroups))
+                (0..<numPasses).map { pass in
+                    slot.sectionRange(acGroupIndex(
+                        pass: pass, group: g, numGroups: dim.numGroups,
+                        numDCGroups: dim.numDCGroups))
+                }
             }
-            typealias GroupResult = Result<ModularGroupResult?, Error>
+            let brackets = (0..<numPasses).map { header.downsamplingBracket(pass: $0) }
+            typealias GroupResult = Result<[ModularGroupResult], Error>
             var results = [GroupResult?](repeating: nil, count: dim.numGroups)
             results.withUnsafeMutableBufferPointer { slots in
                 // Each iteration writes only its own pre-allocated slot; the
@@ -683,19 +698,28 @@ final class FrameDecoder {
                 let code = globalCode
                 let ctxMap = globalCtxMap
                 DispatchQueue.concurrentPerform(iterations: dim.numGroups) { g in
-                    // ModularStreamId::ModularAC(g, pass 0).ID  (kNumQuantTables = 17)
-                    let streamID = 1 + 3 * dim.numDCGroups + 17 + g
                     out[g] = GroupResult {
-                        try decodeModularGroupImage(
-                            BitReader(codestream, byteRange: sectionRanges[g]),
-                            fullImage: full, group: g, dim: dim,
-                            globalTree: tree, globalCode: code, globalCtxMap: ctxMap,
-                            streamID: streamID)
+                        var groupResults: [ModularGroupResult] = []
+                        for pass in 0..<numPasses {
+                            // ModularStreamId::ModularAC(g, pass).ID  (kNumQuantTables = 17)
+                            let streamID =
+                                1 + 3 * dim.numDCGroups + 17 + pass * dim.numGroups + g
+                            if let r = try decodeModularGroupImage(
+                                BitReader(codestream, byteRange: sectionRanges[g][pass]),
+                                fullImage: full, group: g, dim: dim,
+                                globalTree: tree, globalCode: code, globalCtxMap: ctxMap,
+                                streamID: streamID,
+                                minShift: brackets[pass].minShift,
+                                maxShift: brackets[pass].maxShift) {
+                                groupResults.append(r)
+                            }
+                        }
+                        return groupResults
                     }
                 }
             }
             for result in results {
-                if let groupResult = try result!.get() {
+                for groupResult in try result!.get() {
                     blitModularGroup(groupResult, into: fullImage)
                 }
             }
@@ -709,6 +733,7 @@ final class FrameDecoder {
     // MARK: Reference frames (patch sources)
 
     private var cachedReferences: [Int: ReferenceXYBFrame] = [:]
+    private var cachedDCFrame: ReferenceXYBFrame? = nil
 
     /// Dimensions of the reference frame stored in `index` (0-3), or nil when
     /// no preceding frame fills that slot. Used to validate the patch
@@ -733,21 +758,51 @@ final class FrameDecoder {
         guard let frame = latestReferenceSlot(index) else {
             throw JXLError.malformed("patch reference frame \(index) not present")
         }
-        let h = frame.header
-        guard h.saveBeforeColorTransform else {
+        guard frame.header.saveBeforeColorTransform else {
             throw JXLError.malformed("patches cannot use frames saved post color transform")
         }
-        guard h.isModular, h.colorTransform == .xyb else {
-            throw JXLError.unsupported("non-Modular-XYB patch reference frame")
+        let ref = try modularXYBPlanes(of: frame, role: "patch reference frame")
+        cachedReferences[index] = ref
+        return ref
+    }
+
+    /// Decodes (and caches) the DC frame feeding this frame's kUseDcFrame
+    /// flag: the `frameType == .dc` slot at `dc_level + 1`, whose
+    /// pre-color-transform planes become this frame's DC image.
+    func dcXYBFrame() throws -> ReferenceXYBFrame {
+        if let cached = cachedDCFrame { return cached }
+        let level = frameHeader.dcLevel + 1
+        guard let frame = dcFrameSlots.last(where: { $0.header.dcLevel == level }) else {
+            throw JXLError.malformed("kUseDcFrame without a level-\(level) DC frame")
         }
-        guard h.flags == 0, h.numPasses == 1 else {
-            throw JXLError.unsupported("feature-flagged patch reference frame")
+        guard frame.header.flags & 32 == 0 else {
+            // A DC frame may itself use a deeper DC frame (progressive_dc=2);
+            // recursion is a follow-up.
+            throw JXLError.unsupported("nested DC frames (progressive_dc > 1)")
+        }
+        let ref = try modularXYBPlanes(of: frame, role: "DC frame")
+        cachedDCFrame = ref
+        return ref
+    }
+
+    /// Decodes a non-presented Modular-XYB frame slot (patch reference or DC
+    /// frame) to XYB float planes: channels arrive as Y, X, (B−Y) and scale by
+    /// the frame's DC-quant factors (libjxl dec_modular `kXYB` finalization).
+    private func modularXYBPlanes(of frame: FrameSlot, role: String) throws -> ReferenceXYBFrame {
+        let h = frame.header
+        guard h.isModular, h.colorTransform == .xyb else {
+            throw JXLError.unsupported("non-Modular-XYB \(role)")
+        }
+        // kSkipAdaptiveDCSmoothing (128) is meaningless for modular frames;
+        // anything else (patches/splines/noise/useDcFrame) is unsupported here.
+        guard h.flags & ~UInt64(128) == 0 else {
+            throw JXLError.unsupported("feature-flagged \(role)")
         }
         let w = frame.dim.xsize
         let ht = frame.dim.ysize
         let samples = UInt64(w) * UInt64(ht) * UInt64(3 + metadata.extraChannelCount)
         if samples > UInt64(limits.maxTotalSamples) {
-            throw JXLError.limitExceeded("reference frame \(w)x\(ht)")
+            throw JXLError.limitExceeded("\(role) \(w)x\(ht)")
         }
 
         let (image, dcQuant) = try decodeModularChannels(
@@ -756,7 +811,7 @@ final class FrameDecoder {
             image.channels[0].pixels.count >= w * ht,
             image.channels[1].pixels.count >= w * ht,
             image.channels[2].pixels.count >= w * ht
-        else { throw JXLError.malformed("reference frame channel layout") }
+        else { throw JXLError.malformed("\(role) channel layout") }
 
         var x = [Float](repeating: 0, count: w * ht)
         var y = [Float](repeating: 0, count: w * ht)
@@ -769,9 +824,7 @@ final class FrameDecoder {
             y[i] = Float(cY[i]) * dcQuant[1]
             b[i] = Float(cB[i] &+ cY[i]) * dcQuant[2]
         }
-        let ref = ReferenceXYBFrame(width: w, height: ht, x: x, y: y, b: b)
-        cachedReferences[index] = ref
-        return ref
+        return ReferenceXYBFrame(width: w, height: ht, x: x, y: y, b: b)
     }
 
     // MARK: VarDCT stages
@@ -783,11 +836,6 @@ final class FrameDecoder {
         guard !frameHeader.isModular else { throw JXLError.unsupported("Modular frame is not VarDCT") }
         guard frameHeader.frameType == .regular else {
             throw JXLError.unsupported("non-regular VarDCT frame")
-        }
-        if frameHeader.numPasses > 1 && metadata.extraChannelCount > 0 {
-            // Extra-channel modular data is bracketed across pass sections by
-            // shift; that walk is not implemented yet.
-            throw JXLError.unsupported("extra channels in progressive frames")
         }
         guard !frameHeader.needsBlending || allowBlendingDecode else {
             throw JXLError.unsupported(
@@ -803,7 +851,7 @@ final class FrameDecoder {
         // kPatches (2) is decoded from the DC-global head; splines (16) and
         // noise (1) are not yet parsed and would desynchronize the stream.
         // kSkipAdaptiveDCSmoothing (128) is honored.
-        guard frameHeader.flags & ~UInt64(128 | 2) == 0 else {
+        guard frameHeader.flags & ~UInt64(128 | 32 | 2) == 0 else {
             throw JXLError.unsupported("VarDCT frame features (splines/noise)")
         }
     }
