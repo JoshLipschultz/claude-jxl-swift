@@ -316,7 +316,9 @@ func encodePNM(_ image: JXLDecodedImage) -> [UInt8] {
     for y in 0..<image.height {
         for x in 0..<image.width {
             for c in 0..<channelCount {
-                let v = UInt32(bitPattern: image.planes[c][y * image.width + x])
+                // Clamp out-of-range samples (blend/palette edge cases can
+                // overshoot the nominal range) rather than wrapping.
+                let v = UInt32(min(max(image.planes[c][y * image.width + x], 0), Int32(maxval)))
                 if twoBytes {
                     out.append(UInt8((v >> 8) & 0xFF))  // PNM is big-endian
                     out.append(UInt8(v & 0xFF))
@@ -352,7 +354,7 @@ func encodePAM(_ image: JXLDecodedImage) -> [UInt8] {
         for x in 0..<image.width {
             for c in 0..<depth {
                 let plane = c < image.colorChannels ? c : image.colorChannels
-                let v = UInt32(bitPattern: image.planes[plane][y * image.width + x])
+                let v = UInt32(min(max(image.planes[plane][y * image.width + x], 0), Int32(maxval)))
                 if twoBytes {
                     out.append(UInt8((v >> 8) & 0xFF))  // PAM is big-endian
                     out.append(UInt8(v & 0xFF))
