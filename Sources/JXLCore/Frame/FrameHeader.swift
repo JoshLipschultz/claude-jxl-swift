@@ -33,6 +33,15 @@ public struct FrameContext: Sendable {
     }
 }
 
+/// One channel's frame-blending parameters (libjxl `BlendingInfo`).
+public struct JXLBlendingInfo: Sendable, Equatable {
+    public var mode: UInt32 = 0
+    public var alphaChannel: UInt32 = 0
+    public var clamp = false
+    /// Reference slot (0-3) supplying the background.
+    public var source: UInt32 = 0
+}
+
 public struct FrameHeader: Sendable {
     public var frameType: FrameType = .regular
     public var encoding: FrameEncoding = .varDCT
@@ -54,11 +63,14 @@ public struct FrameHeader: Sendable {
     public var isLast = true
     /// Animation frame duration in ticks (0 for stills).
     public var duration: UInt32 = 0
-    /// Color-channel blend mode (0=Replace, 1=Add, 2=Blend, 3=AlphaWeightedAdd,
-    /// 4=Mul); the presented frame composites onto the canvas with this.
-    public var blendMode: UInt32 = 0
+    /// Color-channel blending (mode 0=Replace, 1=Add, 2=Blend,
+    /// 3=AlphaWeightedAdd, 4=Mul; `source` is the reference slot the frame
+    /// composites onto).
+    public var blendingInfo = JXLBlendingInfo()
+    /// Per-extra-channel blending.
+    public var ecBlendingInfo: [JXLBlendingInfo] = []
     /// True when the color or any extra-channel blending departs from
-    /// full-frame Replace (the only composition currently implemented).
+    /// full-frame Replace — the frame then composites against a canvas.
     public var needsBlending = false
     /// Slot 0-3 this frame is stored into for later reference (patches,
     /// blending); meaningful when the frame can be referenced (`!isLast`).
@@ -195,13 +207,14 @@ public struct FrameHeader: Sendable {
 
         // Blending / animation / is_last.
         if frameType == .regular || frameType == .skipProgressive {
-            blendMode = parseBlendingInfo(
+            blendingInfo = parseBlendingInfo(
                 r, numExtraChannels: ctx.numExtraChannels, isPartial: isPartialFrame)
-            if blendMode != 0 || isPartialFrame { needsBlending = true }
+            if blendingInfo.mode != 0 || isPartialFrame { needsBlending = true }
             for _ in 0..<ctx.numExtraChannels {
-                let ecMode = parseBlendingInfo(
+                let ec = parseBlendingInfo(
                     r, numExtraChannels: ctx.numExtraChannels, isPartial: isPartialFrame)
-                if ecMode != 0 { needsBlending = true }
+                ecBlendingInfo.append(ec)
+                if ec.mode != 0 { needsBlending = true }
             }
             if ctx.haveAnimation {
                 duration = r.readU32(.value(0), .value(1), .bits(8), .bits(32))
@@ -251,20 +264,21 @@ public struct FrameHeader: Sendable {
     @discardableResult
     private mutating func parseBlendingInfo(
         _ r: BitReader, numExtraChannels: Int, isPartial: Bool
-    ) -> UInt32 {
-        let mode = r.readU32(.value(0), .value(1), .value(2), .bits(2, offset: 3))  // BlendMode
-        lastBlendModeWasReplace = lastBlendModeWasReplace && (mode == 0)
-        let involvesAlpha = mode == 2 || mode == 3  // kBlend / kAlphaWeightedAdd
+    ) -> JXLBlendingInfo {
+        var info = JXLBlendingInfo()
+        info.mode = r.readU32(.value(0), .value(1), .value(2), .bits(2, offset: 3))  // BlendMode
+        lastBlendModeWasReplace = lastBlendModeWasReplace && (info.mode == 0)
+        let involvesAlpha = info.mode == 2 || info.mode == 3  // kBlend / kAlphaWeightedAdd
         if numExtraChannels > 0 && involvesAlpha {
-            _ = r.readU32(.value(0), .value(1), .value(2), .bits(3, offset: 3))  // alpha_channel
+            info.alphaChannel = r.readU32(.value(0), .value(1), .value(2), .bits(3, offset: 3))
         }
-        if (numExtraChannels > 0 && involvesAlpha) || mode == 4 {  // ... or kMul
-            _ = r.readBool()  // clamp
+        if (numExtraChannels > 0 && involvesAlpha) || info.mode == 4 {  // ... or kMul
+            info.clamp = r.readBool()
         }
-        if mode != 0 || isPartial {
-            _ = r.readU32(.value(0), .value(1), .value(2), .value(3))  // source
+        if info.mode != 0 || isPartial {
+            info.source = r.readU32(.value(0), .value(1), .value(2), .value(3))
         }
-        return mode
+        return info
     }
 
     private mutating func parseLoopFilter(_ r: BitReader, isModular: Bool) {

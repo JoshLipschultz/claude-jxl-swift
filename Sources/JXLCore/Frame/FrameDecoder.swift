@@ -108,6 +108,9 @@ final class FrameDecoder {
     private var cachedLowFrequency: VarDCTLowFrequency?
     private var cachedACGlobal: VarDCTACGlobal?
     private var cachedCoefficients: VarDCTCoefficients?
+    /// Set by the compositing path (`decodeFrames`) so the per-frame pixel
+    /// decode proceeds even when the frame blends onto a canvas.
+    var allowBlendingDecode = false
 
     /// `skipPresentedFrames` selects a later animation frame: that many
     /// presentable frames are skipped (reference-only frames are recorded as
@@ -325,6 +328,63 @@ final class FrameDecoder {
             planes: colorPlanes + ecPlanes, iccProfile: nil)
     }
 
+    /// Decodes this frame's own pixels as float planes in the output encoded
+    /// space (3 color planes — grayscale replicated — plus normalized extra
+    /// channels), sized to the frame's crop. This is the compositing currency:
+    /// frame blending runs after the color transform on encoded samples.
+    func decodeFrameFloat() throws -> FloatFrame {
+        allowBlendingDecode = true
+        let extra = metadata.extraChannelCount
+
+        if frameHeader.isModular {
+            if frameHeader.colorTransform == .xyb {
+                let img = try decodeModularImage(format: .float32)
+                let planes = img.planes.map { plane in
+                    plane.map { Float(bitPattern: UInt32(bitPattern: $0)) }
+                }
+                return FloatFrame(width: img.width, height: img.height, planes: planes)
+            }
+            // Native modular: normalize integers by each channel's bit depth
+            // (color by the image depth, extras by their own).
+            let img = try decodeModularImage()
+            guard !img.isFloat else {
+                throw JXLError.unsupported("float Modular frames in composited animations")
+            }
+            let colorMax = Float((1 << img.bitsPerSample) - 1)
+            var planes: [[Float]] = []
+            for c in 0..<img.colorChannels {
+                planes.append(img.planes[c].map { Float($0) / colorMax })
+            }
+            while planes.count < 3 { planes.append(planes[0]) }  // grayscale
+            for e in 0..<extra {
+                let bits = Int(metadata.extraChannels[e].bitDepth.bitsPerSample)
+                let ecMax = Float((1 << bits) - 1)
+                planes.append(img.planes[img.colorChannels + e].map { Float($0) / ecMax })
+            }
+            return FloatFrame(width: img.width, height: img.height, planes: planes)
+        }
+
+        guard frameHeader.colorTransform == .xyb else {
+            throw JXLError.unsupported("composited YCbCr frames")
+        }
+        var xyb = try reconstructXYB()
+        if let patches = patchDictionary, !patches.isEmpty {
+            try renderPatches(patches, into: &xyb) { try self.referenceXYBFrame($0) }
+        }
+        if frameHeader.upsampling > 1 {
+            xyb = try upsampleXYB(xyb)
+        }
+        let spec = try makeOutputColorSpec(
+            metadata.colorEncoding, toneMapping: metadata.toneMapping)
+        var planes = xybToRGBFloatPlanes(xyb, spec: spec).map { plane in
+            plane.map { Float(bitPattern: UInt32(bitPattern: $0)) }
+        }
+        for plane in try finalizeExtraChannels() {
+            planes.append(plane.map { Float($0) / 255 })
+        }
+        return FloatFrame(width: xyb.width, height: xyb.height, planes: planes)
+    }
+
     /// Rescales an 8-bit extra-channel plane to the requested color format so
     /// every plane of the result shares one sample representation.
     private func scaleECPlane(_ plane: [Int32], to format: JXLSampleFormat) -> [Int32] {
@@ -433,8 +493,9 @@ final class FrameDecoder {
         guard frameHeader.upsampling == 1 else {
             throw JXLError.unsupported("upsampled Modular frames")
         }
-        guard !frameHeader.needsBlending else {
-            throw JXLError.unsupported("frame blending other than full-frame replace")
+        guard !frameHeader.needsBlending || allowBlendingDecode else {
+            throw JXLError.unsupported(
+                "frame blending other than full-frame replace (use decodeFrames)")
         }
 
         let isGray = metadata.colorSpace == .grayscale && frameHeader.colorTransform == .none
@@ -682,8 +743,9 @@ final class FrameDecoder {
         guard frameHeader.numPasses == 1 else {
             throw JXLError.unsupported("progressive (multi-pass) VarDCT frames")
         }
-        guard !frameHeader.needsBlending else {
-            throw JXLError.unsupported("frame blending other than full-frame replace")
+        guard !frameHeader.needsBlending || allowBlendingDecode else {
+            throw JXLError.unsupported(
+                "frame blending other than full-frame replace (use decodeFrames)")
         }
         if !frameHeader.chromaIs444 {
             // Subsampled reconstruction is implemented for the JPEG-transcode

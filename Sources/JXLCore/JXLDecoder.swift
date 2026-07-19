@@ -235,18 +235,34 @@ public enum JXL {
     }
 
     /// Decodes every presented frame of an animated file (a still yields one
-    /// frame). Frames whose composition is anything other than a full-frame
-    /// replace are not yet supported.
+    /// frame), compositing each onto the animation canvas: cropped frames,
+    /// blend/add/mul modes, and reference-slot backgrounds are all honored
+    /// (libjxl stage_blending semantics). Each returned frame is the full
+    /// composited image.
     public static func decodeFrames(
-        from data: [UInt8], limits: JXLDecodeLimits = .default, maxFrames: Int = 4096
+        from data: [UInt8], limits: JXLDecodeLimits = .default, maxFrames: Int = 4096,
+        format: JXLSampleFormat = .uint8
     ) throws -> [Frame] {
         var frames: [Frame] = []
+        var references = [FrameCanvas?](repeating: nil, count: 4)
         for index in 0..<maxFrames {
             let decoder = try FrameDecoder(data: data, limits: limits, skipPresentedFrames: index)
             let header = decoder.frameHeader
+            let metadata = decoder.metadata
+            let fg = try decoder.decodeFrameFloat()
+            let canvas = compositeFrame(
+                fg: fg, header: header,
+                imageWidth: Int(decoder.size.width), imageHeight: Int(decoder.size.height),
+                extraChannels: metadata.extraChannels,
+                references: { references[$0] })
+            if !header.isLast && header.saveAsReference < 4 {
+                references[Int(header.saveAsReference)] = canvas
+            }
             frames.append(
                 Frame(
-                    image: try decoder.decodeImage(),
+                    image: quantizeCanvas(
+                        canvas, colorChannels: 3,
+                        extraChannels: metadata.extraChannelCount, format: format),
                     durationTicks: header.duration, isLast: header.isLast))
             if header.isLast { break }
         }
@@ -254,9 +270,10 @@ public enum JXL {
     }
 
     public static func decodeFrames(
-        from data: Data, limits: JXLDecodeLimits = .default, maxFrames: Int = 4096
+        from data: Data, limits: JXLDecodeLimits = .default, maxFrames: Int = 4096,
+        format: JXLSampleFormat = .uint8
     ) throws -> [Frame] {
-        try decodeFrames(from: [UInt8](data), limits: limits, maxFrames: maxFrames)
+        try decodeFrames(from: [UInt8](data), limits: limits, maxFrames: maxFrames, format: format)
     }
 
     /// Decodes a fast 1/8-scale preview of a VarDCT (lossy) frame — the

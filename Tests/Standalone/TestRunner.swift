@@ -78,6 +78,7 @@ struct TestRunner {
         brotli()
         jbrdParse()
         hdrOutput()
+        frameBlending()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -266,6 +267,55 @@ struct TestRunner {
             let truncated = [UInt8](compressed.prefix(compressed.count / 2))
             _ = try? Brotli.decompress(truncated, maxOutputSize: 16 << 20)
             check(true, "brotli truncated stream handled without crashing")
+        }
+    }
+
+    // MARK: - Frame blending (composited animations)
+
+    /// `96x64_blend.jxl` (lossy) / `96x64_blendll.jxl` (lossless) come from an
+    /// APNG whose frames 1-3 are partial crops alpha-OVER-blended onto the
+    /// canvas. Each decoded frame must match djxl's composited APNG output
+    /// (`.rgba` oracles): near-exact for lossless (float-rounding ±1), looser
+    /// for lossy where per-frame codec differences accumulate through the
+    /// blend chain.
+    static func frameBlending() {
+        let dir = fixturesDir()
+        for (name, minPSNR) in [("96x64_blendll", 55.0), ("96x64_blend", 40.0)] {
+            guard let jxl = try? Data(contentsOf: dir.appendingPathComponent("\(name).jxl")),
+                let frames = try? JXL.decodeFrames(from: jxl)
+            else {
+                check(false, "\(name) composited decode")
+                continue
+            }
+            check(frames.count == 4, "\(name) has 4 frames")
+            var worst = 999.0
+            var alphaOK = true
+            for (f, frame) in frames.enumerated() {
+                guard let rgba = try? Data(
+                    contentsOf: dir.appendingPathComponent("\(name)_\(f).rgba"))
+                else {
+                    check(false, "\(name) frame \(f) oracle present")
+                    continue
+                }
+                let img = frame.image
+                let n = img.width * img.height
+                guard rgba.count == n * 4, img.planes.count >= 4 else {
+                    check(false, "\(name) frame \(f) shape")
+                    continue
+                }
+                var se = 0.0
+                for i in 0..<n {
+                    for c in 0..<3 {
+                        let d = Double(Int(rgba[i * 4 + c]) - Int(img.planes[c][i]))
+                        se += d * d
+                    }
+                    if abs(Int(rgba[i * 4 + 3]) - Int(img.planes[3][i])) > 1 { alphaOK = false }
+                }
+                let mse = se / Double(n * 3)
+                worst = min(worst, mse == 0 ? 999 : 10 * log10(255.0 * 255.0 / mse))
+            }
+            check(worst > minPSNR, "\(name) frames match djxl (worst \(Int(worst)) dB)")
+            check(alphaOK, "\(name) composited alpha within 1")
         }
     }
 
