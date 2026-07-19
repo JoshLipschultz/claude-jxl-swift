@@ -17,6 +17,8 @@ Every actionable finding below was root-caused and fixed; re-measured results:
 | patches | 20.1 dB | re-diagnosed: **121.7 dB vs djxl in sRGB** — not a patch bug; needs CMS output to the embedded ICC space (existing backlog item) |
 | grayscale_public_university | 26.1 dB | 59.0 dB vs reference at 8-bit output (djxl's own 8-bit scores 56.0; tol 60.2 requires float output) — modular gaborish/EPF stages added |
 | alpha_triangles CLI wrap | −31.4 dB as written | clamped output (CLI fix) |
+| patches (ICC round) | 20.1 dB | 57.4 dB — matrix+TRC CMS output to the embedded profile (float = linear device space, djxl PFM convention); remaining gap is skcms's parametric TRC *fit* inside djxl, which we deliberately do not replicate (our conversion agrees with lcms) |
+| grayscale (ICC round) | 12.9 dB raw | **102.1 dB (tol 80) PASS** — gray kTRC ICC output, no manual alignment needed |
 
 Full-corpus re-sweep: 0 malformed-stream errors on valid files; every non-decoding case is a clean named unsupported (progressive, splines/noise, JPEG-transcode wide output, wide/upsampled VarDCT extra channels). Remaining pixel gaps to official tolerances: float-precision parity in VarDCT (bike/opsin_inverse at 75–67 vs tol 80), CMS-to-ICC output (patches), float-precision modular output (grayscale_public_university), spot-color rendering (spot).
 

@@ -85,6 +85,10 @@ final class FrameDecoder {
     let upsamplingWeights: UpsamplingCustomWeights
     /// Custom XYB inverse-opsin matrix/biases (nil = spec defaults).
     let customOpsin: JXLOpsinInverseMatrix?
+    /// The embedded ICC profile parsed for output conversion, when it is a
+    /// matrix+TRC shape our CMS can target (nil otherwise: sRGB fallback).
+    private(set) lazy var iccOutput: ICCOutputProfile? =
+        iccProfile.flatMap(parseICCOutputProfile)
     /// The original file bytes (container box payload ranges index into this).
     let fileData: [UInt8]
 
@@ -308,7 +312,8 @@ final class FrameDecoder {
         // profile fall back to sRGB output, so the profile (which describes
         // the original space) is deliberately not attached.
         let spec = try makeOutputColorSpec(
-            metadata.colorEncoding, toneMapping: metadata.toneMapping, customOpsin: customOpsin)
+            metadata.colorEncoding, toneMapping: metadata.toneMapping, customOpsin: customOpsin,
+            icc: iccOutput)
         let colorPlanes: [[Int32]]
         let bits: Int
         let isFloat: Bool
@@ -329,7 +334,8 @@ final class FrameDecoder {
         return JXLDecodedImage(
             width: xyb.width, height: xyb.height, colorChannels: 3,
             extraChannels: ecPlanes.count, bitsPerSample: bits, isFloat: isFloat,
-            planes: colorPlanes + ecPlanes, iccProfile: nil)
+            planes: colorPlanes + ecPlanes,
+            iccProfile: iccOutput != nil ? iccProfile.map { Data($0) } : nil)
     }
 
     /// Decodes this frame's own pixels as float planes in the output encoded
@@ -379,7 +385,8 @@ final class FrameDecoder {
             xyb = try upsampleXYB(xyb)
         }
         let spec = try makeOutputColorSpec(
-            metadata.colorEncoding, toneMapping: metadata.toneMapping, customOpsin: customOpsin)
+            metadata.colorEncoding, toneMapping: metadata.toneMapping, customOpsin: customOpsin,
+            icc: iccOutput)
         var planes = xybToRGBFloatPlanes(xyb, spec: spec).map { plane in
             plane.map { Float(bitPattern: UInt32(bitPattern: $0)) }
         }
@@ -441,7 +448,8 @@ final class FrameDecoder {
         }
 
         let spec = try makeOutputColorSpec(
-            metadata.colorEncoding, toneMapping: metadata.toneMapping, customOpsin: customOpsin)
+            metadata.colorEncoding, toneMapping: metadata.toneMapping, customOpsin: customOpsin,
+            icc: iccOutput)
         let img = XYBImage(
             width: pw, height: ph, stride: bw, paddedHeight: bh, x: dc.x, y: dc.y, b: dc.b)
         return JXLDecodedImage(
@@ -537,7 +545,8 @@ final class FrameDecoder {
             modularRestorationFilters(x: &x, y: &y, b: &b, w: w, h: h, header: frameHeader)
             let xyb = XYBImage(width: w, height: h, stride: w, paddedHeight: h, x: x, y: y, b: b)
             let spec = try makeOutputColorSpec(
-                metadata.colorEncoding, toneMapping: metadata.toneMapping, customOpsin: customOpsin)
+                metadata.colorEncoding, toneMapping: metadata.toneMapping, customOpsin: customOpsin,
+            icc: iccOutput)
             let ecPlanes = fullImage.channels.dropFirst(3).map {
                 scaleECPlane($0.pixels, to: format)
             }
@@ -561,7 +570,8 @@ final class FrameDecoder {
             return JXLDecodedImage(
                 width: w, height: h, colorChannels: 3,
                 extraChannels: ecPlanes.count, bitsPerSample: bits, isFloat: isFloat,
-                planes: colorPlanes + ecPlanes, iccProfile: nil)
+                planes: colorPlanes + ecPlanes,
+            iccProfile: iccOutput != nil ? iccProfile.map { Data($0) } : nil)
         }
 
         // Modular samples are native (no color transform applied here), so the

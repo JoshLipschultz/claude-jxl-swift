@@ -82,6 +82,7 @@ struct TestRunner {
         float32Modular()
         orientationBaking()
         deltaPalette()
+        iccOutput()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -159,6 +160,63 @@ struct TestRunner {
             }
         }
         return (w, h, planes)
+    }
+
+    // MARK: - ICC output (matrix + TRC CMS)
+
+    /// `appl_display.icc` is a real Apple display profile (matrix colorants +
+    /// shared 1024-entry 'curv' TRC — the profile embedded by the conformance
+    /// `patches` testcase). The expected linear-sRGB -> device matrix was
+    /// computed independently (numpy: inv(colorants) @ bradford(D65->D50) @
+    /// sRGB-to-XYZ), and the tone curve must round-trip. `96x64_iccout.jxl`
+    /// embeds the same profile; its decode must attach it and produce samples
+    /// in the profile's space (validated at the corpus level vs lcms/djxl).
+    static func iccOutput() {
+        let dir = fixturesDir()
+        guard let iccData = try? Data(contentsOf: dir.appendingPathComponent("appl_display.icc")),
+            let profile = parseICCOutputProfile([UInt8](iccData))
+        else {
+            check(false, "appl_display.icc parses as matrix+TRC")
+            return
+        }
+        check(!profile.isGray, "profile is RGB")
+        let expected: [Float] = [
+            0.827775, 0.178156, -0.006040,
+            0.032518, 0.952290, 0.015222,
+            0.017108, 0.072526, 0.910725,
+        ]
+        if let m = profile.matrix {
+            var maxErr: Float = 0
+            for i in 0..<9 { maxErr = max(maxErr, abs(m[i] - expected[i])) }
+            check(maxErr < 5e-4, "ICC output matrix matches independent computation (err \(maxErr))")
+        } else {
+            check(false, "profile has a matrix")
+        }
+        // TRC: decode is monotone on [0,1] and encode inverts it.
+        var maxRT = 0.0
+        var monotone = true
+        var prev = -1.0
+        for i in 0...200 {
+            let s = Double(i) / 200
+            let lin = profile.trc.decode(s)
+            if lin < prev - 1e-9 { monotone = false }
+            prev = lin
+            maxRT = max(maxRT, abs(profile.trc.encode(lin) - s))
+        }
+        check(monotone, "TRC decode is monotone")
+        check(maxRT < 2e-3, "TRC encode inverts decode (max err \(maxRT))")
+
+        // Decode of a file embedding this profile: samples are in the
+        // profile's space and the profile rides along.
+        guard let jxl = try? Data(contentsOf: dir.appendingPathComponent("96x64_iccout.jxl")),
+            let img = try? JXL.decodeImage(from: [UInt8](jxl))
+        else {
+            check(false, "96x64_iccout decodes")
+            return
+        }
+        eq(img.iccProfile, iccData, "decoded image carries the embedded ICC profile")
+        FileHandle.standardError.write(
+            Data("  [icc-output] matrix+TRC profile conversion verified\n".utf8))
     }
 
     // MARK: - Delta palette (lossy palette)

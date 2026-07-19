@@ -72,6 +72,8 @@ enum OutputTransfer {
     case pq(intensityTarget: Float)
     /// ARIB STD-B67 OETF (scene light -> encoded).
     case hlgOETF
+    /// An embedded ICC profile's (inverted) tone curve, domain [0,1].
+    case curve(ICCToneCurve)
 
     /// Largest meaningful display input: 1.0 for relative transfers, but
     /// 10000/target for PQ (an absolute curve — content may exceed the
@@ -107,6 +109,8 @@ enum OutputTransfer {
             return s <= 1.0 / 12
                 ? Float((3.0 * s).squareRoot())
                 : Float(kHLGA * log(12.0 * s - kHLGB) + kHLGC)
+        case .curve(let c):
+            return Float(c.encode(Double(v)))
         }
     }
 
@@ -137,6 +141,11 @@ enum OutputTransfer {
         case .gamma(let g):
             let e = powf(abs(d), Float(g))
             return d < 0 ? -e : e
+        case .curve:
+            // Float output for embedded-ICC files is the *linear* device
+            // space (djxl PFM convention); the TRC applies only to integer
+            // outputs via the quantizer.
+            return d
         }
     }
 
@@ -166,6 +175,8 @@ enum OutputTransfer {
             return s <= 0.5
                 ? s * s / 3.0
                 : (exp((s - kHLGC) / kHLGA) + kHLGB) / 12.0
+        case .curve(let c):
+            return c.decode(s)
         }
     }
 }
@@ -371,8 +382,20 @@ private let kSRGBPrimaries = [
 /// OOTF scale by.
 func makeOutputColorSpec(
     _ enc: JXLColorEncoding, toneMapping: JXLToneMapping = JXLToneMapping(),
-    customOpsin: JXLOpsinInverseMatrix? = nil
+    customOpsin: JXLOpsinInverseMatrix? = nil,
+    icc: ICCOutputProfile? = nil
 ) throws -> OutputColorSpec {
+    // Embedded-ICC output: matrix+TRC profiles convert exactly (the returned
+    // samples are then IN the profile's space); other profile shapes keep the
+    // sRGB fallback below.
+    if let icc {
+        let transfer = OutputTransfer.curve(icc.trc)
+        return OutputColorSpec(
+            matrix: icc.matrix, quantizer: TransferQuantizer(transfer: transfer),
+            transfer: transfer,
+            opsinScale: 255.0 / toneMapping.intensityTarget,
+            customOpsin: customOpsin)
+    }
     // Transfer function.
     let transfer: OutputTransfer
     if enc.hasGamma {
@@ -452,7 +475,7 @@ func makeOutputColorSpec(
 
 // MARK: 3x3 color matrix math (Double)
 
-private func mul3(_ a: [Double], _ b: [Double]) -> [Double] {
+func mul3(_ a: [Double], _ b: [Double]) -> [Double] {
     var r = [Double](repeating: 0, count: 9)
     for i in 0..<3 {
         for j in 0..<3 {
@@ -462,7 +485,7 @@ private func mul3(_ a: [Double], _ b: [Double]) -> [Double] {
     return r
 }
 
-private func inv3(_ m: [Double]) -> [Double] {
+func inv3(_ m: [Double]) -> [Double] {
     let a = m[0], b = m[1], c = m[2]
     let d = m[3], e = m[4], f = m[5]
     let g = m[6], h = m[7], i = m[8]
@@ -480,7 +503,7 @@ private func xyToXYZ(_ c: JXLChromaticity) -> [Double] {
 }
 
 /// RGB -> XYZ for the given primaries and white point.
-private func rgbToXYZMatrix(primaries p: [JXLChromaticity], white: JXLChromaticity) -> [Double] {
+func rgbToXYZMatrix(primaries p: [JXLChromaticity], white: JXLChromaticity) -> [Double] {
     let r = xyToXYZ(p[0])
     let g = xyToXYZ(p[1])
     let b = xyToXYZ(p[2])
@@ -506,7 +529,7 @@ private let kBradford: [Double] = [
 ]
 
 /// Bradford chromatic adaptation from `src` to `dst` white point (XYZ space).
-private func bradfordAdaptation(from src: JXLChromaticity, to dst: JXLChromaticity) -> [Double] {
+func bradfordAdaptation(from src: JXLChromaticity, to dst: JXLChromaticity) -> [Double] {
     let ws = xyToXYZ(src)
     let wd = xyToXYZ(dst)
     func cone(_ w: [Double]) -> [Double] {
