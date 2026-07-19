@@ -27,6 +27,11 @@ final class ImageCanvasView: NSView {
         scrollView.allowsMagnification = true
         scrollView.minMagnification = 0.02
         scrollView.maxMagnification = 64
+        // Center the document when it's smaller than the viewport (per axis),
+        // like Preview.app. The clip view must be swapped in before the
+        // document view is assigned so the document lands in the new clip view,
+        // and before the background settings so they propagate to it.
+        scrollView.contentView = CenteringClipView()
         scrollView.backgroundColor = .underPageBackgroundColor
         scrollView.drawsBackground = true
         scrollView.documentView = documentImageView
@@ -108,6 +113,9 @@ final class ImageCanvasView: NSView {
         scrollView.magnification = clamped
     }
 
+    /// Centers the scroll position when the image is larger than the viewport.
+    /// (When it's smaller, CenteringClipView's constrainBoundsRect(_:) clamps
+    /// whatever origin this computes to the centered one, so both paths agree.)
     private func centerImage() {
         guard documentImageView.hasImage else { return }
         let doc = documentImageView.frame.size
@@ -266,4 +274,28 @@ private final class DocumentImageView: NSView {
     }
 
     override func mouseExited(with event: NSEvent) { onHover?(nil) }
+}
+
+/// Clip view that centers the document whenever it's smaller than the viewport,
+/// per axis independently (Preview.app behavior). AppKit funnels every scroll
+/// origin — including the ones NSScrollView computes during live pinch
+/// magnification, when zooming shrinks the document below the visible size —
+/// through `constrainBoundsRect(_:)`, so overriding it keeps the image centered
+/// at all times. Both rects here are in the clip view's (magnified) bounds
+/// space, so the math is magnification-agnostic. Bounds-changed notifications
+/// still post normally; ImageCanvasView depends on them for the preview/full
+/// image switch.
+private final class CenteringClipView: NSClipView {
+    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
+        var rect = super.constrainBoundsRect(proposedBounds)
+        guard let doc = documentView else { return rect }
+        let docFrame = doc.frame
+        if rect.width > docFrame.width {
+            rect.origin.x = docFrame.minX - (rect.width - docFrame.width) / 2
+        }
+        if rect.height > docFrame.height {
+            rect.origin.y = docFrame.minY - (rect.height - docFrame.height) / 2
+        }
+        return rect
+    }
 }
