@@ -504,9 +504,6 @@ final class FrameDecoder {
 
         let isGray = metadata.colorSpace == .grayscale && frameHeader.colorTransform == .none
         let colorChannels = isGray ? 1 : 3
-        if ProcessInfo.processInfo.environment["JXL_DEBUG_GRAY"] != nil {
-            FileHandle.standardError.write(Data("modular frame: colorTransform=\(frameHeader.colorTransform) gray=\(isGray) gab=\(frameHeader.loopFilterGab) epfIters=\(frameHeader.loopFilterEpfIters) bits=\(metadata.bitDepth.bitsPerSample)\n".utf8))
-        }
         let extra = metadata.extraChannelCount
         try checkPixelLimits(channels: colorChannels + extra)
 

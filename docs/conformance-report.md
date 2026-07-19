@@ -1,5 +1,29 @@
 # JPEG XL conformance scorecard — pure-Swift decoder
 
+## Post-fix status (2026-07-19 fix round)
+
+Every actionable finding below was root-caused and fixed; re-measured results:
+
+| Testcase | Was | Now |
+|---|---|---|
+| animation_icos4d | ERROR (TOC walk) | all 48 frames decode, 58.4+ dB (8-bit floor) — save_before_color_transform gating fix |
+| lossless_pfm | ERROR (finalState) | **bit-exact** vs reference — 32-bit WP wrap + fast-track kernel semantics |
+| spot | ERROR (finalState) | decodes cleanly (partial reference-property block fix); full match needs spot-color rendering |
+| sunset_logo | silent 2048x1024 | **924x1386, 108.2 dB (tol 72.2) PASS** — layered-still compositing + CLI orientation |
+| blendmodes | −19.1 dB | **61.1 dB (tol 48) PASS** — layered-still compositing (earlier −19 also partly a scoring artifact) |
+| cmyk_layers | 16.1 dB | **166.0 dB (tol 60.2) PASS** — layered-still compositing |
+| delta_palette | 5.4 dB | **byte-exact vs djxl, 149.8 dB PASS** — InvPalette delta path |
+| opsin_inverse | 10.6 dB | 66.9 dB (tol 80) — custom OpsinInverseMatrix + unclamped float output; residual is diffuse VarDCT float-precision disagreement (same class as bike 75.8) |
+| patches | 20.1 dB | re-diagnosed: **121.7 dB vs djxl in sRGB** — not a patch bug; needs CMS output to the embedded ICC space (existing backlog item) |
+| grayscale_public_university | 26.1 dB | 59.0 dB vs reference at 8-bit output (djxl's own 8-bit scores 56.0; tol 60.2 requires float output) — modular gaborish/EPF stages added |
+| alpha_triangles CLI wrap | −31.4 dB as written | clamped output (CLI fix) |
+
+Full-corpus re-sweep: 0 malformed-stream errors on valid files; every non-decoding case is a clean named unsupported (progressive, splines/noise, JPEG-transcode wide output, wide/upsampled VarDCT extra channels). Remaining pixel gaps to official tolerances: float-precision parity in VarDCT (bike/opsin_inverse at 75–67 vs tol 80), CMS-to-ICC output (patches), float-precision modular output (grayscale_public_university), spot-color rendering (spot).
+
+---
+
+## Original scorecard (pre-fix, 2026-07 conformance agent run)
+
 Corpus: official [libjxl/conformance](https://github.com/libjxl/conformance) testcases (git-lfs blobs fetched from the public `gs://jxl-conformance` GCS bucket, since `git lfs` is not installed). All **26 full-resolution testcases** fetched and run. The 13 `*_5` variants were skipped — they test 1:5 downsampled decoding, a decoder mode we do not have.
 
 Method: `jxl decode input.jxl out float` (PFM; the CLI falls back to 16-bit PNM for >8-bit modular images), compared against `reference_image.npy` (float32, unclamped, linear-in-profile) with PSNR over the color channels (peak = 1.0). `jxl frames` for animations, `jxl tojpeg` vs `reconstructed.jpg` for JPEG-reconstruction cases. Official per-case tolerance shown as `tol` (derived from `test.json` `rms_error`: PSNR_tol = −20·log10(rms)). Our output clamps to [0,1] while the reference is unclamped, so a "clamped" PSNR (reference clipped to [0,1]) is reported where it differs materially.
