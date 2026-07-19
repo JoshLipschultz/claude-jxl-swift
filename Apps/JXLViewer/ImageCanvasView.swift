@@ -140,9 +140,18 @@ final class ImageCanvasView: NSView {
     }
 }
 
-/// The scroll view's document view: sized to the image's pixel dimensions and
-/// drawn at 1:1 (the scroll view supplies zoom). Flipped so (0,0) is the top-left
-/// pixel, which keeps the cursor→pixel mapping trivial.
+/// The scroll view's document view: sized to the image's pixel dimensions, with
+/// the scroll view supplying zoom. Flipped so (0,0) is the top-left pixel, which
+/// keeps the cursor→pixel mapping trivial.
+///
+/// The image is NOT drawn through `draw(_:)`: at 26 MP the view's backing store
+/// would be hundreds of megabytes and every magnification change would re-render
+/// it on the CPU, making pinch-zoom crawl. Instead the CGImage is assigned
+/// directly as the backing layer's `contents` (`wantsUpdateLayer`), so Core
+/// Animation scales the one uploaded texture on the GPU during live zoom with no
+/// redraws at all — the same technique that makes Preview.app feel instant. The
+/// checkerboard under transparent images is the layer's pattern background
+/// color, also composited without any per-zoom CPU work.
 private final class DocumentImageView: NSView {
 
     var onHover: ((String?) -> Void)?
@@ -157,9 +166,43 @@ private final class DocumentImageView: NSView {
     var hasImage: Bool { fullImage != nil || previewImage != nil }
     var hasFullImage: Bool { fullImage != nil }
 
+    /// 8-point checkerboard tile (2×2 cells), tiled by the layer as a pattern
+    /// background so transparency shows through the image contents above it.
+    /// Layer-space tiling means the squares scale with zoom, exactly as the old
+    /// view-coordinate drawing did.
+    private static let checkerboard: CGColor = {
+        let cell: CGFloat = 8
+        let tile = NSImage(size: NSSize(width: cell * 2, height: cell * 2), flipped: false) { rect in
+            NSColor(white: 0.82, alpha: 1).setFill()
+            rect.fill()
+            NSColor(white: 0.68, alpha: 1).setFill()
+            NSRect(x: 0, y: 0, width: cell, height: cell).fill()
+            NSRect(x: cell, y: cell, width: cell, height: cell).fill()
+            return true
+        }
+        return NSColor(patternImage: tile).cgColor
+    }()
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
+        // Only updateLayer() runs (draw(_:) never does), so no giant backing
+        // store is allocated and nothing re-renders while the scroll view's
+        // magnification scales the layer.
+        layerContentsRedrawPolicy = .onSetNeedsDisplay
+    }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        guard let layer else { return }
+        layer.contents = displayed
+        layer.contentsGravity = .resize  // preview (1/8-size) stretches to full frame
+        layer.backgroundColor = displayed == nil ? nil : Self.checkerboard
+        // Crisp pixels when zoomed in on the real image, smooth scaling for the
+        // preview (only ever shown upscaled-while-waiting or far zoomed out).
+        layer.magnificationFilter = displayed === fullImage ? .nearest : .linear
+        layer.minificationFilter = .linear
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -202,40 +245,7 @@ private final class DocumentImageView: NSView {
         let choice = chooseImage()
         guard force || choice !== displayed else { return }
         displayed = choice
-        // Crisp pixels for the real image, smooth scaling for the preview
-        // (which is only ever shown upscaled-while-waiting or far zoomed out).
-        layer?.magnificationFilter = choice === fullImage ? .nearest : .linear
-        needsDisplay = true
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        guard let ctx = NSGraphicsContext.current?.cgContext, let image = displayed else { return }
-        drawCheckerboard(in: ctx)
-        // Draw the CGImage right-side-up inside this flipped view.
-        ctx.saveGState()
-        ctx.interpolationQuality = image === fullImage ? .none : .medium
-        ctx.translateBy(x: 0, y: bounds.height)
-        ctx.scaleBy(x: 1, y: -1)
-        ctx.draw(image, in: CGRect(origin: .zero, size: bounds.size))
-        ctx.restoreGState()
-    }
-
-    private func drawCheckerboard(in ctx: CGContext) {
-        let cell: CGFloat = 8
-        ctx.setFillColor(NSColor(white: 0.82, alpha: 1).cgColor)
-        ctx.fill(bounds)
-        ctx.setFillColor(NSColor(white: 0.68, alpha: 1).cgColor)
-        var y = bounds.minY
-        var row = 0
-        while y < bounds.maxY {
-            var x = bounds.minX + (row.isMultiple(of: 2) ? 0 : cell)
-            while x < bounds.maxX {
-                ctx.fill(CGRect(x: x, y: y, width: cell, height: cell))
-                x += 2 * cell
-            }
-            y += cell
-            row += 1
-        }
+        needsDisplay = true  // triggers updateLayer(), not draw(_:)
     }
 
     // MARK: - Cursor readout
