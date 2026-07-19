@@ -662,7 +662,8 @@ final class FrameDecoder {
             }
         }
 
-        try undoTransforms(fullImage, transforms: globalHeader.transforms)
+        try undoTransforms(
+            fullImage, transforms: globalHeader.transforms, wpHeader: globalHeader.wpHeader)
         return (fullImage, dcQuant)
     }
 
@@ -807,6 +808,7 @@ final class FrameDecoder {
     /// plus the global transforms to undo once every group has landed.
     private(set) var ecImage: ModularImage?
     private var ecTransforms: [ModularTransform] = []
+    private var ecWPHeader = WPHeader()
     private var ecFinalized = false
 
     private func decodeExtraChannelGlobal(_ dcGlobal: VarDCTDCGlobalDecoded) throws {
@@ -833,6 +835,7 @@ final class FrameDecoder {
             maxChanSize: dim.groupDim)
         ecImage = image
         ecTransforms = header.transforms
+        ecWPHeader = header.wpHeader
     }
 
     /// Applies the pending inverse transforms once every group's extra-channel
@@ -840,7 +843,7 @@ final class FrameDecoder {
     func finalizeExtraChannels() throws -> [[Int32]] {
         guard let image = ecImage else { return [] }
         if !ecFinalized {
-            try undoTransforms(image, transforms: ecTransforms)
+            try undoTransforms(image, transforms: ecTransforms, wpHeader: ecWPHeader)
             ecFinalized = true
         }
         return image.channels.map { $0.pixels }

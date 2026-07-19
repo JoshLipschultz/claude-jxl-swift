@@ -440,7 +440,7 @@ func decodeModularGroupImage(
     let header = try modularDecode(
         br, image: gi, groupID: streamID, globalTree: globalTree, globalCode: globalCode,
         globalCtxMap: globalCtxMap)
-    try undoTransforms(gi, transforms: header.transforms)
+    try undoTransforms(gi, transforms: header.transforms, wpHeader: header.wpHeader)
     return ModularGroupResult(gi: gi, mapping: mapping)
 }
 

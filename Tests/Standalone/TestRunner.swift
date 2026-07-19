@@ -81,6 +81,7 @@ struct TestRunner {
         frameBlending()
         float32Modular()
         orientationBaking()
+        deltaPalette()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -158,6 +159,34 @@ struct TestRunner {
             }
         }
         return (w, h, planes)
+    }
+
+    // MARK: - Delta palette (lossy palette)
+
+    /// `96x64_deltapal.jxl` was produced through the libjxl encoder API with
+    /// JXL_ENC_FRAME_SETTING_LOSSY_PALETTE on a lossless modular frame, so its
+    /// palette carries delta entries (indices below nb_deltas add the palette
+    /// value to an Average4 prediction — the InvPalette delta path). Oracle is
+    /// djxl's PPM; output must be byte-exact.
+    static func deltaPalette() {
+        let dir = fixturesDir()
+        guard let jxl = try? Data(contentsOf: dir.appendingPathComponent("96x64_deltapal.jxl")),
+            let refPPM = try? Data(contentsOf: dir.appendingPathComponent("96x64_deltapal.ppm")),
+            let img = try? JXL.decodeImage(from: jxl), img.planes.count >= 3
+        else {
+            check(false, "delta palette fixture decodes")
+            return
+        }
+        var rgb = [UInt8](repeating: 0, count: img.width * img.height * 3)
+        for c in 0..<3 {
+            for i in 0..<(img.width * img.height) {
+                rgb[i * 3 + c] = UInt8(clamping: img.planes[c][i])
+            }
+        }
+        let psnr = ppmPSNR(refPPM, rgb, img.width, img.height)
+        check(psnr == 999, "96x64_deltapal byte-exact vs djxl")
+        FileHandle.standardError.write(
+            Data("  [delta-palette] lossy-palette fixture byte-exact\n".utf8))
     }
 
     // MARK: - EXIF orientation baking

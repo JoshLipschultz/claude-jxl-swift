@@ -46,7 +46,11 @@ func metaApplyTransform(_ image: ModularImage, transform t: inout ModularTransfo
 }
 
 /// Undoes the transforms applied to a decoded Modular image, in reverse order.
-func undoTransforms(_ image: ModularImage, transforms: [ModularTransform]) throws {
+/// `wpHeader` is the stream's weighted-predictor header (delta palette with
+/// the Weighted predictor runs its own WP state during the undo).
+func undoTransforms(
+    _ image: ModularImage, transforms: [ModularTransform], wpHeader: WPHeader = WPHeader()
+) throws {
     for t in transforms.reversed() {
         switch t.id {
         case .rct:
@@ -54,7 +58,7 @@ func undoTransforms(_ image: ModularImage, transforms: [ModularTransform]) throw
         case .palette:
             try invPalette(
                 image, beginC: Int(t.beginC), nbColors: Int(t.nbColors), nbDeltas: Int(t.nbDeltas),
-                predictor: Int(t.predictor))
+                predictor: Int(t.predictor), wpHeader: wpHeader)
         case .squeeze:
             try invSqueeze(image, params: t.squeezes)
         default:
@@ -354,14 +358,19 @@ func metaPalette(_ image: ModularImage, beginC: Int, endC: Int, nbColors: Int, n
 }
 
 /// Inverse Palette: reconstruct the color channels by looking each index up in
-/// the palette (libjxl InvPalette, the nb_deltas == 0 path).
-func invPalette(_ image: ModularImage, beginC: Int, nbColors: Int, nbDeltas: Int, predictor: Int) throws {
-    if nbDeltas != 0 { throw ModularDecodeError.unsupportedTransform }  // delta palette not yet
+/// the palette (libjxl InvPalette), including the delta-palette path where
+/// indices below `nbDeltas` add the looked-up delta to a per-pixel prediction
+/// (any of the 14 predictors; a fresh WP state per channel for Weighted).
+func invPalette(
+    _ image: ModularImage, beginC: Int, nbColors: Int, nbDeltas: Int, predictor: Int,
+    wpHeader: WPHeader
+) throws {
     guard !image.channels.isEmpty else { throw ModularDecodeError.unsupportedTransform }
 
     let nb = image.channels[0].h  // palette height = number of color channels
     let c0 = beginC + 1
     guard nb >= 1, c0 < image.channels.count else { throw ModularDecodeError.unsupportedTransform }
+    guard predictor < 14 else { throw ModularDecodeError.invalidTransform }
     let w = image.channels[c0].w
     let h = image.channels[c0].h
     let hshift = image.channels[c0].hshift
@@ -376,13 +385,66 @@ func invPalette(_ image: ModularImage, beginC: Int, nbColors: Int, nbDeltas: Int
     let bitDepth = min(image.bitdepth, 24)
     let indexPlane = image.channels[c0].pixels  // copy (outputs alias the index channel)
 
-    for c in 0..<nb {
-        for y in 0..<h {
-            for x in 0..<w {
-                let index = Int(indexPlane[y * w + x])
-                image.channels[c0 + c].pixels[y * w + x] = getPaletteValue(
-                    palette.pixels, onerow: onerow, index: index, c: c, paletteSize: palette.w,
-                    bitDepth: bitDepth)
+    if w == 0 {
+        // Nothing to do (avoid touching empty channels with non-zero height).
+    } else if nbDeltas == 0 && predictor == 0 {
+        for c in 0..<nb {
+            for y in 0..<h {
+                for x in 0..<w {
+                    var index = Int(indexPlane[y * w + x])
+                    if nb == 1 {
+                        // libjxl clamps out-of-range indices in the
+                        // single-channel fast path.
+                        index = min(max(index, 0), palette.w - 1)
+                    }
+                    image.channels[c0 + c].pixels[y * w + x] = getPaletteValue(
+                        palette.pixels, onerow: onerow, index: index, c: c,
+                        paletteSize: palette.w, bitDepth: bitDepth)
+                }
+            }
+        }
+    } else {
+        // Delta palette: indices below nbDeltas add their palette entry to a
+        // prediction from the already-reconstructed output channel.
+        for c in 0..<nb {
+            let wpState = predictor == 6 ? WPState(header: wpHeader, xsize: w, ysize: h) : nil
+            var dummyProps = [Int32](repeating: 0, count: 1)
+            image.channels[c0 + c].pixels.withUnsafeMutableBufferPointer { px in
+                for y in 0..<h {
+                    let rowBase = y * w
+                    let prevBase = (y - 1) * w
+                    let prevPrevBase = (y - 2) * w
+                    for x in 0..<w {
+                        let index = Int(indexPlane[rowBase + x])
+                        let entry = getPaletteValue(
+                            palette.pixels, onerow: onerow, index: index, c: c,
+                            paletteSize: palette.w, bitDepth: bitDepth)
+                        var val = Int(entry)
+                        if index < nbDeltas {
+                            // libjxl runs the predictor (incl. the WP predict)
+                            // only for delta pixels; UpdateErrors below runs
+                            // for every pixel regardless.
+                            let left = x > 0 ? Int(px[rowBase + x - 1]) : (y > 0 ? Int(px[prevBase + x]) : 0)
+                            let top = y > 0 ? Int(px[prevBase + x]) : left
+                            let topleft = (x > 0 && y > 0) ? Int(px[prevBase + x - 1]) : left
+                            let topright = (x + 1 < w && y > 0) ? Int(px[prevBase + x + 1]) : top
+                            let leftleft = x > 1 ? Int(px[rowBase + x - 2]) : left
+                            let toptop = y > 1 ? Int(px[prevPrevBase + x]) : top
+                            let toprightright = (x + 2 < w && y > 0) ? Int(px[prevBase + x + 2]) : topright
+                            let wpPred = wpState?.predict(
+                                x: x, y: y, xsize: w, N: top, W: left, NE: topright,
+                                NW: topleft, NN: toptop, computeProperties: false,
+                                properties: &dummyProps, offset: 0) ?? 0
+                            let guess = predictOne(
+                                predictor, left: left, top: top, toptop: toptop,
+                                topleft: topleft, topright: topright, leftleft: leftleft,
+                                toprightright: toprightright, wpPred: wpPred)
+                            val = guess + Int(entry)
+                        }
+                        px[rowBase + x] = Int32(truncatingIfNeeded: val)
+                        wpState?.updateErrors(Int(px[rowBase + x]), x: x, y: y, xsize: w)
+                    }
+                }
             }
         }
     }
