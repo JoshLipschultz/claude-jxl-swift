@@ -89,7 +89,9 @@ enum DecodePipeline {
     static func decodePreview(_ data: Data) -> (image: CGImage, fullSize: CGSize)? {
         guard let info = try? JXL.readInfo(from: data),
             let decoded = try? JXL.decodePreview(from: data),
-            let cg = try? JXLImageConverter.makeCGImage(from: decoded, orientation: info.orientation)
+            let cg = try? JXLImageConverter.makeCGImage(
+                from: decoded, orientation: info.orientation,
+                colorEncoding: info.colorEncoding)
         else { return nil }
         // Displayed size is the full image's (orientation-swapped when needed).
         let swapped = info.orientation >= 5
@@ -107,8 +109,15 @@ enum DecodePipeline {
 
         do {
             let info = try JXL.readInfo(from: data)
-            let decoded = try JXL.decodeImage(from: data)
-            let cg = try JXLImageConverter.makeCGImage(from: decoded, orientation: info.orientation)
+            // HDR files (PQ/HLG) decode at 16 bits so precision and EDR
+            // headroom survive into the CGImage.
+            let isHDR =
+                info.colorEncoding.transferFunction == 16
+                || info.colorEncoding.transferFunction == 18
+            let decoded = try JXL.decodeImage(from: data, format: isHDR ? .uint16 : .uint8)
+            let cg = try JXLImageConverter.makeCGImage(
+                from: decoded, orientation: info.orientation,
+                colorEncoding: info.colorEncoding)
             return DecodeResult(
                 image: cg,
                 sampler: PixelSampler(decoded, orientation: info.orientation),

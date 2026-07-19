@@ -31,13 +31,36 @@ public enum JXLImageConverter {
         }
     }
 
-    /// Builds an RGBA8 `CGImage` from a decoded image. `orientation` is the EXIF
-    /// orientation (1...8) from the file metadata; it is applied here so callers
-    /// show pixels the right way up.
-    public static func makeCGImage(from image: JXLDecodedImage, orientation: UInt32 = 1) throws -> CGImage {
+    /// The CGColorSpace describing samples rendered with `encoding`'s numeric
+    /// color encoding, when a well-known one matches (ITU-R 2100 PQ/HLG for
+    /// HDR, Display P3, ITU-R 2020). nil falls back to device RGB.
+    public static func displayColorSpace(for encoding: JXLColorEncoding?) -> CGColorSpace? {
+        guard let encoding, !encoding.wantICC, !encoding.hasGamma else { return nil }
+        switch (encoding.primaries, encoding.transferFunction) {
+        case (9, 16): return CGColorSpace(name: CGColorSpace.itur_2100_PQ)
+        case (9, 18): return CGColorSpace(name: CGColorSpace.itur_2100_HLG)
+        case (9, _): return CGColorSpace(name: CGColorSpace.itur_2020)
+        case (11, 13): return CGColorSpace(name: CGColorSpace.displayP3)
+        default: return nil
+        }
+    }
+
+    /// Builds a `CGImage` from a decoded image — RGBA8 normally, RGBA16 when
+    /// the decode used `JXLSampleFormat.uint16` (HDR precision survives).
+    /// `orientation` is the EXIF orientation (1...8) from the file metadata;
+    /// `colorEncoding` (when given) tags the image with the matching display
+    /// color space (ITU-R 2100 PQ/HLG for HDR files) so the system composites
+    /// it correctly, including EDR.
+    public static func makeCGImage(
+        from image: JXLDecodedImage, orientation: UInt32 = 1,
+        colorEncoding: JXLColorEncoding? = nil
+    ) throws -> CGImage {
         guard image.width > 0, image.height > 0 else { throw ConversionError.emptyImage }
         guard image.colorChannels >= 1, image.planes.count >= image.colorChannels else {
             throw ConversionError.missingPlanes
+        }
+        if image.bitsPerSample == 16 && !image.isFloat {
+            return try makeCGImage16(from: image, orientation: orientation, colorEncoding: colorEncoding)
         }
 
         let width = image.width
@@ -75,8 +98,10 @@ public enum JXLImageConverter {
         }
 
         // Tag with the embedded ICC profile when the decoder attached one (its
-        // samples are in that space); otherwise assume device RGB.
+        // samples are in that space), else a matching well-known display
+        // space, else device RGB.
         let colorSpace = image.iccProfile.flatMap { CGColorSpace(iccData: $0 as CFData) }
+            ?? displayColorSpace(for: colorEncoding)
             ?? CGColorSpaceCreateDeviceRGB()
         let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue)
         guard
@@ -90,6 +115,77 @@ public enum JXLImageConverter {
         else { throw ConversionError.cgImageCreationFailed }
 
         return applyOrientation(orientation, to: cg)
+    }
+
+    /// 16-bit RGBA path: preserves the full sample precision (needed for PQ/
+    /// HLG, whose 8-bit quantization visibly bands) and tags the HDR color
+    /// space so the window server applies the right tone mapping / EDR.
+    private static func makeCGImage16(
+        from image: JXLDecodedImage, orientation: UInt32, colorEncoding: JXLColorEncoding?
+    ) throws -> CGImage {
+        let width = image.width
+        let height = image.height
+        let pixelCount = width * height
+        let isGray = image.colorChannels == 1
+        let r = image.planes[0]
+        let g = isGray ? image.planes[0] : image.planes[1]
+        let b = isGray ? image.planes[0] : image.planes[2]
+        let alpha: [Int32]? = image.extraChannels > 0 ? image.planes[image.colorChannels] : nil
+
+        var rgba = [UInt16](repeating: 0, count: pixelCount * 4)
+        rgba.withUnsafeMutableBufferPointer { out in
+            for i in 0..<pixelCount {
+                let o = i * 4
+                out[o + 0] = UInt16(clamping: r[i])
+                out[o + 1] = UInt16(clamping: g[i])
+                out[o + 2] = UInt16(clamping: b[i])
+                out[o + 3] = alpha.map { UInt16(clamping: $0[i]) } ?? 65535
+            }
+        }
+        let colorSpace = displayColorSpace(for: colorEncoding)
+            ?? image.iccProfile.flatMap { CGColorSpace(iccData: $0 as CFData) }
+            ?? CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo(
+            rawValue: CGImageAlphaInfo.last.rawValue | CGBitmapInfo.byteOrder16Little.rawValue)
+        let data = rgba.withUnsafeBufferPointer { Data(buffer: $0) }
+        guard
+            let provider = CGDataProvider(data: data as CFData),
+            let cg = CGImage(
+                width: width, height: height,
+                bitsPerComponent: 16, bitsPerPixel: 64, bytesPerRow: width * 8,
+                space: colorSpace, bitmapInfo: bitmapInfo,
+                provider: provider, decode: nil, shouldInterpolate: false,
+                intent: .defaultIntent)
+        else { throw ConversionError.cgImageCreationFailed }
+        // Orientation is baked via a 16-bit context to keep the precision.
+        guard (2...8).contains(orientation) else { return cg }
+        let swap = orientation >= 5
+        guard
+            let ctx = CGContext(
+                data: nil, width: swap ? height : width, height: swap ? width : height,
+                bitsPerComponent: 16, bytesPerRow: 0, space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                    | CGBitmapInfo.byteOrder16Little.rawValue)
+        else { return cg }
+        ctx.concatenate(orientationTransform(orientation, width: width, height: height))
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return ctx.makeImage() ?? cg
+    }
+
+    /// The affine transform for an EXIF orientation (shared by both depths).
+    private static func orientationTransform(
+        _ orientation: UInt32, width w: Int, height h: Int
+    ) -> CGAffineTransform {
+        switch orientation {
+        case 2: return CGAffineTransform(a: -1, b: 0, c: 0, d: 1, tx: CGFloat(w), ty: 0)
+        case 3: return CGAffineTransform(a: -1, b: 0, c: 0, d: -1, tx: CGFloat(w), ty: CGFloat(h))
+        case 4: return CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: CGFloat(h))
+        case 5: return CGAffineTransform(a: 0, b: -1, c: -1, d: 0, tx: CGFloat(h), ty: CGFloat(w))
+        case 6: return CGAffineTransform(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: CGFloat(w))
+        case 7: return CGAffineTransform(a: 0, b: 1, c: 1, d: 0, tx: 0, ty: 0)
+        case 8: return CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: CGFloat(h), ty: 0)
+        default: return .identity
+        }
     }
 
     /// Re-renders `image` with the given EXIF orientation baked in. Orientation 1

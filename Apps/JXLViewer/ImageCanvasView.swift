@@ -194,6 +194,10 @@ private final class DocumentImageView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
+        // Let PQ/HLG-tagged contents use the display's EDR headroom.
+        if #available(macOS 14.0, *) {
+            layer?.wantsExtendedDynamicRangeContent = true
+        }
         // Only updateLayer() runs (draw(_:) never does), so no giant backing
         // store is allocated and nothing re-renders while the scroll view's
         // magnification scales the layer.
