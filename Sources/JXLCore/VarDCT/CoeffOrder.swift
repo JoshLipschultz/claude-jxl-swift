@@ -35,6 +35,10 @@ let kStrategyOrder: [Int] = [
     /// RAW-encoded dequant tables by quant-table index (nil = library default).
     /// JPEG transcodes carry their original quant tables this way.
     public let customDequant: [[Float]?]
+    /// The RAW tables' integer values + denominator, kept for JPEG
+    /// reconstruction (index 0 / DCT8 holds the original JPEG quant values
+    /// when `den == 1/(8*255)`).
+    public let rawQuant: [(den: Float, qtable: [Int32])?]
 }
 
 /// Hybrid-uint token of `val` under config(0,0,0), clamped — libjxl
@@ -219,6 +223,7 @@ func decodeVarDCTACGlobal(
     // (mode 7, modular-coded original quant tables) are supported.
     let dequantDefault = br.read(1) == 1
     var customDequant = [[Float]?](repeating: nil, count: kNumQuantTablesTotal)
+    var rawQuant = [(den: Float, qtable: [Int32])?](repeating: nil, count: kNumQuantTablesTotal)
     if !dequantDefault {
         for idx in 0..<kNumQuantTablesTotal {
             let mode = br.read(3)
@@ -250,6 +255,11 @@ func decodeVarDCTACGlobal(
                     }
                 }
                 customDequant[idx] = weights
+                rawQuant[idx] = (
+                    den,
+                    image.channels[0].pixels + image.channels[1].pixels
+                        + image.channels[2].pixels
+                )
             default:
                 throw JXLError.unsupported("custom VarDCT quant mode \(mode)")
             }
@@ -274,7 +284,7 @@ func decodeVarDCTACGlobal(
     try br.ensureInBounds("VarDCT AC global")
     return VarDCTACGlobal(
         numHistograms: numHistograms, orders: orders, codes: codes, contextMaps: ctxMaps,
-        customDequant: customDequant)
+        customDequant: customDequant, rawQuant: rawQuant)
 }
 
 /// Total quant tables in the codestream (libjxl kNumQuantTables), including

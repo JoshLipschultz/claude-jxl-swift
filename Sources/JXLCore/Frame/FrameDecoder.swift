@@ -83,6 +83,8 @@ final class FrameDecoder {
     let iccProfile: [UInt8]?
     /// Custom upsampling kernels from CustomTransformData (defaults otherwise).
     let upsamplingWeights: UpsamplingCustomWeights
+    /// The original file bytes (container box payload ranges index into this).
+    let fileData: [UInt8]
 
     var frameHeader: FrameHeader { slot.header }
     var dim: FrameDimensions { slot.dim }
@@ -112,6 +114,7 @@ final class FrameDecoder {
     /// usual along the way) and the next one becomes this decoder's frame.
     init(data: [UInt8], limits: JXLDecodeLimits = .default, skipPresentedFrames: Int = 0) throws {
         self.limits = limits
+        fileData = data
         parsed = try JXLContainer.parse(data)
         guard parsed.codestream.count >= 2,
             parsed.codestream[0] == 0xFF, parsed.codestream[1] == 0x0A

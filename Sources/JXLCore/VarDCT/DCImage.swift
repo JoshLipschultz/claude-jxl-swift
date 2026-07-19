@@ -25,6 +25,12 @@ import Foundation
     public var x: [Float]
     public var y: [Float]
     public var b: [Float]
+    /// Raw quantized DC values (pre-dequant, pre-CfL), same packing as the
+    /// float planes. Kept for JPEG reconstruction, where they are the JPEG DC
+    /// coefficients directly.
+    public var qx: [Int32] = []
+    public var qy: [Int32] = []
+    public var qb: [Int32] = []
 }
 
 /// DC dequantization multipliers derived from the quantizer + color-correlation
@@ -84,6 +90,9 @@ func decodeVarDCTLowFrequency(_ d: FrameDecoder) throws -> VarDCTLowFrequency {
     var planeX = [Float](repeating: 0, count: bw * bh)
     var planeY = [Float](repeating: 0, count: bw * bh)
     var planeB = [Float](repeating: 0, count: bw * bh)
+    var quantX = [Int32](repeating: 0, count: bw * bh)
+    var quantY = [Int32](repeating: 0, count: bw * bh)
+    var quantB = [Int32](repeating: 0, count: bw * bh)
 
     let ctw = divCeil(bw, kColorTileDimInBlocks)
     let cth = divCeil(bh, kColorTileDimInBlocks)
@@ -111,6 +120,7 @@ func decodeVarDCTLowFrequency(_ d: FrameDecoder) throws -> VarDCTLowFrequency {
             reader, groupIndex: dcg, rectW: rect.w, rectH: rect.h,
             dcGlobal: dcGlobal, dequant: dequant, shifts: shifts,
             destX: &planeX, destY: &planeY, destB: &planeB,
+            destQX: &quantX, destQY: &quantY, destQB: &quantB,
             destW: bw, x0: rect.x0, y0: rect.y0, dcQuantContext: &meta.dcQuantContext)
         // (ModularDC reads nothing without extra channels.)
         try decodeAcMetadataGroup(
@@ -128,7 +138,9 @@ func decodeVarDCTLowFrequency(_ d: FrameDecoder) throws -> VarDCTLowFrequency {
             dcFactors: dequant.mulDC, w: bw, h: bh, x: &planeX, y: &planeY, b: &planeB)
     }
 
-    let dc = VarDCTDCImage(widthBlocks: bw, heightBlocks: bh, x: planeX, y: planeY, b: planeB)
+    let dc = VarDCTDCImage(
+        widthBlocks: bw, heightBlocks: bh, x: planeX, y: planeY, b: planeB,
+        qx: quantX, qy: quantY, qb: quantB)
     return VarDCTLowFrequency(dc: dc, metadata: meta)
 }
 
@@ -153,6 +165,7 @@ private func decodeVarDCTDC(
     _ br: BitReader, groupIndex: Int, rectW: Int, rectH: Int,
     dcGlobal: VarDCTDCGlobalDecoded, dequant: DCDequant, shifts: (h: [Int], v: [Int]),
     destX: inout [Float], destY: inout [Float], destB: inout [Float],
+    destQX: inout [Int32], destQY: inout [Int32], destQB: inout [Int32],
     destW: Int, x0: Int, y0: Int, dcQuantContext: inout [UInt8]
 ) throws {
     // extra_precision: 2 bits; mul = 1 / (1 << extra_precision).
@@ -197,12 +210,15 @@ private func decodeVarDCTDC(
                 destY[dstRow + xx] = inY
                 destX[dstRow + xx] = inY * cflX + inX
                 destB[dstRow + xx] = inY * cflB + inB
+                destQY[dstRow + xx] = qY[srcRow + xx]
+                destQX[dstRow + xx] = qX[srcRow + xx]
+                destQB[dstRow + xx] = qB[srcRow + xx]
             }
         }
     } else {
         // Subsampled (libjxl DequantDC non-444 path): per-channel factor, no
         // DC CfL, shifted rects.
-        func dequantChannel(_ c: Int, _ dest: inout [Float]) {
+        func dequantChannel(_ c: Int, _ dest: inout [Float], _ destQ: inout [Int32]) {
             let mc = c < 2 ? c ^ 1 : c
             let q = image.channels[mc].pixels
             let w = rectW >> shifts.h[c]
@@ -215,12 +231,13 @@ private func decodeVarDCTDC(
                 let dstRow = (dy0 + yy) * destW + dx0
                 for xx in 0..<w {
                     dest[dstRow + xx] = Float(q[srcRow + xx]) * fac
+                    destQ[dstRow + xx] = q[srcRow + xx]
                 }
             }
         }
-        dequantChannel(1, &destY)
-        dequantChannel(0, &destX)
-        dequantChannel(2, &destB)
+        dequantChannel(1, &destY, &destQY)
+        dequantChannel(0, &destX, &destQX)
+        dequantChannel(2, &destB, &destQB)
     }
 
     // quant_dc (libjxl DequantDC tail): per-block DC context byte from the

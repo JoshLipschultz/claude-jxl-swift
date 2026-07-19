@@ -295,6 +295,13 @@ struct TestRunner {
         } catch {
             check(false, "jbrd parses (\(error))")
         }
+        // Full reconstruction must reproduce the source JPEG byte-for-byte.
+        if let original = try? Data(contentsOf: dir.appendingPathComponent("256x192_jbrd.jpg")),
+            let recon = try? JXL.reconstructJPEG(from: jxl) {
+            check(recon == original, "jbrd reconstruction byte-exact vs source JPEG")
+        } else {
+            check(false, "jbrd reconstruction runs")
+        }
     }
 
     // MARK: - Animation (multi-frame)

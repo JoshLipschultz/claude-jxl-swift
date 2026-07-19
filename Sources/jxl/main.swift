@@ -125,6 +125,12 @@ do {
     case "jbrd":
         print(try describeJBRD(from: bytes))
 
+    case "tojpeg":
+        guard args.count >= 4 else { usage() }
+        let jpeg = try JXL.reconstructJPEG(from: bytes)
+        try jpeg.write(to: URL(fileURLWithPath: args[3]))
+        print("reconstructed \(jpeg.count) JPEG bytes -> \(args[3])")
+
     case "vardct":
         let info = try JXL.readVarDCTInfo(from: bytes)
         print(

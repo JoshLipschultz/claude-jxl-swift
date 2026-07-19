@@ -65,6 +65,8 @@ func exercise(_ bytes: [UInt8]) {
     _ = try? JXL.readVarDCTInfo(from: bytes)
     note("decodeImage")
     _ = try? JXL.decodeImage(from: bytes, limits: limits)
+    note("reconstructJPEG")
+    _ = try? JXL.reconstructJPEG(from: bytes, limits: limits)
 }
 
 @main

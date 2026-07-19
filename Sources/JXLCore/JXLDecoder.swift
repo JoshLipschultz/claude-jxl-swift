@@ -261,6 +261,27 @@ public enum JXL {
         try decodePreview(from: [UInt8](data), limits: limits)
     }
 
+    /// Reconstructs the original JPEG file bytes from a JPEG-transcoded file
+    /// (requires the `jbrd` reconstruction box). The output is byte-identical
+    /// to the JPEG that was fed to the encoder.
+    public static func reconstructJPEG(
+        from data: [UInt8], limits: JXLDecodeLimits = .default
+    ) throws -> Data {
+        Data(try FrameDecoder(data: data, limits: limits).reconstructJPEG())
+    }
+
+    public static func reconstructJPEG(
+        from data: Data, limits: JXLDecodeLimits = .default
+    ) throws -> Data {
+        try reconstructJPEG(from: [UInt8](data), limits: limits)
+    }
+
+    public static func reconstructJPEG(
+        contentsOf url: URL, limits: JXLDecodeLimits = .default
+    ) throws -> Data {
+        try reconstructJPEG(from: try Data(contentsOf: url), limits: limits)
+    }
+
     /// Returns the embedded ICC profile, decoded from its compressed form, or
     /// `nil` when the file's color encoding does not carry one (`want_icc`
     /// unset). This is the profile as embedded — for XYB-encoded (lossy) files
