@@ -229,15 +229,20 @@ public struct FrameHeader: Sendable {
             saveAsReference = r.readU32(.value(0), .value(1), .value(2), .value(3))
         }
 
-        // save_before_color_transform (only in cases not reached by is_last frames).
+        // save_before_color_transform. CanBeReferenced() in libjxl: not last,
+        // not DC, and (zero duration or explicitly saved as a reference) — a
+        // nonzero-duration frame that is not saved cannot be referenced, so
+        // the bit is absent (frame_header.h CanBeReferenced).
         if frameType != .dc {
-            let canBeReferenced = !isLast
-            if canBeReferenced && lastBlendModeWasReplace && !isPartialFrame
+            let canBeReferenced = !isLast && (duration == 0 || saveAsReference != 0)
+            if canBeReferenced && blendingInfo.mode == 0 && !isPartialFrame
                 && (frameType == .regular || frameType == .skipProgressive) {
                 saveBeforeColorTransform = r.readBool()
             } else if frameType == .referenceOnly {
                 saveBeforeColorTransform = r.readBool()
             }
+        } else {
+            saveBeforeColorTransform = true
         }
 
         name = readNameString(r)
@@ -246,8 +251,6 @@ public struct FrameHeader: Sendable {
 
         r.skipExtensions()
     }
-
-    private var lastBlendModeWasReplace = true
 
     // MARK: Nested bundles
 
@@ -267,7 +270,6 @@ public struct FrameHeader: Sendable {
     ) -> JXLBlendingInfo {
         var info = JXLBlendingInfo()
         info.mode = r.readU32(.value(0), .value(1), .value(2), .bits(2, offset: 3))  // BlendMode
-        lastBlendModeWasReplace = lastBlendModeWasReplace && (info.mode == 0)
         let involvesAlpha = info.mode == 2 || info.mode == 3  // kBlend / kAlphaWeightedAdd
         if numExtraChannels > 0 && involvesAlpha {
             info.alphaChannel = r.readU32(.value(0), .value(1), .value(2), .bits(3, offset: 3))
