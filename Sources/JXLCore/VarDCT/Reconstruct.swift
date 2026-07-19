@@ -632,6 +632,36 @@ extension FrameDecoder {
     }
 }
 
+/// Gaborish + EPF for Modular frames (libjxl runs the same restoration
+/// stages on modular pipeline channels, with a *uniform* sigma image filled
+/// with kInvSigmaNum / epf_sigma_for_modular — dec_frame.cc ProcessDCGroup).
+/// Planes are unpadded width*height; for grayscale the caller replicates the
+/// single channel (libjxl rgb_from_gray does the same before the filters).
+func modularRestorationFilters(
+    x: inout [Float], y: inout [Float], b: inout [Float], w: Int, h: Int,
+    header fh: FrameHeader
+) {
+    if fh.loopFilterGab {
+        gaborish(&x, w: w, h: h, weight1: fh.gabXWeight1, weight2: fh.gabXWeight2)
+        gaborish(&y, w: w, h: h, weight1: fh.gabYWeight1, weight2: fh.gabYWeight2)
+        gaborish(&b, w: w, h: h, weight1: fh.gabBWeight1, weight2: fh.gabBWeight2)
+    }
+    if fh.loopFilterEpfIters >= 1 {
+        let bw = (w + 7) / 8
+        let bh = (h + 7) / 8
+        var invSigma = kInvSigmaNum / fh.loopFilterEpfSigmaForModular
+        if !invSigma.isFinite { invSigma = kInvSigmaNum }
+        let sigmaInv = [Float](repeating: invSigma, count: bw * bh)
+        if fh.loopFilterEpfIters >= 3 {
+            epf0(x: &x, y: &y, b: &b, w: w, h: h, sigmaInv: sigmaInv, bw: bw)
+        }
+        epf1(x: &x, y: &y, b: &b, w: w, h: h, sigmaInv: sigmaInv, bw: bw)
+        if fh.loopFilterEpfIters >= 2 {
+            epf2(x: &x, y: &y, b: &b, w: w, h: h, sigmaInv: sigmaInv, bw: bw)
+        }
+    }
+}
+
 /// Doubles a packed chroma region to full resolution with libjxl's
 /// half-phase triangle filter (`HorizontalChromaUpsamplingStage` /
 /// `VerticalChromaUpsamplingStage`): `out[2x] = (in[x-1] + 3 in[x]) / 4`,

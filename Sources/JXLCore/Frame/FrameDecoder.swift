@@ -504,6 +504,9 @@ final class FrameDecoder {
 
         let isGray = metadata.colorSpace == .grayscale && frameHeader.colorTransform == .none
         let colorChannels = isGray ? 1 : 3
+        if ProcessInfo.processInfo.environment["JXL_DEBUG_GRAY"] != nil {
+            FileHandle.standardError.write(Data("modular frame: colorTransform=\(frameHeader.colorTransform) gray=\(isGray) gab=\(frameHeader.loopFilterGab) epfIters=\(frameHeader.loopFilterEpfIters) bits=\(metadata.bitDepth.bitsPerSample)\n".utf8))
+        }
         let extra = metadata.extraChannelCount
         try checkPixelLimits(channels: colorChannels + extra)
 
@@ -532,6 +535,9 @@ final class FrameDecoder {
                 y[i] = Float(cY[i]) * dcQuant[1]
                 b[i] = Float(cB[i] &+ cY[i]) * dcQuant[2]
             }
+            // Lossy modular frames carry the same restoration filters as
+            // VarDCT (gaborish/EPF with a uniform modular sigma).
+            modularRestorationFilters(x: &x, y: &y, b: &b, w: w, h: h, header: frameHeader)
             let xyb = XYBImage(width: w, height: h, stride: w, paddedHeight: h, x: x, y: y, b: b)
             let spec = try makeOutputColorSpec(
                 metadata.colorEncoding, toneMapping: metadata.toneMapping, customOpsin: customOpsin)
@@ -563,11 +569,37 @@ final class FrameDecoder {
 
         // Modular samples are native (no color transform applied here), so the
         // embedded profile — when present — describes them directly.
+        var planes = fullImage.channels.map { $0.pixels }
+        if (frameHeader.loopFilterGab || frameHeader.loopFilterEpfIters > 0)
+            && !metadata.bitDepth.isFloatingPoint
+        {
+            // Restoration filters run on the pipeline floats (samples scaled
+            // by 1/(2^bits - 1)); grayscale replicates its channel into all
+            // three color slots first (libjxl rgb_from_gray), which keeps the
+            // three planes identical through the symmetric filters.
+            let w = dim.xsize
+            let h = dim.ysize
+            let maxVal = Float((1 << Int(metadata.bitDepth.bitsPerSample)) - 1)
+            let scale = 1.0 / maxVal
+            func toFloat(_ p: [Int32]) -> [Float] { p.map { Float($0) * scale } }
+            var r = toFloat(planes[0])
+            var g = colorChannels >= 3 ? toFloat(planes[1]) : r
+            var b = colorChannels >= 3 ? toFloat(planes[2]) : r
+            modularRestorationFilters(x: &r, y: &g, b: &b, w: w, h: h, header: frameHeader)
+            func toInt(_ p: [Float]) -> [Int32] {
+                p.map { Int32(min(max(($0 * maxVal).rounded(), 0), maxVal)) }
+            }
+            planes[0] = toInt(r)
+            if colorChannels >= 3 {
+                planes[1] = toInt(g)
+                planes[2] = toInt(b)
+            }
+        }
         return JXLDecodedImage(
             width: dim.xsize, height: dim.ysize, colorChannels: colorChannels,
             extraChannels: extra, bitsPerSample: Int(metadata.bitDepth.bitsPerSample),
             isFloat: metadata.bitDepth.isFloatingPoint,
-            planes: fullImage.channels.map { $0.pixels },
+            planes: planes,
             iccProfile: iccProfile.map { Data($0) })
     }
 

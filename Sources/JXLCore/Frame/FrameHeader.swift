@@ -84,6 +84,8 @@ public struct FrameHeader: Sendable {
     // Loop filter (defaults per libjxl LoopFilter::VisitFields).
     public var loopFilterGab = true
     public var loopFilterEpfIters: UInt32 = 2
+    /// Uniform EPF sigma for Modular frames (libjxl `epf_sigma_for_modular`).
+    public var loopFilterEpfSigmaForModular: Float = 1.0
     public var gabXWeight1: Float = 1.1 * 0.104699568
     public var gabXWeight2: Float = 1.1 * 0.055680538
     public var gabYWeight1: Float = 1.1 * 0.104699568
@@ -307,7 +309,7 @@ public struct FrameHeader: Sendable {
                 if !isModular { _ = r.readF16() }  // epf_quant_mul
                 for _ in 0..<3 { _ = r.readF16() }
             }
-            if isModular { _ = r.readF16() }  // epf_sigma_for_modular
+            if isModular { loopFilterEpfSigmaForModular = r.readF16() }
         }
         r.skipExtensions()
     }
