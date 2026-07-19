@@ -63,6 +63,17 @@ public struct JXLExtraChannelInfo: Equatable, Sendable {
     public let alphaAssociated: Bool
 }
 
+/// ToneMapping (libjxl image_metadata.h): the display characteristics the
+/// samples were mastered for. `intensityTarget` is the luminance (cd/m²) of
+/// the maximum sample value — 255 for SDR content, and the mastering peak
+/// (commonly 1000-10000) for PQ/HLG content, where it scales the transfer.
+public struct JXLToneMapping: Equatable, Sendable {
+    public var intensityTarget: Float = 255
+    public var minNits: Float = 0
+    public var relativeToMaxDisplay = false
+    public var linearBelow: Float = 0
+}
+
 /// AnimationHeader (libjxl headers): tick rate and loop count for animated
 /// files. A frame's duration is in ticks; seconds = ticks × den / num.
 public struct JXLAnimationInfo: Equatable, Sendable {
@@ -80,6 +91,8 @@ public struct JXLImageMetadata: Equatable, Sendable {
     public let hasAlpha: Bool
     /// Present when the file is animated.
     public let animation: JXLAnimationInfo?
+    /// Mastering display characteristics (defaults describe SDR).
+    public let toneMapping: JXLToneMapping
 
     public var extraChannelCount: Int { extraChannels.count }
     public let orientation: UInt32
@@ -98,6 +111,7 @@ public struct JXLImageMetadata: Equatable, Sendable {
             self.extraChannels = []
             self.hasAlpha = false
             self.animation = nil
+            self.toneMapping = JXLToneMapping()
             self.orientation = 1
             self.hasAnimation = false
             self.xybEncoded = true
@@ -140,8 +154,9 @@ public struct JXLImageMetadata: Equatable, Sendable {
         let parsedXybEncoded = reader.readBool()  // xyb_encoded
         let parsedColor = ImageMetadataFields.readColorEncoding(reader)
 
+        var parsedToneMapping = JXLToneMapping()
         if extraFields {
-            ImageMetadataFields.skipToneMapping(reader)
+            parsedToneMapping = ImageMetadataFields.readToneMapping(reader)
         }
         reader.skipExtensions()
 
@@ -150,6 +165,7 @@ public struct JXLImageMetadata: Equatable, Sendable {
         self.extraChannels = parsedExtra
         self.hasAlpha = alpha
         self.animation = parsedAnimation
+        self.toneMapping = parsedToneMapping
         self.orientation = parsedOrientation
         self.hasAnimation = parsedHasAnimation
         self.xybEncoded = parsedXybEncoded
@@ -291,12 +307,15 @@ private enum ImageMetadataFields {
 
     // MARK: Optional sub-headers (consumed, values not exposed yet)
 
-    static func skipToneMapping(_ reader: BitReader) {
-        if reader.readBool() { return }  // all_default
-        _ = reader.readF16()  // intensity_target
-        _ = reader.readF16()  // min_nits
-        _ = reader.readBool()  // relative_to_max_display
-        _ = reader.readF16()  // linear_below
+    static func readToneMapping(_ reader: BitReader) -> JXLToneMapping {
+        if reader.readBool() { return JXLToneMapping() }  // all_default
+        let intensityTarget = reader.readF16()
+        let minNits = reader.readF16()
+        let relativeToMaxDisplay = reader.readBool()
+        let linearBelow = reader.readF16()
+        return JXLToneMapping(
+            intensityTarget: intensityTarget, minNits: minNits,
+            relativeToMaxDisplay: relativeToMaxDisplay, linearBelow: linearBelow)
     }
 
     static func readAnimationHeader(_ reader: BitReader) -> JXLAnimationInfo {

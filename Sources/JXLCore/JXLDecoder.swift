@@ -88,6 +88,16 @@ public struct JXLDecodedImage: Sendable {
     public let iccProfile: Data?
 }
 
+/// Output sample representation for rendered (lossy/XYB) frames.
+public enum JXLSampleFormat: Sendable {
+    /// 8-bit integers, 0...255 (the default).
+    case uint8
+    /// 16-bit integers, 0...65535 — full precision for HDR (PQ/HLG) content.
+    case uint16
+    /// Transfer-encoded 32-bit floats as IEEE-754 bit patterns.
+    case float32
+}
+
 public enum JXL {
     /// Reads structural information (dimensions, container layout) from a JPEG XL file.
     public static func readInfo(from data: [UInt8]) throws -> JXLImageInfo {
@@ -153,21 +163,24 @@ public enum JXL {
     /// A single regular frame is supported. `limits` bounds the allocations a
     /// (possibly hostile) header can demand.
     public static func decodeImage(
-        from data: [UInt8], limits: JXLDecodeLimits = .default
+        from data: [UInt8], limits: JXLDecodeLimits = .default,
+        format: JXLSampleFormat = .uint8
     ) throws -> JXLDecodedImage {
-        try FrameDecoder(data: data, limits: limits).decodeImage()
+        try FrameDecoder(data: data, limits: limits).decodeImage(format: format)
     }
 
     public static func decodeImage(
-        from data: Data, limits: JXLDecodeLimits = .default
+        from data: Data, limits: JXLDecodeLimits = .default,
+        format: JXLSampleFormat = .uint8
     ) throws -> JXLDecodedImage {
-        try decodeImage(from: [UInt8](data), limits: limits)
+        try decodeImage(from: [UInt8](data), limits: limits, format: format)
     }
 
     public static func decodeImage(
-        contentsOf url: URL, limits: JXLDecodeLimits = .default
+        contentsOf url: URL, limits: JXLDecodeLimits = .default,
+        format: JXLSampleFormat = .uint8
     ) throws -> JXLDecodedImage {
-        try decodeImage(from: try Data(contentsOf: url), limits: limits)
+        try decodeImage(from: try Data(contentsOf: url), limits: limits, format: format)
     }
 
     /// Returns the raw bytes for one logical frame section. The section range is

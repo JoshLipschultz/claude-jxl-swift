@@ -262,10 +262,11 @@ final class FrameDecoder {
     // MARK: Mode dispatch
 
     /// Decodes the frame to pixel planes: Modular frames in their native
-    /// samples, VarDCT frames as three 8-bit sRGB planes.
-    func decodeImage() throws -> JXLDecodedImage {
+    /// samples, VarDCT frames rendered to `format` (8-bit is the default; 16
+    /// bits or transfer-encoded float preserve HDR precision).
+    func decodeImage(format: JXLSampleFormat = .uint8) throws -> JXLDecodedImage {
         if frameHeader.isModular {
-            return try decodeModularImage()
+            return try decodeModularImage(format: format)
         }
         var xyb = try reconstructXYB()
         // Patches blend in after the restoration filters, before the color
@@ -278,13 +279,17 @@ final class FrameDecoder {
         if frameHeader.upsampling > 1 {
             xyb = try upsampleXYB(xyb)
         }
-        // Extra channels ride the frame's modular sub-streams and come out as
-        // native integer planes alongside the 8-bit color.
-        let ecPlanes = try finalizeExtraChannels()
+        // Extra channels ride the frame's modular sub-streams (8-bit native);
+        // they are rescaled to match wider color formats.
+        let ecPlanes = try finalizeExtraChannels().map { scaleECPlane($0, to: format) }
         if frameHeader.colorTransform == .ycbcr {
-            // JPEG transcode: the YCbCr planes convert to the file's *native*
-            // encoded RGB (no color management applied), so the embedded
-            // profile — when present — describes the returned samples.
+            // JPEG transcode: the YCbCr planes are inherently 8-bit and
+            // convert to the file's *native* encoded RGB (no color management
+            // applied), so the embedded profile — when present — describes
+            // the returned samples.
+            guard format == .uint8 else {
+                throw JXLError.unsupported("wide output for YCbCr (JPEG transcode) frames")
+            }
             return JXLDecodedImage(
                 width: xyb.width, height: xyb.height, colorChannels: 3,
                 extraChannels: ecPlanes.count, bitsPerSample: 8, isFloat: false,
@@ -292,14 +297,45 @@ final class FrameDecoder {
                 iccProfile: iccProfile.map { Data($0) })
         }
         // XYB: converted to the frame's declared numeric encoding (primaries/
-        // white point/transfer); files whose encoding is an ICC profile fall
-        // back to sRGB output, so the profile (which describes the original
-        // space) is deliberately not attached.
-        let spec = try makeOutputColorSpec(metadata.colorEncoding)
+        // white point/transfer, incl. PQ/HLG); files whose encoding is an ICC
+        // profile fall back to sRGB output, so the profile (which describes
+        // the original space) is deliberately not attached.
+        let spec = try makeOutputColorSpec(
+            metadata.colorEncoding, toneMapping: metadata.toneMapping)
+        let colorPlanes: [[Int32]]
+        let bits: Int
+        let isFloat: Bool
+        switch format {
+        case .uint8:
+            colorPlanes = xybToRGB8Planes(xyb, spec: spec)
+            bits = 8
+            isFloat = false
+        case .uint16:
+            colorPlanes = xybToRGB16Planes(xyb, spec: spec)
+            bits = 16
+            isFloat = false
+        case .float32:
+            colorPlanes = xybToRGBFloatPlanes(xyb, spec: spec)
+            bits = 32
+            isFloat = true
+        }
         return JXLDecodedImage(
             width: xyb.width, height: xyb.height, colorChannels: 3,
-            extraChannels: ecPlanes.count, bitsPerSample: 8, isFloat: false,
-            planes: xybToRGB8Planes(xyb, spec: spec) + ecPlanes, iccProfile: nil)
+            extraChannels: ecPlanes.count, bitsPerSample: bits, isFloat: isFloat,
+            planes: colorPlanes + ecPlanes, iccProfile: nil)
+    }
+
+    /// Rescales an 8-bit extra-channel plane to the requested color format so
+    /// every plane of the result shares one sample representation.
+    private func scaleECPlane(_ plane: [Int32], to format: JXLSampleFormat) -> [Int32] {
+        switch format {
+        case .uint8:
+            return plane
+        case .uint16:
+            return plane.map { $0 * 257 }  // 0...255 -> 0...65535
+        case .float32:
+            return plane.map { Int32(bitPattern: (Float($0) / 255).bitPattern) }
+        }
     }
 
     /// A fast 1/8-scale preview: for VarDCT frames, the dequantized DC image
@@ -340,7 +376,8 @@ final class FrameDecoder {
                 iccProfile: iccProfile.map { Data($0) })
         }
 
-        let spec = try makeOutputColorSpec(metadata.colorEncoding)
+        let spec = try makeOutputColorSpec(
+            metadata.colorEncoding, toneMapping: metadata.toneMapping)
         let img = XYBImage(
             width: pw, height: ph, stride: bw, paddedHeight: bh, x: dc.x, y: dc.y, b: dc.b)
         return JXLDecodedImage(
@@ -378,10 +415,11 @@ final class FrameDecoder {
 
     // MARK: Modular pixels
 
-    /// Decodes a Modular (lossless) frame. Supports a single regular frame with
-    /// RCT/Palette (or no) transforms; integer samples are returned as values,
-    /// 32-bit float samples as their IEEE-754 bit patterns.
-    func decodeModularImage() throws -> JXLDecodedImage {
+    /// Decodes a Modular (lossless) frame. Native-space frames return their
+    /// native samples regardless of `format` (integers as values, 32-bit float
+    /// as IEEE-754 bit patterns); Modular-XYB (lossy modular) frames render
+    /// through the color pipeline at the requested format.
+    func decodeModularImage(format: JXLSampleFormat = .uint8) throws -> JXLDecodedImage {
         guard frameHeader.isModular else { throw JXLError.unsupported("VarDCT frame is not Modular") }
         guard frameHeader.frameType == .regular, frameHeader.flags == 0 else {
             throw JXLError.unsupported("non-regular or feature-flagged frames")
@@ -430,12 +468,32 @@ final class FrameDecoder {
                 b[i] = Float(cB[i] &+ cY[i]) * dcQuant[2]
             }
             let xyb = XYBImage(width: w, height: h, stride: w, paddedHeight: h, x: x, y: y, b: b)
-            let spec = try makeOutputColorSpec(metadata.colorEncoding)
-            let ecPlanes = fullImage.channels.dropFirst(3).map { $0.pixels }
+            let spec = try makeOutputColorSpec(
+                metadata.colorEncoding, toneMapping: metadata.toneMapping)
+            let ecPlanes = fullImage.channels.dropFirst(3).map {
+                scaleECPlane($0.pixels, to: format)
+            }
+            let colorPlanes: [[Int32]]
+            let bits: Int
+            let isFloat: Bool
+            switch format {
+            case .uint8:
+                colorPlanes = xybToRGB8Planes(xyb, spec: spec)
+                bits = 8
+                isFloat = false
+            case .uint16:
+                colorPlanes = xybToRGB16Planes(xyb, spec: spec)
+                bits = 16
+                isFloat = false
+            case .float32:
+                colorPlanes = xybToRGBFloatPlanes(xyb, spec: spec)
+                bits = 32
+                isFloat = true
+            }
             return JXLDecodedImage(
                 width: w, height: h, colorChannels: 3,
-                extraChannels: ecPlanes.count, bitsPerSample: 8, isFloat: false,
-                planes: xybToRGB8Planes(xyb, spec: spec) + ecPlanes, iccProfile: nil)
+                extraChannels: ecPlanes.count, bitsPerSample: bits, isFloat: isFloat,
+                planes: colorPlanes + ecPlanes, iccProfile: nil)
         }
 
         // Modular samples are native (no color transform applied here), so the

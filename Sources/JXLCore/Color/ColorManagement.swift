@@ -46,8 +46,21 @@ private let kOpsinBiasCbrt = cbrtf(kOpsinBias)
 
 // MARK: - Output transfer functions
 
-/// The display transfer functions the decoder can synthesize (PQ and HLG are
-/// not yet supported and are rejected when building the output spec).
+// SMPTE ST 2084 (PQ) constants (libjxl TF_PQ_Base).
+private let kPQM1 = 2610.0 / 16384
+private let kPQM2 = (2523.0 / 4096) * 128
+private let kPQC1 = 3424.0 / 4096
+private let kPQC2 = (2413.0 / 4096) * 32
+private let kPQC3 = (2392.0 / 4096) * 32
+// ARIB STD-B67 (HLG) OETF constants (libjxl TF_HLG_Base).
+private let kHLGA = 0.17883277
+private let kHLGB = 1.0 - 4.0 * kHLGA
+private let kHLGC = 0.5 - kHLGA * log(4.0 * kHLGA)
+
+/// The display transfer functions the decoder can synthesize. PQ carries the
+/// file's mastering peak (`intensity_target`): display 1.0 maps to that many
+/// nits on the absolute 10000-nit PQ scale. HLG here is the pure OETF — the
+/// cross-channel inverse OOTF is a separate pre-pass (`OutputColorSpec.hlgOOTF`).
 enum OutputTransfer {
     case linear
     case srgb
@@ -55,10 +68,22 @@ enum OutputTransfer {
     case dci  // gamma 2.6
     /// `encoded = linear ^ gamma` (the codestream's gamma convention).
     case gamma(Double)
+    /// SMPTE ST 2084, scaled by the mastering intensity target (nits).
+    case pq(intensityTarget: Float)
+    /// ARIB STD-B67 OETF (scene light -> encoded).
+    case hlgOETF
 
-    /// Encoded value for a clamped linear input (Float reference).
+    /// Largest meaningful display input: 1.0 for relative transfers, but
+    /// 10000/target for PQ (an absolute curve — content may exceed the
+    /// mastering peak, encoding above encode(1.0) up to 1.0 at 10000 nits).
+    var domainMax: Float {
+        if case .pq(let target) = self { return 10000.0 / target }
+        return 1
+    }
+
+    /// Encoded value for a domain-clamped linear input (Float reference).
     func encode(_ d: Float) -> Float {
-        let v = max(0, min(1, d))
+        let v = max(0, min(domainMax, d))
         switch self {
         case .linear:
             return v
@@ -72,6 +97,16 @@ enum OutputTransfer {
             return powf(v, 1.0 / 2.6)
         case .gamma(let g):
             return powf(v, Float(g))
+        case .pq(let target):
+            if v == 0 { return 0 }
+            let xp = pow(Double(v) * Double(target) / 10000.0, kPQM1)
+            return Float(pow((kPQC1 + xp * kPQC2) / (1.0 + xp * kPQC3), kPQM2))
+        case .hlgOETF:
+            if v == 0 { return 0 }
+            let s = Double(v)
+            return s <= 1.0 / 12
+                ? Float((3.0 * s).squareRoot())
+                : Float(kHLGA * log(12.0 * s - kHLGB) + kHLGC)
         }
     }
 
@@ -90,6 +125,17 @@ enum OutputTransfer {
             return pow(s, 2.6)
         case .gamma(let g):
             return pow(s, 1.0 / g)
+        case .pq(let target):
+            if s == 0 { return 0 }
+            let xp = pow(s, 1.0 / kPQM2)
+            let num = max(xp - kPQC1, 0.0)
+            let den = kPQC2 - kPQC3 * xp
+            return pow(num / den, 1.0 / kPQM1) * (10000.0 / Double(target))
+        case .hlgOETF:
+            if s == 0 { return 0 }
+            return s <= 0.5
+                ? s * s / 3.0
+                : (exp((s - kHLGC) / kHLGA) + kHLGB) / 12.0
         }
     }
 }
@@ -108,15 +154,26 @@ enum OutputTransfer {
 final class TransferQuantizer {
     /// `thresholds[k-1]` = smallest linear value mapping to output `k` (255 entries).
     let thresholds: UnsafePointer<Float>
-    /// For bucket `b` of [0,1]/kQuantizerBuckets: the search start for the bucket.
+    /// For bucket `b` of the transfer's domain / kQuantizerBuckets: the search
+    /// start for the bucket.
     let coarse: UnsafePointer<UInt8>
+    /// Maps a linear value to its coarse bucket: `kQuantizerBuckets / domainMax`.
+    let bucketScale: Float
 
     init(transfer: OutputTransfer) {
+        let domainMax = transfer.domainMax
+        bucketScale = Float(kQuantizerBuckets) / domainMax
         func reference(_ v: Float) -> Int {
             Int(max(0, min(255, (transfer.encode(v) * 255).rounded())))
         }
         let t = UnsafeMutablePointer<Float>.allocate(capacity: 255)
+        // Levels above encode(domainMax) are unreachable; +inf thresholds.
+        let maxLevel = reference(transfer.domainMax)
         for k in 1...255 {
+            if k > maxLevel {
+                t[k - 1] = .infinity
+                continue
+            }
             let s = (Double(k) - 0.5) / 255.0
             // The analytic threshold can land a few ulps off the reference's
             // Float flip point; walk to the exact smallest Float mapping to k
@@ -130,7 +187,7 @@ final class TransferQuantizer {
         let c = UnsafeMutablePointer<UInt8>.allocate(capacity: kQuantizerBuckets + 1)
         var k = 0
         for b in 0...kQuantizerBuckets {
-            let start = Float(b) / Float(kQuantizerBuckets)
+            let start = domainMax * Float(b) / Float(kQuantizerBuckets)
             while k < 255 && t[k] <= start { k += 1 }
             c[b] = UInt8(k)  // thresholds[k-1] <= start < thresholds[k]
         }
@@ -145,7 +202,7 @@ final class TransferQuantizer {
     /// Convenience for non-hot callers (tests); hot loops use `encodeSample8`
     /// with the bound pointers instead.
     func encode(_ v: Float) -> UInt8 {
-        encodeSample8(v, thresholds, coarse)
+        encodeSample8(v, thresholds, coarse, bucketScale)
     }
 }
 
@@ -153,11 +210,11 @@ let kQuantizerBuckets = 1024
 
 @inline(__always)
 func encodeSample8(
-    _ v: Float, _ thresholds: UnsafePointer<Float>, _ coarse: UnsafePointer<UInt8>
+    _ v: Float, _ thresholds: UnsafePointer<Float>, _ coarse: UnsafePointer<UInt8>,
+    _ bucketScale: Float
 ) -> UInt8 {
     if !(v > 0) { return 0 }  // negatives and NaN clamp to 0
-    if v >= 1 { return 255 }
-    let bucket = Int(v * Float(kQuantizerBuckets))
+    let bucket = min(Int(v * bucketScale), kQuantizerBuckets)
     var k = Int(coarse[bucket])
     // A few steps at most: thresholds are densest near 0 for gamma-like
     // curves, still several per bucket at worst.
@@ -166,6 +223,71 @@ func encodeSample8(
 }
 
 nonisolated(unsafe) let srgb8Quantizer = TransferQuantizer(transfer: .srgb)
+
+/// Linear -> 16-bit quantizer: the same threshold-table technique as the
+/// 8-bit `TransferQuantizer`, with 65535 thresholds. `encode(v)` equals
+/// `round(transfer.encode(clamp(v)) * 65535)` exactly (thresholds refined to
+/// the Float flip points).
+final class TransferQuantizer16 {
+    let thresholds: UnsafePointer<Float>
+    /// Search start per bucket of the transfer's domain / kQuantizer16Buckets.
+    let coarse: UnsafePointer<UInt16>
+    let bucketScale: Float
+
+    init(transfer: OutputTransfer) {
+        let domainMax = transfer.domainMax
+        bucketScale = Float(kQuantizer16Buckets) / domainMax
+        func reference(_ v: Float) -> Int {
+            Int(max(0, min(65535, (transfer.encode(v) * 65535).rounded())))
+        }
+        let t = UnsafeMutablePointer<Float>.allocate(capacity: 65535)
+        // See TransferQuantizer: levels above encode(domainMax) are unreachable.
+        let maxLevel = reference(transfer.domainMax)
+        for k in 1...65535 {
+            if k > maxLevel {
+                t[k - 1] = .infinity
+                continue
+            }
+            let s = (Double(k) - 0.5) / 65535.0
+            var flip = Float(transfer.inverse(s))
+            while reference(flip) < k { flip = flip.nextUp }
+            while flip > 0 && reference(flip.nextDown) >= k { flip = flip.nextDown }
+            t[k - 1] = flip
+        }
+        thresholds = UnsafePointer(t)
+        let c = UnsafeMutablePointer<UInt16>.allocate(capacity: kQuantizer16Buckets + 1)
+        var k = 0
+        for b in 0...kQuantizer16Buckets {
+            let start = domainMax * Float(b) / Float(kQuantizer16Buckets)
+            while k < 65535 && t[k] <= start { k += 1 }
+            c[b] = UInt16(k)
+        }
+        coarse = UnsafePointer(c)
+    }
+
+    deinit {
+        UnsafeMutablePointer(mutating: thresholds).deallocate()
+        UnsafeMutablePointer(mutating: coarse).deallocate()
+    }
+
+    func encode(_ v: Float) -> UInt16 {
+        encodeSample16(v, thresholds, coarse, bucketScale)
+    }
+}
+
+let kQuantizer16Buckets = 1 << 16
+
+@inline(__always)
+func encodeSample16(
+    _ v: Float, _ thresholds: UnsafePointer<Float>, _ coarse: UnsafePointer<UInt16>,
+    _ bucketScale: Float
+) -> UInt16 {
+    if !(v > 0) { return 0 }
+    let bucket = min(Int(v * bucketScale), kQuantizer16Buckets)
+    var k = Int(coarse[bucket])
+    while k < 65535 && v >= thresholds[k] { k += 1 }
+    return UInt16(truncatingIfNeeded: k)
+}
 
 // MARK: - Output color spec (declared numeric encoding -> conversion recipe)
 
@@ -177,6 +299,30 @@ struct OutputColorSpec {
     /// sRGB primaries and a D65 white point (identity).
     let matrix: [Float]?
     let quantizer: TransferQuantizer
+    /// The transfer used by the quantizer, kept for 16-bit/float encoding.
+    let transfer: OutputTransfer
+    /// HLG inverse OOTF (display -> scene light): each pixel scales by
+    /// `luminance^exponent` before the OETF, with luminance the dot product of
+    /// the target primaries' Y contributions. nil when not HLG or when the
+    /// exponent is negligible (libjxl `apply_ootf_`).
+    let hlgOOTF: (exponent: Float, lumR: Float, lumG: Float, lumB: Float)?
+
+    /// Scale applied to the inverse-opsin linear output: libjxl inits the
+    /// opsin matrix with `255 / intensity_target`, so linear 1.0 equals the
+    /// mastering peak (identity for SDR's default 255).
+    let opsinScale: Float
+
+    init(
+        matrix: [Float]?, quantizer: TransferQuantizer, transfer: OutputTransfer,
+        hlgOOTF: (exponent: Float, lumR: Float, lumG: Float, lumB: Float)? = nil,
+        opsinScale: Float = 1
+    ) {
+        self.matrix = matrix
+        self.quantizer = quantizer
+        self.transfer = transfer
+        self.hlgOOTF = hlgOOTF
+        self.opsinScale = opsinScale
+    }
 }
 
 private let kD65 = JXLChromaticity(x: 0.3127, y: 0.3290)
@@ -186,8 +332,11 @@ private let kSRGBPrimaries = [
 ]
 
 /// Builds the output conversion for a VarDCT frame's declared color encoding.
-/// Throws `unsupported` for transfer functions we cannot synthesize yet.
-func makeOutputColorSpec(_ enc: JXLColorEncoding) throws -> OutputColorSpec {
+/// `toneMapping` supplies the mastering intensity target that PQ and the HLG
+/// OOTF scale by.
+func makeOutputColorSpec(
+    _ enc: JXLColorEncoding, toneMapping: JXLToneMapping = JXLToneMapping()
+) throws -> OutputColorSpec {
     // Transfer function.
     let transfer: OutputTransfer
     if enc.hasGamma {
@@ -196,10 +345,12 @@ func makeOutputColorSpec(_ enc: JXLColorEncoding) throws -> OutputColorSpec {
         switch enc.transferFunction {
         case 1: transfer = .bt709
         case 8: transfer = .linear
+        case 16: transfer = .pq(intensityTarget: toneMapping.intensityTarget)
         case 17: transfer = .dci
+        case 18: transfer = .hlgOETF
         case 0, 2, 13: transfer = .srgb  // sRGB; Unknown renders as sRGB
         default:
-            throw JXLError.unsupported("transfer function \(enc.transferFunction) (PQ/HLG)")
+            throw JXLError.unsupported("transfer function \(enc.transferFunction)")
         }
     }
 
@@ -240,7 +391,26 @@ func makeOutputColorSpec(_ enc: JXLColorEncoding) throws -> OutputColorSpec {
     } else {
         quantizer = TransferQuantizer(transfer: transfer)
     }
-    return OutputColorSpec(matrix: matrix, quantizer: quantizer)
+
+    // HLG inverse OOTF (libjxl HlgOOTF::ToSceneLight): display -> scene light
+    // with gamma (1/1.2) * 1.111^(-log2(target/1000)); per-pixel luminance
+    // uses the target primaries' Y row. Skipped when |gamma - 1| <= 0.01.
+    var hlgOOTF: (exponent: Float, lumR: Float, lumG: Float, lumB: Float)? = nil
+    if case .hlgOETF = transfer {
+        let gamma =
+            (1.0 / 1.2)
+            * powf(1.111, -log2(toneMapping.intensityTarget / 1000.0))
+        let exponent = gamma - 1
+        if exponent < -0.01 || exponent > 0.01 {
+            let toXYZ = rgbToXYZMatrix(primaries: primaries, white: white)
+            hlgOOTF = (
+                exponent, Float(toXYZ[3]), Float(toXYZ[4]), Float(toXYZ[5])
+            )
+        }
+    }
+    return OutputColorSpec(
+        matrix: matrix, quantizer: quantizer, transfer: transfer, hlgOOTF: hlgOOTF,
+        opsinScale: 255.0 / toneMapping.intensityTarget)
 }
 
 // MARK: 3x3 color matrix math (Double)
@@ -356,8 +526,13 @@ private struct ConvertState: @unchecked Sendable {
     let m00, m01, m02, m10, m11, m12, m20, m21, m22: Float
     let th: UnsafePointer<Float>
     let co: UnsafePointer<UInt8>
+    let thScale: Float
+    let hasOOTF: Bool
+    let ootfExp, lumR, lumG, lumB: Float
+    let opsinScale: Float
 
     init(_ spec: OutputColorSpec) {
+        opsinScale = spec.opsinScale
         hasMatrix = spec.matrix != nil
         let m = spec.matrix ?? [1, 0, 0, 0, 1, 0, 0, 0, 1]
         m00 = m[0]; m01 = m[1]; m02 = m[2]
@@ -365,11 +540,23 @@ private struct ConvertState: @unchecked Sendable {
         m20 = m[6]; m21 = m[7]; m22 = m[8]
         th = spec.quantizer.thresholds
         co = spec.quantizer.coarse
+        thScale = spec.quantizer.bucketScale
+        hasOOTF = spec.hlgOOTF != nil
+        let ootf = spec.hlgOOTF ?? (0, 0, 0, 0)
+        ootfExp = ootf.exponent
+        lumR = ootf.lumR
+        lumG = ootf.lumG
+        lumB = ootf.lumB
     }
 
+    /// Linear target-space RGB for one XYB sample (opsin intensity scale +
+    /// matrix + HLG OOTF applied).
     @inline(__always)
-    func convert(_ x: Float, _ y: Float, _ b: Float) -> (UInt8, UInt8, UInt8) {
+    func linear(_ x: Float, _ y: Float, _ b: Float) -> (Float, Float, Float) {
         var (lr, lg, lb) = xybToLinearSRGB(x: x, y: y, b: b)
+        lr *= opsinScale
+        lg *= opsinScale
+        lb *= opsinScale
         if hasMatrix {
             let tr = m00 * lr + m01 * lg + m02 * lb
             let tg = m10 * lr + m11 * lg + m12 * lb
@@ -378,7 +565,25 @@ private struct ConvertState: @unchecked Sendable {
             lg = tg
             lb = tb
         }
-        return (encodeSample8(lr, th, co), encodeSample8(lg, th, co), encodeSample8(lb, th, co))
+        if hasOOTF {
+            let luminance = lumR * lr + lumG * lg + lumB * lb
+            if luminance > 0 {
+                let ratio = min(powf(luminance, ootfExp), 1e9)
+                lr *= ratio
+                lg *= ratio
+                lb *= ratio
+            }
+        }
+        return (lr, lg, lb)
+    }
+
+    @inline(__always)
+    func convert(_ x: Float, _ y: Float, _ b: Float) -> (UInt8, UInt8, UInt8) {
+        let (lr, lg, lb) = linear(x, y, b)
+        return (
+            encodeSample8(lr, th, co, thScale), encodeSample8(lg, th, co, thScale),
+            encodeSample8(lb, th, co, thScale)
+        )
     }
 }
 
@@ -535,6 +740,105 @@ func xybToRGB8Planes(_ img: XYBImage, spec: OutputColorSpec) -> [[Int32]] {
             }
         }
         withExtendedLifetime(spec.quantizer) {}
+    }
+    }
+    }
+    }
+    }
+    }
+    return [planeR, planeG, planeB]
+}
+
+/// Converts XYB planes to three planar 16-bit channels (values 0...65535 as
+/// Int32), row-parallel. The 16-bit quantizer table is built per call
+/// (~milliseconds) — negligible against the decode itself.
+func xybToRGB16Planes(_ img: XYBImage, spec: OutputColorSpec) -> [[Int32]] {
+    let width = img.width
+    let stride = img.stride
+    var planeR = [Int32](repeating: 0, count: img.width * img.height)
+    var planeG = planeR
+    var planeB = planeR
+    let state = ConvertState(spec)
+    let quantizer16 = TransferQuantizer16(transfer: spec.transfer)
+    planeR.withUnsafeMutableBufferPointer { rBuf in
+    planeG.withUnsafeMutableBufferPointer { gBuf in
+    planeB.withUnsafeMutableBufferPointer { bBuf in
+    img.x.withUnsafeBufferPointer { xBuf in
+    img.y.withUnsafeBufferPointer { yBuf in
+    img.b.withUnsafeBufferPointer { bSrcBuf in
+        nonisolated(unsafe) let pr = rBuf.baseAddress!
+        nonisolated(unsafe) let pg = gBuf.baseAddress!
+        nonisolated(unsafe) let pbOut = bBuf.baseAddress!
+        nonisolated(unsafe) let px = xBuf.baseAddress!
+        nonisolated(unsafe) let py = yBuf.baseAddress!
+        nonisolated(unsafe) let pb = bSrcBuf.baseAddress!
+        nonisolated(unsafe) let th = quantizer16.thresholds
+        nonisolated(unsafe) let co = quantizer16.coarse
+        let thScale = quantizer16.bucketScale
+        DispatchQueue.concurrentPerform(iterations: img.height) { y in
+            let row = y * stride
+            let dstRow = y * width
+            for x in 0..<width {
+                let (lr, lg, lb) = state.linear(px[row + x], py[row + x], pb[row + x])
+                pr[dstRow + x] = Int32(encodeSample16(lr, th, co, thScale))
+                pg[dstRow + x] = Int32(encodeSample16(lg, th, co, thScale))
+                pbOut[dstRow + x] = Int32(encodeSample16(lb, th, co, thScale))
+            }
+        }
+        withExtendedLifetime(quantizer16) {}
+    }
+    }
+    }
+    }
+    }
+    }
+    return [planeR, planeG, planeB]
+}
+
+/// Converts XYB planes to three planar 32-bit float channels holding the
+/// transfer-encoded values (IEEE-754 bit patterns in Int32, matching the
+/// Modular float convention), row-parallel. Unlike the integer paths, values
+/// are NOT clamped to [0, 1] before the transfer — HDR headroom survives for
+/// linear output; PQ/HLG/gamma curves clamp inherently.
+func xybToRGBFloatPlanes(_ img: XYBImage, spec: OutputColorSpec) -> [[Int32]] {
+    let width = img.width
+    let stride = img.stride
+    var planeR = [Int32](repeating: 0, count: img.width * img.height)
+    var planeG = planeR
+    var planeB = planeR
+    let state = ConvertState(spec)
+    let transfer = spec.transfer
+    planeR.withUnsafeMutableBufferPointer { rBuf in
+    planeG.withUnsafeMutableBufferPointer { gBuf in
+    planeB.withUnsafeMutableBufferPointer { bBuf in
+    img.x.withUnsafeBufferPointer { xBuf in
+    img.y.withUnsafeBufferPointer { yBuf in
+    img.b.withUnsafeBufferPointer { bSrcBuf in
+        nonisolated(unsafe) let pr = rBuf.baseAddress!
+        nonisolated(unsafe) let pg = gBuf.baseAddress!
+        nonisolated(unsafe) let pbOut = bBuf.baseAddress!
+        nonisolated(unsafe) let px = xBuf.baseAddress!
+        nonisolated(unsafe) let py = yBuf.baseAddress!
+        nonisolated(unsafe) let pb = bSrcBuf.baseAddress!
+        DispatchQueue.concurrentPerform(iterations: img.height) { y in
+            let row = y * stride
+            let dstRow = y * width
+            @inline(__always) func enc(_ v: Float) -> Int32 {
+                let e: Float
+                if case .linear = transfer {
+                    e = v  // keep HDR headroom / negatives for linear output
+                } else {
+                    e = transfer.encode(v)
+                }
+                return Int32(bitPattern: e.bitPattern)
+            }
+            for x in 0..<width {
+                let (lr, lg, lb) = state.linear(px[row + x], py[row + x], pb[row + x])
+                pr[dstRow + x] = enc(lr)
+                pg[dstRow + x] = enc(lg)
+                pbOut[dstRow + x] = enc(lb)
+            }
+        }
     }
     }
     }

@@ -100,7 +100,15 @@ do {
 
     case "decode":
         guard args.count >= 4 else { usage() }
-        let image = try JXL.decodeImage(from: bytes)
+        var format = JXLSampleFormat.uint8
+        if args.count >= 5 {
+            switch args[4] {
+            case "16": format = .uint16
+            case "float": format = .float32
+            default: usage()
+            }
+        }
+        let image = try JXL.decodeImage(from: bytes, format: format)
         let wantPAM = args[3].lowercased().hasSuffix(".pam")
         let out =
             image.isFloat

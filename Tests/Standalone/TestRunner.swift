@@ -77,6 +77,7 @@ struct TestRunner {
         animation()
         brotli()
         jbrdParse()
+        hdrOutput()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -265,6 +266,62 @@ struct TestRunner {
             let truncated = [UInt8](compressed.prefix(compressed.count / 2))
             _ = try? Brotli.decompress(truncated, maxOutputSize: 16 << 20)
             check(true, "brotli truncated stream handled without crashing")
+        }
+    }
+
+    // MARK: - HDR output (PQ/HLG transfers, 16-bit + float formats)
+
+    /// `192x128_pq.jxl` (BT.2020 + SMPTE 2084 at 1000 nits) and
+    /// `192x128_hlg.jxl` (BT.2020 + HLG) must match djxl's 16-bit output
+    /// (`--bits_per_sample=16` PPMs). PQ content exceeds the mastering peak,
+    /// exercising the extended transfer domain; HLG exercises the inverse
+    /// OOTF. The float32 format must agree exactly with the 16-bit format.
+    static func hdrOutput() {
+        let dir = fixturesDir()
+        for name in ["192x128_pq", "192x128_hlg"] {
+            guard let jxl = try? Data(contentsOf: dir.appendingPathComponent("\(name).jxl")),
+                let refPPM = try? Data(contentsOf: dir.appendingPathComponent("\(name).ppm")),
+                let img16 = try? JXL.decodeImage(from: jxl, format: .uint16),
+                let imgF = try? JXL.decodeImage(from: jxl, format: .float32)
+            else {
+                check(false, "\(name) decodes at 16-bit + float")
+                continue
+            }
+            check(img16.bitsPerSample == 16 && !img16.isFloat, "\(name) 16-bit shape")
+            check(imgF.bitsPerSample == 32 && imgF.isFloat, "\(name) float shape")
+            // Parse the 16-bit P6 (big-endian samples after 3 newlines).
+            var newlines = 0
+            var offset = 0
+            for (i, byte) in refPPM.enumerated() where byte == 0x0A {
+                newlines += 1
+                if newlines == 3 {
+                    offset = i + 1
+                    break
+                }
+            }
+            let ref = [UInt8](refPPM[offset...])
+            let n = img16.width * img16.height
+            guard ref.count == n * 6 else {
+                check(false, "\(name) oracle size")
+                continue
+            }
+            var se = 0.0
+            var floatAgrees = true
+            for i in 0..<n {
+                for c in 0..<3 {
+                    let refVal = Int(ref[(i * 3 + c) * 2]) << 8 | Int(ref[(i * 3 + c) * 2 + 1])
+                    let got = Int(img16.planes[c][i])
+                    let d = Double(refVal - got)
+                    se += d * d
+                    let f = Float(
+                        bitPattern: UInt32(bitPattern: imgF.planes[c][i]))
+                    if abs(Int((f * 65535).rounded()) - got) > 0 { floatAgrees = false }
+                }
+            }
+            let mse = se / Double(n * 3)
+            let psnr = mse == 0 ? 999 : 10 * log10(65535.0 * 65535.0 / mse)
+            check(psnr > 50, "\(name) 16-bit matches djxl (PSNR \(Int(psnr)) dB)")
+            check(floatAgrees, "\(name) float32 agrees with 16-bit")
         }
     }
 
