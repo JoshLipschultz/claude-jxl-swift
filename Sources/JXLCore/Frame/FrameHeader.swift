@@ -54,6 +54,8 @@ public struct FrameHeader: Sendable {
     public var xQmScale: UInt32 = 2
     public var bQmScale: UInt32 = 2
     public var numPasses: UInt32 = 1
+    /// Per-pass coefficient shifts (Passes header); the last pass is 0.
+    public var passShifts: [UInt32] = [0]
     public var dcLevel: UInt32 = 0
     public var customSizeOrOrigin = false
     public var frameWidth: UInt32 = 0
@@ -258,9 +260,11 @@ public struct FrameHeader: Sendable {
 
     private mutating func parsePasses(_ r: BitReader) {
         numPasses = r.readU32(.value(1), .value(2), .value(3), .bits(3, offset: 4))
+        passShifts = [UInt32](repeating: 0, count: Int(numPasses))
         if numPasses != 1 {
             let numDownsample = r.readU32(.value(0), .value(1), .value(2), .bits(1, offset: 3))
-            for _ in 0..<(numPasses - 1) { _ = r.read(2) }  // shift[i]
+            // Coefficient shifts for all passes but the last (which is 0).
+            for i in 0..<(Int(numPasses) - 1) { passShifts[i] = UInt32(r.read(2)) }
             for _ in 0..<numDownsample { _ = r.readU32(.value(1), .value(2), .value(4), .value(8)) }  // downsample
             for _ in 0..<numDownsample { _ = r.readU32(.value(0), .value(1), .value(2), .bits(3)) }  // last_pass
         }

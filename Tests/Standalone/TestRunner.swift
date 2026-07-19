@@ -83,6 +83,7 @@ struct TestRunner {
         orientationBaking()
         deltaPalette()
         iccOutput()
+        progressiveAC()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -160,6 +161,35 @@ struct TestRunner {
             }
         }
         return (w, h, planes)
+    }
+
+    // MARK: - Progressive (multi-pass) VarDCT
+
+    /// `384x256_prog{,q}.jxl` (cjxl --progressive_ac / --qprogressive_ac) are
+    /// multi-group, multi-pass VarDCT frames: each pass carries its own
+    /// histograms/orders and its coefficients accumulate with the Passes
+    /// header's per-pass shifts. Oracles are djxl PPMs.
+    static func progressiveAC() {
+        let dir = fixturesDir()
+        for name in ["384x256_prog", "384x256_progq"] {
+            guard let jxl = try? Data(contentsOf: dir.appendingPathComponent("\(name).jxl")),
+                let refPPM = try? Data(contentsOf: dir.appendingPathComponent("\(name).ppm")),
+                let img = try? JXL.decodeImage(from: [UInt8](jxl))
+            else {
+                check(false, "\(name) fixture decodes")
+                continue
+            }
+            var rgb = [UInt8](repeating: 0, count: img.width * img.height * 3)
+            for c in 0..<3 {
+                for i in 0..<(img.width * img.height) {
+                    rgb[i * 3 + c] = UInt8(clamping: img.planes[c][i])
+                }
+            }
+            let psnr = ppmPSNR(refPPM, rgb, img.width, img.height)
+            check(psnr > 50, "\(name) matches djxl (PSNR \(Int(psnr)) dB)")
+        }
+        FileHandle.standardError.write(
+            Data("  [progressive] multi-pass AC fixtures match djxl=2\n".utf8))
     }
 
     // MARK: - ICC output (matrix + TRC CMS)

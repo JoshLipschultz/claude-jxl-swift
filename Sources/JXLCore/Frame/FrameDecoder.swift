@@ -784,8 +784,10 @@ final class FrameDecoder {
         guard frameHeader.frameType == .regular else {
             throw JXLError.unsupported("non-regular VarDCT frame")
         }
-        guard frameHeader.numPasses == 1 else {
-            throw JXLError.unsupported("progressive (multi-pass) VarDCT frames")
+        if frameHeader.numPasses > 1 && metadata.extraChannelCount > 0 {
+            // Extra-channel modular data is bracketed across pass sections by
+            // shift; that walk is not implemented yet.
+            throw JXLError.unsupported("extra channels in progressive frames")
         }
         guard !frameHeader.needsBlending || allowBlendingDecode else {
             throw JXLError.unsupported(

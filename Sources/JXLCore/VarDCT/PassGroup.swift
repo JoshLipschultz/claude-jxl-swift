@@ -117,18 +117,21 @@ func decodeVarDCTCoefficients(_ d: FrameDecoder) throws -> VarDCTCoefficients {
     let acGlobal = try d.varDCTACGlobal()
 
     let bctx = try d.varDCTDCGlobal().info.blockContextMap
-    // Context map padded by the "cheat" margin so out-of-range zero-density
-    // contexts index validly (libjxl resize to num_contexts + limit - count).
+    // Per-pass context maps padded by the "cheat" margin so out-of-range
+    // zero-density contexts index validly (libjxl resize to num_contexts +
+    // limit - count).
     let numContexts = acGlobal.numHistograms * bctx.numACContexts
-    let ctxMap: [UInt8] = {
-        var map = acGlobal.contextMaps[0]
+    let numPasses = Int(d.frameHeader.numPasses)
+    let passShifts = d.frameHeader.passShifts.map(Int.init)
+    let ctxMaps: [[UInt8]] = (0..<numPasses).map { pass in
+        var map = acGlobal.contextMaps[pass]
         if map.count < numContexts + kZeroDensityContextLimit - kZeroDensityContextCount {
             map += [UInt8](
                 repeating: 0,
                 count: numContexts + kZeroDensityContextLimit - kZeroDensityContextCount - map.count)
         }
         return map
-    }()
+    }
     let histoSelectorBits = ceilLog2Nonzero(UInt32(acGlobal.numHistograms))
 
     let dim = d.dim
@@ -154,10 +157,11 @@ func decodeVarDCTCoefficients(_ d: FrameDecoder) throws -> VarDCTCoefficients {
     if d.coalesced {
         let (bx0, by0, gw, gh) = groupBounds(0)
         let reader = d.acGroupReader(0)
-        let (blocks, nz) = try decodeACGroup(
-            reader, meta: meta, acGlobal: acGlobal, bctx: bctx, ctxMap: ctxMap,
+        var blocks: [VarDCTBlock] = []
+        let nz = try decodeACGroupPass(
+            reader, meta: meta, acGlobal: acGlobal, bctx: bctx, ctxMap: ctxMaps[0],
             histoSelectorBits: histoSelectorBits, bx0: bx0, by0: by0, gw: gw, gh: gh,
-            blockW: blockW, shifts: shifts)
+            blockW: blockW, shifts: shifts, pass: 0, coeffShift: 0, blocks: &blocks)
         if let ecImage,
             let ecResult = try decodeModularGroupImage(
                 reader, fullImage: ecImage, group: 0, dim: dim,
@@ -176,9 +180,12 @@ func decodeVarDCTCoefficients(_ d: FrameDecoder) throws -> VarDCTCoefficients {
     typealias GroupResult = Result<
         (blocks: [VarDCTBlock], nonZeros: Int, ec: ModularGroupResult?), Error>
     let codestream = d.codestream
+    // Row-major [group][pass] section ranges.
     let sectionRanges = (0..<dim.numGroups).map { g in
-        d.sectionRange(acGroupIndex(
-            pass: 0, group: g, numGroups: dim.numGroups, numDCGroups: dim.numDCGroups))
+        (0..<numPasses).map { pass in
+            d.sectionRange(acGroupIndex(
+                pass: pass, group: g, numGroups: dim.numGroups, numDCGroups: dim.numDCGroups))
+        }
     }
     var results = [GroupResult?](repeating: nil, count: dim.numGroups)
     results.withUnsafeMutableBufferPointer { slots in
@@ -192,19 +199,27 @@ func decodeVarDCTCoefficients(_ d: FrameDecoder) throws -> VarDCTCoefficients {
         DispatchQueue.concurrentPerform(iterations: dim.numGroups) { g in
             let (bx0, by0, gw, gh) = groupBounds(g)
             out[g] = GroupResult {
-                let reader = BitReader(codestream, byteRange: sectionRanges[g])
-                let acResult = try decodeACGroup(
-                    reader,
-                    meta: meta, acGlobal: acGlobal, bctx: bctx, ctxMap: ctxMap,
-                    histoSelectorBits: histoSelectorBits, bx0: bx0, by0: by0, gw: gw, gh: gh,
-                    blockW: blockW, shifts: shifts)
+                // Passes accumulate into the same block list, in pass order.
+                var groupBlocks: [VarDCTBlock] = []
+                var nonZeros = 0
+                var lastReader: BitReader? = nil
+                for pass in 0..<numPasses {
+                    let reader = BitReader(codestream, byteRange: sectionRanges[g][pass])
+                    nonZeros += try decodeACGroupPass(
+                        reader,
+                        meta: meta, acGlobal: acGlobal, bctx: bctx, ctxMap: ctxMaps[pass],
+                        histoSelectorBits: histoSelectorBits, bx0: bx0, by0: by0, gw: gw, gh: gh,
+                        blockW: blockW, shifts: shifts, pass: pass,
+                        coeffShift: passShifts[pass], blocks: &groupBlocks)
+                    lastReader = reader
+                }
                 let ecResult = try ec.flatMap {
                     try decodeModularGroupImage(
-                        reader, fullImage: $0, group: g, dim: dim,
+                        lastReader!, fullImage: $0, group: g, dim: dim,
                         globalTree: tree, globalCode: code, globalCtxMap: treeCtxMap,
                         streamID: ecStreamID(g))
                 }
-                return (acResult.blocks, acResult.nonZeros, ecResult)
+                return (groupBlocks, nonZeros, ecResult)
             }
         }
     }
@@ -226,12 +241,14 @@ func decodeVarDCTCoefficients(_ d: FrameDecoder) throws -> VarDCTCoefficients {
     try decodeVarDCTCoefficients(from: [UInt8](data))
 }
 
-private func decodeACGroup(
+private func decodeACGroupPass(
     _ br: BitReader, meta: VarDCTACMetadata, acGlobal: VarDCTACGlobal,
     bctx: VarDCTBlockContextMap, ctxMap: [UInt8], histoSelectorBits: Int,
-    bx0: Int, by0: Int, gw: Int, gh: Int, blockW: Int, shifts: (h: [Int], v: [Int])
-) throws -> (blocks: [VarDCTBlock], nonZeros: Int) {
-    var blocks: [VarDCTBlock] = []
+    bx0: Int, by0: Int, gw: Int, gh: Int, blockW: Int, shifts: (h: [Int], v: [Int]),
+    pass: Int, coeffShift: Int, blocks: inout [VarDCTBlock]
+) throws -> Int {
+    let firstPass = pass == 0
+    var blockIndex = 0
     var totalNonZeros = 0
     var curHistogram = 0
     if histoSelectorBits != 0 { curHistogram = Int(br.read(histoSelectorBits)) }
@@ -239,15 +256,16 @@ private func decodeACGroup(
         throw JXLError.malformed("invalid histogram selector")
     }
     let ctxOffset = curHistogram * bctx.numACContexts
-    let reader = ANSSymbolReader(code: acGlobal.codes[0], reader: br)
+    let reader = ANSSymbolReader(code: acGlobal.codes[pass], reader: br)
 
     // Group-local non-zero prediction planes, per channel at that channel's
-    // subsampled resolution (libjxl num_nzeroes planes).
+    // subsampled resolution (libjxl num_nzeroes planes). Fresh per pass: each
+    // pass codes its own non-zero counts.
     let is444 = shifts.h == [0, 0, 0] && shifts.v == [0, 0, 0]
     let nzW = (0..<3).map { divCeil(gw, 1 << shifts.h[$0]) }
     let nzH = (0..<3).map { divCeil(gh, 1 << shifts.v[$0]) }
     var nzeros = (0..<3).map { [Int32](repeating: 0, count: nzW[$0] * nzH[$0]) }
-    let orders = acGlobal.orders[0]
+    let orders = acGlobal.orders[pass]
 
     for byl in 0..<gh {
         let by = by0 + byl
@@ -263,7 +281,15 @@ private func decodeACGroup(
             let size = covered * kDCTBlockSize
             let ord = kStrategyOrder[strategy]
 
-            var coeff: [[Int32]] = [[], [], []]
+            var coeff: [[Int32]]
+            if firstPass {
+                coeff = [[], [], []]
+            } else {
+                // Later passes add into the block created by pass 0. Detach
+                // the storage so the in-place accumulation below stays unique.
+                coeff = blocks[blockIndex].coeff
+                blocks[blockIndex].coeff = []
+            }
             // DC context index (libjxl qdc_row[lbx], full-res position).
             let dcIdx = Int(meta.dcQuantContext[pos])
 
@@ -278,7 +304,21 @@ private func decodeACGroup(
                 if !is444 && (hs != 0 || vs != 0) && covered != 1 {
                     throw JXLError.unsupported("multi-block AC strategy on subsampled channel")
                 }
-                coeff[c] = [Int32](repeating: 0, count: size)
+                // The channel plane is detached into a local (fresh on the
+                // first pass, moved out of the block afterwards) and written
+                // through a bound buffer pointer: the conditional provenance
+                // otherwise defeats uniqueness analysis and every write pays
+                // a COW check.
+                var chan: [Int32]
+                if firstPass {
+                    chan = [Int32](repeating: 0, count: size)
+                } else {
+                    chan = coeff[c]
+                    coeff[c] = []
+                    guard chan.count == size else {
+                        throw JXLError.malformed("pass block size mismatch")
+                    }
+                }
 
                 // Block context: libjxl's GetBlockFromBitstream reads the raw
                 // quant field at (full-res row, rect.x0 + subsampled x).
@@ -302,30 +342,43 @@ private func decodeACGroup(
                 let histoOffset = ctxOffset + blockCtxZeroDensityOffset(bctx, blockCtx: blockCtx)
                 var prev = nz > size / 16 ? 0 : 1
                 var k = covered
-                while k < size && nz != 0 {
-                    let ctx = histoOffset
-                        + zeroDensityContext(
-                            nonzerosLeft: nz, k: k, coveredBlocks: covered,
-                            log2Covered: log2Covered, prev: prev)
-                    let u = reader.readHybridUintClustered(Int(ctxMap[ctx]), br)
-                    // UnpackSigned without UB.
-                    let magnitude = Int32(bitPattern: u >> 1)
-                    let negSign = Int32(bitPattern: (~u) & 1)
-                    let value = (magnitude ^ (negSign &- 1))
-                    coeff[c][Int(order[k])] = coeff[c][Int(order[k])] &+ value
-                    prev = u != 0 ? 1 : 0
-                    nz -= prev
-                    k += 1
+                chan.withUnsafeMutableBufferPointer { cbuf in
+                    order.withUnsafeBufferPointer { obuf in
+                        while k < size && nz != 0 {
+                            let ctx = histoOffset
+                                + zeroDensityContext(
+                                    nonzerosLeft: nz, k: k, coveredBlocks: covered,
+                                    log2Covered: log2Covered, prev: prev)
+                            let u = reader.readHybridUintClustered(Int(ctxMap[ctx]), br)
+                            // UnpackSigned without UB, then the pass's shift.
+                            let magnitude = Int32(bitPattern: u >> 1)
+                            let negSign = Int32(bitPattern: (~u) & 1)
+                            let value = (magnitude ^ (negSign &- 1)) << coeffShift
+                            let idx = Int(obuf[k])
+                            cbuf[idx] = cbuf[idx] &+ value
+                            prev = u != 0 ? 1 : 0
+                            nz -= prev
+                            k += 1
+                        }
+                    }
                 }
                 guard nz == 0 else { throw JXLError.malformed("invalid AC: nonzeros remain") }
+                coeff[c] = chan
             }
-            blocks.append(
-                VarDCTBlock(bx: bx, by: by, strategy: UInt8(strategy), coveredX: cx, coveredY: cy, coeff: coeff))
+            if firstPass {
+                blocks.append(
+                    VarDCTBlock(
+                        bx: bx, by: by, strategy: UInt8(strategy), coveredX: cx, coveredY: cy,
+                        coeff: coeff))
+            } else {
+                blocks[blockIndex].coeff = coeff
+            }
+            blockIndex += 1
         }
     }
 
     guard reader.checkANSFinalState() else {
         throw JXLError.malformed("AC group ANS checksum failure")
     }
-    return (blocks, totalNonZeros)
+    return totalNonZeros
 }
