@@ -110,6 +110,36 @@ enum OutputTransfer {
         }
     }
 
+    /// Unclamped encode for float32 output, matching libjxl's transfer
+    /// implementations: the curve applies to |v| with the sign copied back
+    /// (out-of-gamut samples stay out of gamut, as djxl emits them). The
+    /// absolute curves (PQ/HLG) keep their domain clamp.
+    func encodeExtended(_ d: Float) -> Float {
+        switch self {
+        case .linear:
+            return d
+        case .pq, .hlgOETF:
+            return encode(d)
+        case .srgb:
+            let v = abs(d)
+            let e = v <= 0.0031308 ? 12.92 * v : 1.055 * powf(v, 1.0 / 2.4) - 0.055
+            return d < 0 ? -e : e
+        case .bt709:
+            let v = abs(d)
+            let e =
+                v < 0.018053968510807
+                ? 4.5 * v
+                : 1.099296826809442 * powf(v, 0.45) - 0.099296826809442
+            return d < 0 ? -e : e
+        case .dci:
+            let e = powf(abs(d), 1.0 / 2.6)
+            return d < 0 ? -e : e
+        case .gamma(let g):
+            let e = powf(abs(d), Float(g))
+            return d < 0 ? -e : e
+        }
+    }
+
     /// Inverse transfer (encoded -> linear), in Double for table construction.
     func inverse(_ s: Double) -> Double {
         switch self {
@@ -312,16 +342,21 @@ struct OutputColorSpec {
     /// mastering peak (identity for SDR's default 255).
     let opsinScale: Float
 
+    /// Custom inverse-opsin matrix/biases (nil = spec defaults).
+    let customOpsin: JXLOpsinInverseMatrix?
+
     init(
         matrix: [Float]?, quantizer: TransferQuantizer, transfer: OutputTransfer,
         hlgOOTF: (exponent: Float, lumR: Float, lumG: Float, lumB: Float)? = nil,
-        opsinScale: Float = 1
+        opsinScale: Float = 1,
+        customOpsin: JXLOpsinInverseMatrix? = nil
     ) {
         self.matrix = matrix
         self.quantizer = quantizer
         self.transfer = transfer
         self.hlgOOTF = hlgOOTF
         self.opsinScale = opsinScale
+        self.customOpsin = customOpsin
     }
 }
 
@@ -335,7 +370,8 @@ private let kSRGBPrimaries = [
 /// `toneMapping` supplies the mastering intensity target that PQ and the HLG
 /// OOTF scale by.
 func makeOutputColorSpec(
-    _ enc: JXLColorEncoding, toneMapping: JXLToneMapping = JXLToneMapping()
+    _ enc: JXLColorEncoding, toneMapping: JXLToneMapping = JXLToneMapping(),
+    customOpsin: JXLOpsinInverseMatrix? = nil
 ) throws -> OutputColorSpec {
     // Transfer function.
     let transfer: OutputTransfer
@@ -410,7 +446,8 @@ func makeOutputColorSpec(
     }
     return OutputColorSpec(
         matrix: matrix, quantizer: quantizer, transfer: transfer, hlgOOTF: hlgOOTF,
-        opsinScale: 255.0 / toneMapping.intensityTarget)
+        opsinScale: 255.0 / toneMapping.intensityTarget,
+        customOpsin: customOpsin)
 }
 
 // MARK: 3x3 color matrix math (Double)
@@ -501,22 +538,10 @@ private func linearSRGBToTargetMatrix(
 
 // MARK: - XYB -> output pixels
 
-/// XYB -> linear sRGB (libjxl XybToRgb), the mode-independent first stage.
-@inline(__always)
-func xybToLinearSRGB(x: Float, y: Float, b: Float) -> (Float, Float, Float) {
-    // libjxl opsin_biases_cbrt = cbrt(-bias) = -cbrt(bias), and XybToRgb
-    // subtracts it — i.e. adds cbrt(bias) — to recover cbrt(mixed).
-    let gr = (y + x) + kOpsinBiasCbrt
-    let gg = (y - x) + kOpsinBiasCbrt
-    let gb = b + kOpsinBiasCbrt
-    let mr = gr * gr * gr - kOpsinBias
-    let mg = gg * gg * gg - kOpsinBias
-    let mb = gb * gb * gb - kOpsinBias
-    let lr = kInvOpsin00 * mr + kInvOpsin01 * mg + kInvOpsin02 * mb
-    let lg = kInvOpsin10 * mr + kInvOpsin11 * mg + kInvOpsin12 * mb
-    let lb = kInvOpsin20 * mr + kInvOpsin21 * mg + kInvOpsin22 * mb
-    return (lr, lg, lb)
-}
+// XYB -> linear RGB (libjxl XybToRgb) lives in ConvertState.linear: recover
+// cbrt(mixed) by adding each channel's bias cbrt (libjxl stores cbrt(-bias) =
+// -cbrt(bias) and subtracts), cube, remove the bias, then apply the inverse
+// opsin absorbance matrix — file overrides via OpsinInverseMatrix honored.
 
 /// The pre-bound scalar/pointer state one conversion worker needs: matrix as
 /// scalars, quantizer tables as raw pointers (no per-pixel closures, no
@@ -530,9 +555,34 @@ private struct ConvertState: @unchecked Sendable {
     let hasOOTF: Bool
     let ootfExp, lumR, lumG, lumB: Float
     let opsinScale: Float
+    // Inverse-opsin constants (file overrides or spec defaults), as scalars
+    // for the per-pixel hot path.
+    let io00, io01, io02, io10, io11, io12, io20, io21, io22: Float
+    let biasR, biasG, biasB, biasCbrtR, biasCbrtG, biasCbrtB: Float
 
     init(_ spec: OutputColorSpec) {
         opsinScale = spec.opsinScale
+        if let custom = spec.customOpsin {
+            let im = custom.inverseMatrix
+            io00 = im[0]; io01 = im[1]; io02 = im[2]
+            io10 = im[3]; io11 = im[4]; io12 = im[5]
+            io20 = im[6]; io21 = im[7]; io22 = im[8]
+            // Serialized biases are the *negative* absorbance biases
+            // (kNegOpsinAbsorbanceBiasRGB); the formula below wants the
+            // positive value and its cbrt.
+            biasR = -custom.opsinBiases[0]
+            biasG = -custom.opsinBiases[1]
+            biasB = -custom.opsinBiases[2]
+            biasCbrtR = cbrtf(biasR)
+            biasCbrtG = cbrtf(biasG)
+            biasCbrtB = cbrtf(biasB)
+        } else {
+            io00 = kInvOpsin00; io01 = kInvOpsin01; io02 = kInvOpsin02
+            io10 = kInvOpsin10; io11 = kInvOpsin11; io12 = kInvOpsin12
+            io20 = kInvOpsin20; io21 = kInvOpsin21; io22 = kInvOpsin22
+            biasR = kOpsinBias; biasG = kOpsinBias; biasB = kOpsinBias
+            biasCbrtR = kOpsinBiasCbrt; biasCbrtG = kOpsinBiasCbrt; biasCbrtB = kOpsinBiasCbrt
+        }
         hasMatrix = spec.matrix != nil
         let m = spec.matrix ?? [1, 0, 0, 0, 1, 0, 0, 0, 1]
         m00 = m[0]; m01 = m[1]; m02 = m[2]
@@ -553,7 +603,15 @@ private struct ConvertState: @unchecked Sendable {
     /// matrix + HLG OOTF applied).
     @inline(__always)
     func linear(_ x: Float, _ y: Float, _ b: Float) -> (Float, Float, Float) {
-        var (lr, lg, lb) = xybToLinearSRGB(x: x, y: y, b: b)
+        let gr = (y + x) + biasCbrtR
+        let gg = (y - x) + biasCbrtG
+        let gb = b + biasCbrtB
+        let mr = gr * gr * gr - biasR
+        let mg = gg * gg * gg - biasG
+        let mb = gb * gb * gb - biasB
+        var lr = io00 * mr + io01 * mg + io02 * mb
+        var lg = io10 * mr + io11 * mg + io12 * mb
+        var lb = io20 * mr + io21 * mg + io22 * mb
         lr *= opsinScale
         lg *= opsinScale
         lb *= opsinScale
@@ -824,13 +882,7 @@ func xybToRGBFloatPlanes(_ img: XYBImage, spec: OutputColorSpec) -> [[Int32]] {
             let row = y * stride
             let dstRow = y * width
             @inline(__always) func enc(_ v: Float) -> Int32 {
-                let e: Float
-                if case .linear = transfer {
-                    e = v  // keep HDR headroom / negatives for linear output
-                } else {
-                    e = transfer.encode(v)
-                }
-                return Int32(bitPattern: e.bitPattern)
+                Int32(bitPattern: transfer.encodeExtended(v).bitPattern)
             }
             for x in 0..<width {
                 let (lr, lg, lb) = state.linear(px[row + x], py[row + x], pb[row + x])

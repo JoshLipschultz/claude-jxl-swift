@@ -15,17 +15,32 @@ struct UpsamplingCustomWeights {
     var up8: [Float]?
 }
 
+/// A file's custom OpsinInverseMatrix (libjxl `OpsinInverseMatrix`): the
+/// XYB→linear-RGB inverse absorbance matrix, per-channel opsin biases, and the
+/// AC dequantization biases. Absent (`nil`) means the spec defaults.
+struct JXLOpsinInverseMatrix {
+    /// Row-major 3x3 inverse opsin absorbance matrix.
+    var inverseMatrix: [Float]
+    /// Per-channel opsin biases (default 0.0037930732552754493 each).
+    var opsinBiases: [Float]
+    /// AC quant biases: x, y, b, numerator (Reconstruct.adjustQuantBias).
+    var quantBiases: [Float]
+}
+
 enum CustomTransformData {
     static func skip(_ reader: BitReader, xybEncoded: Bool) {
         _ = parse(reader, xybEncoded: xybEncoded)
     }
 
-    static func parse(_ reader: BitReader, xybEncoded: Bool) -> UpsamplingCustomWeights {
+    static func parse(
+        _ reader: BitReader, xybEncoded: Bool
+    ) -> (weights: UpsamplingCustomWeights, opsin: JXLOpsinInverseMatrix?) {
         var weights = UpsamplingCustomWeights()
-        if reader.readBool() { return weights }  // all_default
+        if reader.readBool() { return (weights, nil) }  // all_default
 
+        var opsin: JXLOpsinInverseMatrix? = nil
         if xybEncoded {
-            skipOpsinInverseMatrix(reader)
+            opsin = parseOpsinInverseMatrix(reader)
         }
 
         let customWeightsMask = UInt32(reader.read(3))
@@ -40,13 +55,15 @@ enum CustomTransformData {
         }
         // NOTE: libjxl's CustomTransformData::VisitFields has no extensions field;
         // it ends after the weight tables.
-        return weights
+        return (weights, opsin)
     }
 
-    private static func skipOpsinInverseMatrix(_ reader: BitReader) {
-        if reader.readBool() { return }  // all_default
-
-        // inverse_matrix[3][3], opsin_biases[3], quant_biases[4]
-        for _ in 0..<16 { _ = reader.readF16() }
+    private static func parseOpsinInverseMatrix(_ reader: BitReader) -> JXLOpsinInverseMatrix? {
+        if reader.readBool() { return nil }  // all_default
+        let matrix = (0..<9).map { _ in reader.readF16() }
+        let biases = (0..<3).map { _ in reader.readF16() }
+        let quant = (0..<4).map { _ in reader.readF16() }
+        return JXLOpsinInverseMatrix(
+            inverseMatrix: matrix, opsinBiases: biases, quantBiases: quant)
     }
 }

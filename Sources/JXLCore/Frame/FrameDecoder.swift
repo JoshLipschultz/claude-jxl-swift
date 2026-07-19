@@ -83,6 +83,8 @@ final class FrameDecoder {
     let iccProfile: [UInt8]?
     /// Custom upsampling kernels from CustomTransformData (defaults otherwise).
     let upsamplingWeights: UpsamplingCustomWeights
+    /// Custom XYB inverse-opsin matrix/biases (nil = spec defaults).
+    let customOpsin: JXLOpsinInverseMatrix?
     /// The original file bytes (container box payload ranges index into this).
     let fileData: [UInt8]
 
@@ -127,7 +129,9 @@ final class FrameDecoder {
         reader.skip(16)
         size = SizeHeader(reader)
         metadata = JXLImageMetadata(reader)
-        upsamplingWeights = CustomTransformData.parse(reader, xybEncoded: metadata.xybEncoded)
+        let transformData = CustomTransformData.parse(reader, xybEncoded: metadata.xybEncoded)
+        upsamplingWeights = transformData.weights
+        customOpsin = transformData.opsin
         if metadata.colorEncoding.wantICC {
             // A compressed ICC profile follows the transform data.
             iccProfile = try readICCProfile(reader)
@@ -304,7 +308,7 @@ final class FrameDecoder {
         // profile fall back to sRGB output, so the profile (which describes
         // the original space) is deliberately not attached.
         let spec = try makeOutputColorSpec(
-            metadata.colorEncoding, toneMapping: metadata.toneMapping)
+            metadata.colorEncoding, toneMapping: metadata.toneMapping, customOpsin: customOpsin)
         let colorPlanes: [[Int32]]
         let bits: Int
         let isFloat: Bool
@@ -375,7 +379,7 @@ final class FrameDecoder {
             xyb = try upsampleXYB(xyb)
         }
         let spec = try makeOutputColorSpec(
-            metadata.colorEncoding, toneMapping: metadata.toneMapping)
+            metadata.colorEncoding, toneMapping: metadata.toneMapping, customOpsin: customOpsin)
         var planes = xybToRGBFloatPlanes(xyb, spec: spec).map { plane in
             plane.map { Float(bitPattern: UInt32(bitPattern: $0)) }
         }
@@ -437,7 +441,7 @@ final class FrameDecoder {
         }
 
         let spec = try makeOutputColorSpec(
-            metadata.colorEncoding, toneMapping: metadata.toneMapping)
+            metadata.colorEncoding, toneMapping: metadata.toneMapping, customOpsin: customOpsin)
         let img = XYBImage(
             width: pw, height: ph, stride: bw, paddedHeight: bh, x: dc.x, y: dc.y, b: dc.b)
         return JXLDecodedImage(
@@ -530,7 +534,7 @@ final class FrameDecoder {
             }
             let xyb = XYBImage(width: w, height: h, stride: w, paddedHeight: h, x: x, y: y, b: b)
             let spec = try makeOutputColorSpec(
-                metadata.colorEncoding, toneMapping: metadata.toneMapping)
+                metadata.colorEncoding, toneMapping: metadata.toneMapping, customOpsin: customOpsin)
             let ecPlanes = fullImage.channels.dropFirst(3).map {
                 scaleECPlane($0.pixels, to: format)
             }

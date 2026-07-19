@@ -25,17 +25,12 @@ private let kQuantBiasB: Float = 1.0 - 0.049935103337343655
 private let kQuantBiasNumerator: Float = 0.145
 
 @inline(__always)
-private func quantBias(_ c: Int) -> Float {
-    c == 0 ? kQuantBiasX : (c == 1 ? kQuantBiasY : kQuantBiasB)
-}
-
-@inline(__always)
-private func adjustQuantBias(_ q: Int32, _ c: Int) -> Float {
+private func adjustQuantBias(_ q: Int32, _ bias: Float, _ numerator: Float) -> Float {
     if q == 0 { return 0 }
-    if q == 1 { return quantBias(c) }
-    if q == -1 { return -quantBias(c) }
+    if q == 1 { return bias }
+    if q == -1 { return -bias }
     let qf = Float(q)
-    return qf - kQuantBiasNumerator / qf
+    return qf - numerator / qf
 }
 
 // MARK: - Gaborish (libjxl GaborishStage)
@@ -436,6 +431,12 @@ extension FrameDecoder {
 
         let invGlobalScale = Float(1 << 16) / Float(dcGlobalInfo.quantizer.globalScale)
         let xDmMul = powf(1.0 / 1.25, Float(frameHeader.xQmScale) - 2.0)
+        // AC quant biases (file OpsinInverseMatrix overrides or spec defaults),
+        // as captured scalars for the per-coefficient loop.
+        let qbX = customOpsin?.quantBiases[0] ?? kQuantBiasX
+        let qbY = customOpsin?.quantBiases[1] ?? kQuantBiasY
+        let qbB = customOpsin?.quantBiases[2] ?? kQuantBiasB
+        let qbNum = customOpsin?.quantBiases[3] ?? kQuantBiasNumerator
         let bDmMul = powf(1.0 / 1.25, Float(frameHeader.bQmScale) - 2.0)
 
         // Chroma-from-luma bases.
@@ -538,18 +539,18 @@ extension FrameDecoder {
                     let cB = blk.coeff[2]
                     for k in 0..<size {
                         let yMul = t[size + k] * scaledDequant
-                        bufY[k] = adjustQuantBias(cY[k], 1) * yMul
+                        bufY[k] = adjustQuantBias(cY[k], qbY, qbNum) * yMul
                     }
                     if !cX.isEmpty {
                         for k in 0..<size {
                             let xMul = t[k] * scaledDequant * xDmMul
-                            bufX[k] = adjustQuantBias(cX[k], 0) * xMul + xCC * bufY[k]
+                            bufX[k] = adjustQuantBias(cX[k], qbX, qbNum) * xMul + xCC * bufY[k]
                         }
                     }
                     if !cB.isEmpty {
                         for k in 0..<size {
                             let bMul = t[2 * size + k] * scaledDequant * bDmMul
-                            bufB[k] = adjustQuantBias(cB[k], 2) * bMul + bCC * bufY[k]
+                            bufB[k] = adjustQuantBias(cB[k], qbB, qbNum) * bMul + bCC * bufY[k]
                         }
                     }
 
@@ -692,7 +693,8 @@ private func upsampleChroma(
     if decoder.frameHeader.colorTransform == .ycbcr {
         return (xyb.width, xyb.height, ycbcrToRGB8Interleaved(xyb))
     }
-    let spec = try makeOutputColorSpec(decoder.metadata.colorEncoding)
+    let spec = try makeOutputColorSpec(
+        decoder.metadata.colorEncoding, customOpsin: decoder.customOpsin)
     return (xyb.width, xyb.height, xybToRGB8Interleaved(xyb, spec: spec))
 }
 
