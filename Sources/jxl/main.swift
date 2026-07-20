@@ -101,14 +101,17 @@ do {
     case "decode":
         guard args.count >= 4 else { usage() }
         var format = JXLSampleFormat.uint8
-        if args.count >= 5 {
-            switch args[4] {
+        var renderSpots = true
+        for arg in args.dropFirst(4) {
+            switch arg {
             case "16": format = .uint16
             case "float": format = .float32
+            case "nospot": renderSpots = false  // djxl --norender_spotcolors
             default: usage()
             }
         }
-        var image = try JXL.decodeImage(from: bytes, format: format)
+        var image = try JXL.decodeImage(
+            from: bytes, format: format, renderSpotColors: renderSpots)
         // Match djxl: EXIF orientation is applied to the output raster.
         if let info = try? JXL.readInfo(from: bytes), info.orientation != 1 {
             image = JXL.applyOrientation(image, orientation: info.orientation)

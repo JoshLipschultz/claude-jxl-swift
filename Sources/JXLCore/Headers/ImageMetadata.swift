@@ -61,6 +61,8 @@ public struct JXLExtraChannelInfo: Equatable, Sendable {
     public let dimShift: UInt32
     /// Alpha only: samples are premultiplied.
     public let alphaAssociated: Bool
+    /// SpotColor only: RGBA, where [3] is the global blend scale.
+    public let spotColor: [Float]?
 }
 
 /// ToneMapping (libjxl image_metadata.h): the display characteristics the
@@ -200,7 +202,7 @@ private enum ImageMetadataFields {
             return JXLExtraChannelInfo(
                 type: 0,  // kAlpha
                 bitDepth: JXLBitDepth(bitsPerSample: 8, exponentBitsPerSample: 0),
-                dimShift: 0, alphaAssociated: false)
+                dimShift: 0, alphaAssociated: false, spotColor: nil)
         }
         let type = reader.readEnum()
         let bitDepth = readBitDepth(reader)
@@ -211,15 +213,16 @@ private enum ImageMetadataFields {
         if type == 0 {  // kAlpha
             alphaAssociated = reader.readBool()
         }
+        var spotColor: [Float]? = nil
         if type == 2 {  // kSpotColor
-            for _ in 0..<4 { _ = reader.readF16() }
+            spotColor = (0..<4).map { _ in reader.readF16() }
         }
         if type == 5 {  // kCFA
             _ = reader.readU32(.value(1), .bits(2), .bits(4, offset: 3), .bits(8, offset: 19))
         }
         return JXLExtraChannelInfo(
             type: type, bitDepth: bitDepth, dimShift: dimShift,
-            alphaAssociated: alphaAssociated)
+            alphaAssociated: alphaAssociated, spotColor: spotColor)
     }
 
     /// Per libjxl `VisitNameString`: length = U32(Val(0), Bits(4),

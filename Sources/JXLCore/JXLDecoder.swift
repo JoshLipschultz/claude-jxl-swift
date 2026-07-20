@@ -164,7 +164,7 @@ public enum JXL {
     /// (possibly hostile) header can demand.
     public static func decodeImage(
         from data: [UInt8], limits: JXLDecodeLimits = .default,
-        format: JXLSampleFormat = .uint8
+        format: JXLSampleFormat = .uint8, renderSpotColors: Bool = true
     ) throws -> JXLDecodedImage {
         let decoder = try FrameDecoder(data: data, limits: limits)
         let header = decoder.frameHeader
@@ -178,6 +178,7 @@ public enum JXL {
             || (header.frameX0 == 0 && header.frameY0 == 0
                 && (header.frameWidth == 0 || header.frameWidth == decoder.size.width)
                 && (header.frameHeight == 0 || header.frameHeight == decoder.size.height))
+        var image: JXLDecodedImage
         if !decoder.metadata.hasAnimation
             && (!header.isLast || !coversCanvas || header.needsBlending)
         {
@@ -186,9 +187,56 @@ public enum JXL {
             guard let last = frames.last, last.isLast else {
                 throw JXLError.unsupported("layered still with too many layers")
             }
-            return last.image
+            image = last.image
+        } else {
+            image = try decoder.decodeImage(format: format)
         }
-        return try decoder.decodeImage(format: format)
+        if renderSpotColors {
+            image = spotColorsRendered(image, extraChannels: decoder.metadata.extraChannels)
+        }
+        return image
+    }
+
+    /// Renders spot-color extra channels onto the color planes (libjxl
+    /// stage_spot, djxl's default): for each spot channel,
+    /// `color = mix * spot_rgb + (1 - mix) * color` with
+    /// `mix = spot_scale * spot_sample`. Operates on the output-encoded
+    /// samples; spot planes stay in the result untouched. Files without spot
+    /// channels (or non-3-channel output) return unchanged.
+    static func spotColorsRendered(
+        _ image: JXLDecodedImage, extraChannels: [JXLExtraChannelInfo]
+    ) -> JXLDecodedImage {
+        guard image.colorChannels == 3,
+            extraChannels.contains(where: { $0.type == 2 && $0.spotColor != nil })
+        else { return image }
+        let maxVal = Float((1 << image.bitsPerSample) &- 1)
+        let isFloat = image.isFloat
+        @inline(__always) func toF(_ v: Int32) -> Float {
+            isFloat ? Float(bitPattern: UInt32(bitPattern: v)) : Float(v) / maxVal
+        }
+        @inline(__always) func fromF(_ v: Float) -> Int32 {
+            isFloat
+                ? Int32(bitPattern: v.bitPattern)
+                : Int32(max(0, min(maxVal, (v * maxVal).rounded())))
+        }
+        var planes = image.planes
+        for (e, ec) in extraChannels.enumerated()
+        where ec.type == 2 && image.colorChannels + e < planes.count {
+            guard let spot = ec.spotColor else { continue }
+            let spotPlane = planes[image.colorChannels + e]
+            let scale = spot[3]
+            for c in 0..<3 {
+                let spotV = spot[c]
+                planes[c] = zip(planes[c], spotPlane).map { v, s in
+                    let mix = scale * toF(s)
+                    return fromF(mix * spotV + (1 - mix) * toF(v))
+                }
+            }
+        }
+        return JXLDecodedImage(
+            width: image.width, height: image.height, colorChannels: image.colorChannels,
+            extraChannels: image.extraChannels, bitsPerSample: image.bitsPerSample,
+            isFloat: image.isFloat, planes: planes, iccProfile: image.iccProfile)
     }
 
     /// Returns `image` with an EXIF orientation baked into the pixel planes

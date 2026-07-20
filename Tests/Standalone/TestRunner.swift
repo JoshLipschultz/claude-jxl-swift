@@ -83,6 +83,7 @@ struct TestRunner {
         float32Modular()
         integerModularFloat()
         jpegTranscodeWide()
+        spotColorRendering()
         orientationBaking()
         deltaPalette()
         iccOutput()
@@ -163,6 +164,69 @@ struct TestRunner {
         eq(mismatches, 0, "\(base) float bit-exact vs djxl PFM")
         FileHandle.standardError.write(
             Data("  [int-modular-float] unclamped float output bit-exact vs djxl\n".utf8))
+    }
+
+    /// `96x64_spotcolor.jxl` (libjxl C API, lossless 16-bit RGB + alpha + one
+    /// spot channel, spot_color ≈ (0.9, 0.2, 0.05, scale 0.75)): default
+    /// decode renders the spot channel onto the color planes (libjxl
+    /// stage_spot, `color = mix·spot_rgb + (1−mix)·color`); oracle is djxl's
+    /// 16-bit PPM (max ±1 from double rounding). `renderSpotColors: false`
+    /// must return the untouched lossless gradient exactly.
+    static func spotColorRendering() {
+        let dir = fixturesDir()
+        guard
+            let jxl = try? Data(contentsOf: dir.appendingPathComponent("96x64_spotcolor.jxl")),
+            let ppm = try? Data(contentsOf: dir.appendingPathComponent("96x64_spotcolor.ppm")),
+            let rendered = try? JXL.decodeImage(from: [UInt8](jxl), format: .uint16),
+            let raw = try? JXL.decodeImage(
+                from: [UInt8](jxl), format: .uint16, renderSpotColors: false)
+        else {
+            check(false, "spotcolor fixtures decode")
+            return
+        }
+        // Parse the 16-bit big-endian PPM oracle.
+        let bytes = [UInt8](ppm)
+        var pos = 2
+        var fields = [Int]()
+        while fields.count < 3 {
+            while bytes[pos] == 0x20 || bytes[pos] == 0x0A { pos += 1 }
+            var v = 0
+            while bytes[pos] >= 0x30 && bytes[pos] <= 0x39 {
+                v = v * 10 + Int(bytes[pos] - 0x30)
+                pos += 1
+            }
+            fields.append(v)
+        }
+        pos += 1
+        let (w, h) = (fields[0], fields[1])
+        eq(w, rendered.width, "spotcolor width")
+        var maxDiff = 0
+        for i in 0..<(w * h) {
+            for c in 0..<3 {
+                let o = pos + (i * 3 + c) * 2
+                let ref = Int(bytes[o]) << 8 | Int(bytes[o + 1])
+                maxDiff = max(maxDiff, abs(ref - Int(rendered.planes[c][i])))
+            }
+        }
+        check(maxDiff <= 1, "spot rendering within ±1 of djxl 16-bit (max \(maxDiff))")
+        // Un-rendered output is the exact lossless gradient.
+        var rawExact = true
+        for y in 0..<h where rawExact {
+            for x in 0..<w {
+                let i = y * w + x
+                if raw.planes[0][i] != Int32(x * 65535 / (w - 1))
+                    || raw.planes[1][i] != Int32(y * 65535 / (h - 1))
+                    || raw.planes[2][i] != Int32((x + y) * 65535 / (w + h - 2))
+                {
+                    rawExact = false
+                    break
+                }
+            }
+        }
+        check(rawExact, "renderSpotColors: false leaves color planes untouched")
+        check(rendered.planes[0] != raw.planes[0], "spot rendering changed the red plane")
+        FileHandle.standardError.write(
+            Data("  [spot-color] rendering vs djxl (max ±1), norender exact\n".utf8))
     }
 
     /// `96x64_jpeg444.jxl` is a 4:4:4 JPEG transcode (no chroma upsampling in
