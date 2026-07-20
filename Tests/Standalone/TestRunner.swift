@@ -87,6 +87,8 @@ struct TestRunner {
         jxlpOutOfOrder()
         modularPatches()
         nestedDCFrames()
+        bitWriterRoundTrip()
+        headerWriterRoundTrip()
         orientationBaking()
         deltaPalette()
         iccOutput()
@@ -232,6 +234,121 @@ struct TestRunner {
         eq(mismatches, 0, "\(base) float bit-exact vs djxl PFM")
         FileHandle.standardError.write(
             Data("  [int-modular-float] unclamped float output bit-exact vs djxl\n".utf8))
+    }
+
+    // MARK: - Encoder E0: BitWriter + header writers
+
+    /// Randomized write→read identity across every field primitive: 10k mixed
+    /// operations (raw bits, bool, U32 with random alternatives, U64, Enum,
+    /// F16) written with `BitWriter` must read back identically through
+    /// `BitReader` — the writer is the reader's exact dual by construction.
+    static func bitWriterRoundTrip() {
+        // Deterministic LCG so failures reproduce.
+        var state: UInt64 = 0x9E37_79B9_7F4A_7C15
+        func rnd() -> UInt64 {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            return state >> 16
+        }
+        enum Op {
+            case bits(UInt64, Int)
+            case bool(Bool)
+            case u32(UInt32, U32Choice, U32Choice, U32Choice, U32Choice)
+            case u64(UInt64)
+            case enumV(UInt32)
+            case f16(Float)
+        }
+        var ops: [Op] = []
+        let w = BitWriter()
+        for _ in 0..<10_000 {
+            switch rnd() % 6 {
+            case 0:
+                let n = Int(rnd() % 57)  // 0...56 (reader fast path + 0)
+                let v = rnd() & ((n == 0) ? 0 : (UInt64.max >> (64 - UInt64(n))))
+                ops.append(.bits(v, n))
+                w.write(v, n)
+            case 1:
+                let b = rnd() & 1 == 1
+                ops.append(.bool(b))
+                w.writeBool(b)
+            case 2:
+                // Random alternatives; pick a value one of them can encode.
+                func choice() -> U32Choice {
+                    rnd() & 1 == 0
+                        ? .value(UInt32(rnd() % 1000))
+                        : .bits(Int(rnd() % 20) + 1, offset: UInt32(rnd() % 1000))
+                }
+                let cs = (choice(), choice(), choice(), choice())
+                let pickList = [cs.0, cs.1, cs.2, cs.3]
+                let pick = pickList[Int(rnd() % 4)]
+                let maxExtra: UInt32 =
+                    pick.bitCount == 0 ? 0 : (1 << UInt32(pick.bitCount)) - 1
+                let v = pick.offset &+ UInt32(truncatingIfNeeded: rnd()) % (maxExtra &+ 1)
+                ops.append(.u32(v, cs.0, cs.1, cs.2, cs.3))
+                w.writeU32(v, cs.0, cs.1, cs.2, cs.3)
+            case 3:
+                // Exercise every U64 branch incl. the 60-bit continuation tail.
+                let shift = rnd() % 64
+                let v = rnd() >> shift
+                ops.append(.u64(v))
+                w.writeU64(v)
+            case 4:
+                let v = UInt32(rnd() % 82)  // Enum range 0...81
+                ops.append(.enumV(v))
+                w.writeEnum(v)
+            default:
+                let v = Float(Float16(bitPattern: UInt16(truncatingIfNeeded: rnd())))
+                let safe = v.isNaN ? Float(0.5) : v
+                ops.append(.f16(safe))
+                w.writeF16(safe)
+            }
+        }
+        let r = BitReader(w.finalize())
+        var mismatches = 0
+        for op in ops {
+            switch op {
+            case .bits(let v, let n): if r.read(n) != v { mismatches += 1 }
+            case .bool(let b): if r.readBool() != b { mismatches += 1 }
+            case .u32(let v, let a, let b, let c, let d):
+                if r.readU32(a, b, c, d) != v { mismatches += 1 }
+            case .u64(let v): if r.readU64() != v { mismatches += 1 }
+            case .enumV(let v): if r.readEnum() != v { mismatches += 1 }
+            case .f16(let v): if r.readF16() != v { mismatches += 1 }
+            }
+        }
+        eq(mismatches, 0, "BitWriter/BitReader field identity (10k ops)")
+        check(r.allReadsWithinBounds, "round-trip stayed in bounds")
+        FileHandle.standardError.write(
+            Data("  [bitwriter] 10k-op write->read identity\n".utf8))
+    }
+
+    /// Header writers → the decoder's own parsers: dimensions, bit depth, and
+    /// color space survive the round trip for a spread of shapes.
+    static func headerWriterRoundTrip() {
+        let cases: [(w: UInt32, h: UInt32, bits: UInt32, gray: Bool)] = [
+            (1, 1, 8, false), (96, 64, 8, false), (4096, 2160, 16, false),
+            (513, 511, 12, false), (200, 150, 8, true), (1 << 18, 3, 8, false),
+        ]
+        var failures = 0
+        for c in cases {
+            let w = BitWriter()
+            HeaderWriter.writeCodestreamHeaders(
+                w, width: c.w, height: c.h, bitsPerSample: c.bits, grayscale: c.gray)
+            guard let info = try? JXL.readInfo(from: w.finalize()) else {
+                check(false, "headers parse (\(c.w)x\(c.h))")
+                failures += 1
+                continue
+            }
+            if info.width != c.w || info.height != c.h
+                || info.bitDepth.bitsPerSample != c.bits
+                || (info.colorSpace == .grayscale) != c.gray
+                || info.hasAlpha || info.hasAnimation || info.orientation != 1
+            {
+                failures += 1
+            }
+        }
+        eq(failures, 0, "header write->readInfo identity (\(cases.count) shapes)")
+        FileHandle.standardError.write(
+            Data("  [header-writer] size/metadata/transform-data duals verified\n".utf8))
     }
 
     /// `128x128_pdc2.jxl` (cjxl -d 1.5 --progressive_dc=2): a VarDCT frame
@@ -1496,7 +1613,7 @@ struct TestRunner {
     // MARK: - Entropy coding (M3)
 
     /// LSB-first bit writer used to construct streams for round-trip tests.
-    final class BitWriter {
+    final class TestBitWriter {
         var bytes: [UInt8] = []
         var bitPos = 0
         func write(_ value: UInt64, _ count: Int) {
@@ -1549,7 +1666,7 @@ struct TestRunner {
         for cfg in configs {
             for v in values {
                 let (token, nbits, bits) = cfg.encode(v)
-                let w = BitWriter()
+                let w = TestBitWriter()
                 w.write(UInt64(bits), Int(nbits))
                 let decoded = cfg.decode(token: token, reader: w.reader)
                 eq(
@@ -1579,7 +1696,7 @@ struct TestRunner {
             let codes = canonicalCodes(lengths)
             // Encode a sequence of all symbols (twice, shuffled) and decode it back.
             let sequence = Array(0..<lengths.count) + Array((0..<lengths.count).reversed())
-            let w = BitWriter()
+            let w = TestBitWriter()
             for sym in sequence { w.write(UInt64(codes[sym].key), codes[sym].len) }
             let reader = w.reader
             var allOK = true
@@ -1588,7 +1705,7 @@ struct TestRunner {
         }
 
         // Simple prefix code: 2 explicit symbols, decode a known bit pattern.
-        let sw = BitWriter()
+        let sw = TestBitWriter()
         sw.write(1, 2)  // simple code
         sw.write(1, 2)  // num_symbols - 1 = 1  -> 2 symbols
         sw.write(1, 2)  // symbol 1
@@ -1604,7 +1721,7 @@ struct TestRunner {
         ans()
     }
 
-    static func writeVarLenUint8(_ w: BitWriter, _ v: Int) {
+    static func writeVarLenUint8(_ w: TestBitWriter, _ v: Int) {
         if v == 0 {
             w.write(0, 1)
             return
@@ -1681,7 +1798,7 @@ struct TestRunner {
         eq(roundtrip, original, "inverse MTF round-trips")
 
         // ReadHistogram: hand-built "simple 1-symbol" and "flat" streams.
-        let hw = BitWriter()
+        let hw = TestBitWriter()
         hw.write(1, 1)  // simple
         hw.write(0, 1)  // num_symbols - 1 = 0
         writeVarLenUint8(hw, 5)  // symbol = 5
@@ -1692,7 +1809,7 @@ struct TestRunner {
             check(false, "simple histogram failed to parse")
         }
 
-        let fw = BitWriter()
+        let fw = TestBitWriter()
         fw.write(0, 1)  // not simple
         fw.write(1, 1)  // flat
         writeVarLenUint8(fw, 3)  // alphabet_size - 1 = 3 -> 4

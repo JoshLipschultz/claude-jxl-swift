@@ -114,7 +114,14 @@ extension Float {
                 // Signed zero.
                 result = sign
             } else {
-                // Subnormal half -> normalized single.
+                // Subnormal half -> normalized single. A mantissa with its
+                // top bit at position p (value = mantissa × 2⁻²⁴) normalizes
+                // to 1.f × 2^(p−24), i.e. exponent field 127 + p − 24 =
+                // 112 − e for e = (10 − p) − 1 normalization steps.
+                // (The original `113 + e` here was off by 2^(2e+1) — caught
+                // by the encoder's F16 write→read round-trip; real files
+                // never carry subnormal F16 header values, so decoding was
+                // unaffected.)
                 var e: Int32 = -1
                 var m = mantissa
                 repeat {
@@ -122,7 +129,7 @@ extension Float {
                     m <<= 1
                 } while (m & 0x0400) == 0
                 m &= 0x03FF
-                let exp32 = UInt32(Int32(127 - 15 + 1) + e) << 23
+                let exp32 = UInt32(Int32(127 - 15) - e) << 23
                 result = sign | exp32 | (m << 13)
             }
         } else if exponent == 0x1F {
