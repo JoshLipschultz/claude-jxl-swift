@@ -84,6 +84,7 @@ struct TestRunner {
         integerModularFloat()
         jpegTranscodeWide()
         spotColorRendering()
+        jxlpOutOfOrder()
         orientationBaking()
         deltaPalette()
         iccOutput()
@@ -164,6 +165,72 @@ struct TestRunner {
         eq(mismatches, 0, "\(base) float bit-exact vs djxl PFM")
         FileHandle.standardError.write(
             Data("  [int-modular-float] unclamped float output bit-exact vs djxl\n".utf8))
+    }
+
+    /// Out-of-order `jxlp` boxes (ftyp minor version 1, libjxl v0.12):
+    /// partial-codestream boxes are ordered by their 4-byte index, the top
+    /// index bit marks the last box, and duplicate or missing indices are
+    /// malformed. Containers are built programmatically from a bare fixture.
+    static func jxlpOutOfOrder() {
+        let dir = fixturesDir()
+        guard let jxl = try? Data(contentsOf: dir.appendingPathComponent("96x64_deltapal.jxl")),
+            let parsed = try? JXLContainer.parse([UInt8](jxl)),
+            let want = try? JXL.decodeImage(from: [UInt8](jxl))
+        else {
+            check(false, "jxlp base fixture decodes")
+            return
+        }
+        let cs = parsed.codestream
+        let third = cs.count / 3
+        let chunks = [Array(cs[0..<third]), Array(cs[third..<2 * third]), Array(cs[(2 * third)...])]
+        func box(_ type: String, _ payload: [UInt8]) -> [UInt8] {
+            var out = [UInt8]()
+            let size = UInt32(8 + payload.count)
+            out.append(contentsOf: [
+                UInt8(size >> 24 & 0xFF), UInt8(size >> 16 & 0xFF),
+                UInt8(size >> 8 & 0xFF), UInt8(size & 0xFF),
+            ])
+            out.append(contentsOf: Array(type.utf8))
+            out.append(contentsOf: payload)
+            return out
+        }
+        func jxlp(_ seq: UInt32, last: Bool, _ chunk: [UInt8]) -> [UInt8] {
+            let idx = seq | (last ? 0x8000_0000 : 0)
+            return box(
+                "jxlp",
+                [
+                    UInt8(idx >> 24 & 0xFF), UInt8(idx >> 16 & 0xFF),
+                    UInt8(idx >> 8 & 0xFF), UInt8(idx & 0xFF),
+                ] + chunk)
+        }
+        let sig: [UInt8] = JXLContainer.containerSignature
+        let ftyp = box("ftyp", Array("jxl ".utf8) + [0, 0, 0, 1] + Array("jxl ".utf8))
+        // File order 1, 2(last), 0 — must reassemble as 0, 1, 2.
+        let shuffled =
+            sig + ftyp + jxlp(1, last: false, chunks[1]) + jxlp(2, last: true, chunks[2])
+            + jxlp(0, last: false, chunks[0])
+        if let img = try? JXL.decodeImage(from: shuffled) {
+            var same = img.width == want.width && img.height == want.height
+            if same { same = img.planes == want.planes }
+            check(same, "out-of-order jxlp reassembles to the same image")
+        } else {
+            check(false, "out-of-order jxlp decodes")
+        }
+        // Duplicate index is malformed.
+        let dup =
+            sig + ftyp + jxlp(0, last: false, chunks[0]) + jxlp(0, last: false, chunks[1])
+            + jxlp(2, last: true, chunks[2])
+        check((try? JXLContainer.parse(dup)) == nil, "duplicate jxlp index rejected")
+        // Missing index is malformed.
+        let gap =
+            sig + ftyp + jxlp(0, last: false, chunks[0]) + jxlp(2, last: true, chunks[2])
+        check((try? JXLContainer.parse(gap)) == nil, "missing jxlp index rejected")
+        // 'last' flag on a non-final box is malformed.
+        let badLast =
+            sig + ftyp + jxlp(0, last: true, chunks[0]) + jxlp(1, last: false, chunks[1])
+        check((try? JXLContainer.parse(badLast)) == nil, "misplaced jxlp last flag rejected")
+        FileHandle.standardError.write(
+            Data("  [jxlp] out-of-order reassembly + index validation\n".utf8))
     }
 
     /// `96x64_spotcolor.jxl` (libjxl C API, lossless 16-bit RGB + alpha + one

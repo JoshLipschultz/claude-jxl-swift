@@ -93,7 +93,7 @@ the dependency-free runner, and `Tests/JXLCoreTests/*` is the XCTest mirror.
 
 ## Testing methodology
 
-Every feature is validated against libjxl (`cjxl`/`djxl` v0.11.x) as an
+Every feature is validated against libjxl (`cjxl`/`djxl` v0.12.x) as an
 oracle: lossless decodes must be **byte-exact** (including float32 bit
 patterns), lossy decodes must meet PSNR thresholds against `djxl`'s output,
 and JPEG reconstruction must be byte-exact. Small generated fixtures

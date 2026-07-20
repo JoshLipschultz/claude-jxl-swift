@@ -104,21 +104,39 @@ public enum JXLContainer {
             return Array(data[whole.payload])
         }
 
-        // Otherwise concatenate `jxlp` partial boxes in order. Each begins with a
-        // 4-byte big-endian index; the codestream bytes follow.
-        var codestream: [UInt8] = []
-        var sawPartial = false
+        // Otherwise reassemble `jxlp` partial boxes. Each begins with a 4-byte
+        // big-endian index whose top bit marks the final box; the codestream
+        // bytes follow. Boxes may appear out of file order (ftyp minor
+        // version 1, libjxl v0.12) — order by index, which must be a
+        // duplicate-free permutation of 0..<count, with the "last" flag on the
+        // highest index only.
+        var parts: [(seq: UInt32, isLast: Bool, chunk: Range<Int>)] = []
         for box in boxes where box.type == "jxlp" {
-            sawPartial = true
             guard box.payload.count >= 4 else {
                 throw JXLError.malformed("jxlp box too small for index")
             }
-            let chunk = box.payload.lowerBound + 4 ..< box.payload.upperBound
-            codestream.append(contentsOf: data[chunk])
+            let raw = beUInt32(data, box.payload.lowerBound)
+            parts.append(
+                (seq: raw & 0x7FFF_FFFF, isLast: raw & 0x8000_0000 != 0,
+                 chunk: box.payload.lowerBound + 4 ..< box.payload.upperBound))
         }
 
-        guard sawPartial else {
+        guard !parts.isEmpty else {
             throw JXLError.malformed("container has no jxlc or jxlp codestream box")
+        }
+        parts.sort { $0.seq < $1.seq }
+        var codestream: [UInt8] = []
+        for (i, part) in parts.enumerated() {
+            guard part.seq == UInt32(i) else {
+                throw JXLError.malformed(
+                    part.seq < UInt32(i)
+                        ? "duplicate jxlp index \(part.seq)"
+                        : "missing jxlp index \(i)")
+            }
+            guard part.isLast == (i == parts.count - 1) else {
+                throw JXLError.malformed("jxlp 'last' flag on index \(part.seq)")
+            }
+            codestream.append(contentsOf: data[part.chunk])
         }
         return codestream
     }
