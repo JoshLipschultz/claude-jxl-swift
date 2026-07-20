@@ -155,11 +155,13 @@ enum DecodePipeline {
             // YCbCr and native-Modular frames keep the CPU CGImage path.
             // JXL_CPU_COLOR=1 forces the CPU path for A/B verification.
             var cg: CGImage? = nil
-            if !isHDR, info.orientation == 1,
+            if info.orientation == 1,
                 ProcessInfo.processInfo.environment["JXL_CPU_COLOR"] == nil,
                 let converter = metalConverter,
                 let xyb = displayXYB
             {
+                // Covers SDR (sRGB/709/linear) and, with 2020 primaries,
+                // PQ/HLG; makeLinearCGImage returns nil otherwise.
                 cg = converter.makeLinearCGImage(from: xyb)
             }
             let usedGPU = cg != nil

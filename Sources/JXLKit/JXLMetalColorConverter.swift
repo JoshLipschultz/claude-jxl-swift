@@ -79,6 +79,7 @@ public final class JXLMetalColorConverter {
         var params = Self.packParams(image.params)
         params.append(premultiply ? 1 : 0)
         params.append(displayMode)
+        params.append(image.params.intensityTarget / 10000)
         guard let cmd = queue.makeCommandBuffer(),
             let enc = cmd.makeComputeCommandEncoder()
         else { return nil }
@@ -135,17 +136,29 @@ public final class JXLMetalColorConverter {
     /// callers keep that path for HDR.
     public func makeLinearCGImage(from image: JXLXYBFloatImage) -> CGImage? {
         // Covered transfers: sRGB (13, or 0/2 rendered as sRGB), linear (8),
-        // and BT.709 (1, encoded in-shader). Everything else — PQ/HLG (whose
-        // EDR nits mapping the CPU path owns), DCI, gamma — falls back to the
-        // CPU converter.
+        // BT.709 (1), and — with 2020 primaries, where a named HDR colorspace
+        // exists — PQ (16) and HLG (18), all encoded in-shader with the same
+        // curves as the CPU 16-bit path. DCI/gamma and PQ/HLG on other
+        // primaries fall back to the CPU converter.
         let tf = image.params.transferFunction
-        guard tf == 0 || tf == 1 || tf == 2 || tf == 8 || tf == 13 else { return nil }
-        let is709 = tf == 1
+        let isHDR = tf == 16 || tf == 18
+        if isHDR {
+            guard image.params.primaries == 9 else { return nil }
+        } else {
+            guard tf == 0 || tf == 1 || tf == 2 || tf == 8 || tf == 13 else { return nil }
+        }
+        let mode: Float
+        switch tf {
+        case 1: mode = 2
+        case 16: mode = 3
+        case 18: mode = 4
+        default: mode = 1
+        }
         guard
             let tex = makeLinearTexture(
                 from: image, pixelFormat: .rgba16Float, usage: [.shaderRead],
                 premultiply: image.alpha != nil && !image.alphaPremultiplied,
-                displayMode: is709 ? 2 : 1)
+                displayMode: mode)
         else { return nil }
         let w = image.width
         let h = image.height
@@ -157,9 +170,11 @@ public final class JXLMetalColorConverter {
                 from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
         }
         let name: CFString
-        if is709 {
-            name = CGColorSpace.itur_709
-        } else {
+        switch tf {
+        case 1: name = CGColorSpace.itur_709
+        case 16: name = CGColorSpace.itur_2100_PQ
+        case 18: name = CGColorSpace.itur_2100_HLG
+        default:
             switch image.params.primaries {
             case 11: name = CGColorSpace.extendedLinearDisplayP3
             case 9: name = CGColorSpace.extendedLinearITUR_2020
@@ -249,18 +264,41 @@ public final class JXLMetalColorConverter {
             // Display modes (u[32]): 1 = clamp SDR linear to [0,1]
             // (extended-linear would carry DCT ringing outside the sRGB gamut
             // onto wide-gamut displays; the CPU path clamps at uint8);
-            // 2 = additionally encode with the BT.709 OETF — 709 content is
-            // *displayed* through the 1886-style convention, so raw linear
-            // skips the intended OETF/EOTF asymmetry (washed-out mid-tones).
-            if (u[32] > 0.5) {
+            // 2 = clamp + BT.709 OETF (709 content is *displayed* through the
+            // 1886-style convention; raw linear skips the intended OETF/EOTF
+            // asymmetry); 3 = PQ encode (u[33] = intensity_target/10000,
+            // domain [0, 10000/target] — mirrors OutputTransfer.encode);
+            // 4 = HLG OETF (the inverse OOTF already ran above).
+            int mode = int(u[32] + 0.5);
+            if (mode == 1 || mode == 2 || mode == 4) {
                 lr = clamp(lr, 0.0, 1.0);
                 lg = clamp(lg, 0.0, 1.0);
                 lb = clamp(lb, 0.0, 1.0);
             }
-            if (u[32] > 1.5) {
+            if (mode == 2) {
                 lr = lr < 0.018 ? 4.5 * lr : 1.099 * pow(lr, 0.45) - 0.099;
                 lg = lg < 0.018 ? 4.5 * lg : 1.099 * pow(lg, 0.45) - 0.099;
                 lb = lb < 0.018 ? 4.5 * lb : 1.099 * pow(lb, 0.45) - 0.099;
+            } else if (mode == 3) {
+                const float m1 = 2610.0 / 16384.0;
+                const float m2 = (2523.0 / 4096.0) * 128.0;
+                const float c1 = 3424.0 / 4096.0;
+                const float c2 = (2413.0 / 4096.0) * 32.0;
+                const float c3 = (2392.0 / 4096.0) * 32.0;
+                float dmax = 1.0 / u[33];
+                float3 v = clamp(float3(lr, lg, lb), 0.0, dmax) * u[33];
+                float3 xp = pow(v, m1);
+                float3 e = pow((c1 + xp * c2) / (1.0 + xp * c3), m2);
+                lr = v.x == 0.0 ? 0.0 : e.x;
+                lg = v.y == 0.0 ? 0.0 : e.y;
+                lb = v.z == 0.0 ? 0.0 : e.z;
+            } else if (mode == 4) {
+                const float a = 0.17883277;
+                const float b = 1.0 - 4.0 * a;
+                const float c = 0.5 - a * log(4.0 * a);
+                lr = lr == 0.0 ? 0.0 : (lr <= 1.0/12.0 ? sqrt(3.0 * lr) : a * log(12.0 * lr - b) + c);
+                lg = lg == 0.0 ? 0.0 : (lg <= 1.0/12.0 ? sqrt(3.0 * lg) : a * log(12.0 * lg - b) + c);
+                lb = lb == 0.0 ? 0.0 : (lb <= 1.0/12.0 ? sqrt(3.0 * lb) : a * log(12.0 * lb - b) + c);
             }
             // Premultiply for display when requested (u[31]), in the output
             // space (matching the CPU converter, which premultiplies the
