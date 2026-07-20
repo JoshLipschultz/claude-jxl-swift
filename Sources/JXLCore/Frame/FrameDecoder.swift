@@ -455,7 +455,8 @@ dcFrameSlots = dcSlots
             if bits == 16 { return plane }
             return plane.map { Int32((Float($0) * 65535 / maxVal).rounded()) }
         case .float32:
-            return plane.map { Int32(bitPattern: (Float($0) / maxVal).bitPattern) }
+            let scale = 1.0 / maxVal
+            return plane.map { Int32(bitPattern: (Float($0) * scale).bitPattern) }
         }
     }
 
@@ -634,6 +635,12 @@ dcFrameSlots = dcSlots
         // Modular samples are native (no color transform applied here), so the
         // embedded profile — when present — describes them directly.
         var planes = fullImage.channels.map { $0.pixels }
+        // Integer-modular float output: samples scaled by 1/(2^bits − 1),
+        // deliberately unclamped (djxl PFM / conformance-reference convention —
+        // lossy modular legitimately produces out-of-range samples that the
+        // integer paths clamp away).
+        let wantFloat = format == .float32 && !metadata.bitDepth.isFloatingPoint
+        var floatColor: [[Float]]? = nil
         if (frameHeader.loopFilterGab || frameHeader.loopFilterEpfIters > 0)
             && !metadata.bitDepth.isFloatingPoint
         {
@@ -650,14 +657,38 @@ dcFrameSlots = dcSlots
             var g = colorChannels >= 3 ? toFloat(planes[1]) : r
             var b = colorChannels >= 3 ? toFloat(planes[2]) : r
             modularRestorationFilters(x: &r, y: &g, b: &b, w: w, h: h, header: frameHeader)
-            func toInt(_ p: [Float]) -> [Int32] {
-                p.map { Int32(min(max(($0 * maxVal).rounded(), 0), maxVal)) }
+            if wantFloat {
+                floatColor = colorChannels >= 3 ? [r, g, b] : [r]
+            } else {
+                func toInt(_ p: [Float]) -> [Int32] {
+                    p.map { Int32(min(max(($0 * maxVal).rounded(), 0), maxVal)) }
+                }
+                planes[0] = toInt(r)
+                if colorChannels >= 3 {
+                    planes[1] = toInt(g)
+                    planes[2] = toInt(b)
+                }
             }
-            planes[0] = toInt(r)
-            if colorChannels >= 3 {
-                planes[1] = toInt(g)
-                planes[2] = toInt(b)
+        }
+        if wantFloat {
+            // Multiply by the reciprocal (not divide) — libjxl's scaling, and
+            // the two differ by an ulp on some samples.
+            let scale = 1.0 / Float((1 << Int(metadata.bitDepth.bitsPerSample)) - 1)
+            let color =
+                floatColor ?? planes[0..<colorChannels].map { p in p.map { Float($0) * scale } }
+            var out = color.map { p in p.map { Int32(bitPattern: $0.bitPattern) } }
+            for e in 0..<extra {
+                out.append(
+                    scaleECPlane(
+                        planes[colorChannels + e],
+                        bits: Int(metadata.extraChannels[e].bitDepth.bitsPerSample),
+                        to: .float32))
             }
+            return JXLDecodedImage(
+                width: dim.xsize, height: dim.ysize, colorChannels: colorChannels,
+                extraChannels: extra, bitsPerSample: 32, isFloat: true,
+                planes: out,
+                iccProfile: iccProfile.map { Data($0) })
         }
         return JXLDecodedImage(
             width: dim.xsize, height: dim.ysize, colorChannels: colorChannels,

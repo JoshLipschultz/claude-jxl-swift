@@ -81,6 +81,7 @@ struct TestRunner {
         hdrOutput()
         frameBlending()
         float32Modular()
+        integerModularFloat()
         orientationBaking()
         deltaPalette()
         iccOutput()
@@ -131,6 +132,36 @@ struct TestRunner {
         }
         FileHandle.standardError.write(
             Data("  [float32-modular] lossless float images bit-exact=3\n".utf8))
+    }
+
+    /// Integer-modular images decoded at `.float32` scale by 1/(2^bits − 1)
+    /// without clamping (djxl PFM / conformance-reference convention; lossy
+    /// modular legitimately produces out-of-range samples). Oracle is djxl's
+    /// PFM output for the delta-palette fixture; must match bit-for-bit.
+    static func integerModularFloat() {
+        let dir = fixturesDir()
+        let base = "96x64_deltapal"
+        guard let jxl = try? Data(contentsOf: dir.appendingPathComponent(base + ".jxl")),
+            let pfm = try? Data(contentsOf: dir.appendingPathComponent(base + ".pfm")),
+            let oracle = parsePFM(pfm),
+            let img = try? JXL.decodeImage(from: [UInt8](jxl), format: .float32)
+        else {
+            check(false, "\(base) float fixtures decode")
+            return
+        }
+        check(img.isFloat && img.bitsPerSample == 32, "\(base) float output is float32")
+        eq(img.width, oracle.width, "\(base) float width")
+        eq(img.height, oracle.height, "\(base) float height")
+        var mismatches = 0
+        for c in 0..<3 {
+            for i in 0..<(img.width * img.height)
+            where img.planes[c][i] != oracle.planes[c][i] {
+                mismatches += 1
+            }
+        }
+        eq(mismatches, 0, "\(base) float bit-exact vs djxl PFM")
+        FileHandle.standardError.write(
+            Data("  [int-modular-float] unclamped float output bit-exact vs djxl\n".utf8))
     }
 
     /// Minimal PFM reader (color, either endianness) returning int32 bit
