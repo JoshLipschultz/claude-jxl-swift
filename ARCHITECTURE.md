@@ -226,11 +226,22 @@ exactly, so a full-precision render read back matches the CPU reference
 headless validation (`Scripts/metal-parity.sh`) that sidesteps the GPU/oracle
 bit-parity problem by checking absolute error, not bit-equality. The viewer
 uses it for SDR XYB stills (opsin/matrix on the GPU, extended-linear CGImage
-into the existing `layer.contents` path). Still deferred: the full **HDR EDR**
-normalization (mapping PQ/HLG absolute nits to extended-linear multiples of
-SDR white — the CPU 16-bit PQ/HLG-tagged path stays authoritative for HDR),
-and a true draw-time `MTKView` blit (the current path converts once at decode
-and reuses the proven CGImage zoom architecture).
+into the existing `layer.contents` path). **HDR (PQ/HLG) rides the same GPU
+route** (2026-07-20, user-verified identical to the CPU pair on an EDR
+display): the kernel encodes SMPTE-2084 / the HLG OETF in-shader — the same
+curves as the CPU 16-bit path — tagged `itur_2100_PQ`/`HLG`, restricted to
+2020 primaries where those named spaces exist; verified through ColorSync
+tone mapping at maxDiff ≤ 3 vs both the CPU path and djxl's PNG. The viewer
+runs ONE decode for both outputs (`JXL.decodeImageForDisplay`: shared
+`renderedXYB()` pass → pixels + display planes; was two full decodes,
+173 → 73 ms on the dice fixture).
+
+Still open (nice-to-haves, not correctness): a true extended-linear EDR
+*experiment* (mapping PQ/HLG absolute nits to multiples of SDR white
+directly, to compare against the PQ-tag rendering on real HDR photos); a
+draw-time `MTKView` blit (the current path converts once at decode and
+reuses the proven CGImage zoom architecture); a lazy XYB-backed inspector
+sampler so the GPU route can skip the uint8 color convert entirely.
 
 **Other Metal triggers, still open:** EPF iters ≠ 1 with a dominant filter
 tail → fused Gaborish+EPF compute kernel; animation playback, where the GPU
