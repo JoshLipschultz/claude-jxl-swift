@@ -82,4 +82,10 @@ encoded in the filenames, so structural tests pass without any oracle present.
 
 ## License & provenance
 
-Implemented from the ISO/IEC 18181 specification. Contains no libjxl code.
+Licensed under the [BSD 3-Clause License](LICENSE).
+
+Implemented primarily from the ISO/IEC 18181 specification, with libjxl as the
+test oracle. Portions of the decoder — notably splines, noise synthesis, frame
+blending, the fast transfer-function evaluators, and other bit-exactness-critical
+paths — are derived from [libjxl](https://github.com/libjxl/libjxl), used under
+its BSD 3-Clause license (Copyright (c) the JPEG XL Project Authors).
