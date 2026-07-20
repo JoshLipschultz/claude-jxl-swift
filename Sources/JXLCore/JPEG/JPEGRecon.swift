@@ -145,16 +145,16 @@ extension FrameDecoder {
                 let sbx = bx >> hs
                 let sby = by >> vs
                 if (sbx << hs) != bx || (sby << vs) != by { continue }
-                guard block.coeff[c].count == 64 else {
+                guard block.channelMask & (1 << UInt8(c)) != 0 else {
                     throw JXLError.malformed("jbrd: missing block coefficients")
                 }
                 let comp = jpegCMap[c]
                 let dst = (sby * compWidthInBlocks[comp] + sbx) * 64
                 // JPEG XL blocks are transposed relative to JPEG.
-                let src = block.coeff[c]
+                let src = block.coeffOffset + c * 64
                 for yy in 0..<8 {
                     for xx in 0..<8 {
-                        transposed[yy * 8 + xx] = src[xx * 8 + yy]
+                        transposed[yy * 8 + xx] = coeffs.pool[src + xx * 8 + yy]
                     }
                 }
                 let cmapV = c == 0 ? ytox : (c == 2 ? ytob : 0)

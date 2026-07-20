@@ -89,13 +89,19 @@ let kCoveredBlocksY: [Int] = [
     try decodeVarDCTACGlobalForFrame(from: [UInt8](data))
 }
 
-/// Decodes one DC group's `AcMetadata` stream and writes into `meta`/`valid`.
+/// Decodes one DC group's `AcMetadata` stream and writes the group's rect of
+/// the full-frame metadata fields (raw pointers so DC groups can decode
+/// concurrently). Returns the group's varblock count and used-strategy mask.
 func decodeAcMetadataGroup(
     _ br: BitReader, groupIndex: Int, rect: (x0: Int, y0: Int, w: Int, h: Int),
     dim: FrameDimensions, dcGlobal: VarDCTDCGlobalDecoded,
-    meta: inout VarDCTACMetadata, valid: inout [Bool], totalVarblocks: inout Int,
-    usedACs: inout UInt32
-) throws {
+    strategy: UnsafeMutablePointer<UInt8>, isFirstBlock: UnsafeMutablePointer<Bool>,
+    quantField: UnsafeMutablePointer<Int32>, epfSharpness: UnsafeMutablePointer<UInt8>,
+    ytoxMap: UnsafeMutablePointer<Int8>, ytobMap: UnsafeMutablePointer<Int8>,
+    valid: UnsafeMutablePointer<Bool>,
+    widthBlocks: Int, heightBlocks: Int, colorTileWidth: Int
+) throws -> (varblocks: Int, usedACs: UInt32) {
+    var usedACs: UInt32 = 0
     let upperBound = rect.w * rect.h
     let count = Int(br.read(ceilLog2Nonzero(UInt32(upperBound)))) + 1
 
@@ -122,9 +128,9 @@ func decodeAcMetadataGroup(
         for x in 0..<crW {
             let v0 = image.channels[0].pixels[y * crW + x]
             let v1 = image.channels[1].pixels[y * crW + x]
-            let dst = (ctY0 + y) * meta.colorTileWidth + (ctX0 + x)
-            meta.ytoxMap[dst] = Int8(clamping: v0)
-            meta.ytobMap[dst] = Int8(clamping: v1)
+            let dst = (ctY0 + y) * colorTileWidth + (ctX0 + x)
+            ytoxMap[dst] = Int8(clamping: v0)
+            ytobMap[dst] = Int8(clamping: v1)
         }
     }
 
@@ -133,10 +139,10 @@ func decodeAcMetadataGroup(
     let acsRow = image.channels[2].pixels  // row 0 = strategy, row 1 = quant
     let qfRow0 = count  // index offset for row 1
     let epf = image.channels[3].pixels
-    let bw = meta.widthBlocks
+    let bw = widthBlocks
     var num = 0
     let xlim = min(bw, rect.x0 + rect.w)
-    let ylim = min(meta.heightBlocks, rect.y0 + rect.h)
+    let ylim = min(heightBlocks, rect.y0 + rect.h)
 
     for iy in 0..<rect.h {
         let y = rect.y0 + iy
@@ -146,7 +152,7 @@ func decodeAcMetadataGroup(
             guard sharpness >= 0, Int(sharpness) < kEpfSharpEntries else {
                 throw JXLError.malformed("corrupted EPF sharpness field")
             }
-            meta.epfSharpness[y * bw + x] = UInt8(truncatingIfNeeded: sharpness)
+            epfSharpness[y * bw + x] = UInt8(truncatingIfNeeded: sharpness)
             if valid[y * bw + x] { continue }
             guard num < count else { throw JXLError.malformed("AC metadata: too few varblocks") }
             let raw = acsRow[num]
@@ -171,8 +177,8 @@ func decodeAcMetadataGroup(
                     let pos = (y + dy) * bw + (x + dx)
                     if valid[pos] { throw JXLError.malformed("AC strategy block overlap") }
                     valid[pos] = true
-                    meta.strategy[pos] = UInt8(truncatingIfNeeded: raw)
-                    meta.isFirstBlock[pos] = (dx | dy) == 0
+                    strategy[pos] = UInt8(truncatingIfNeeded: raw)
+                    isFirstBlock[pos] = (dx | dy) == 0
                 }
             }
             // The quant value covers the whole varblock (libjxl fills every
@@ -181,12 +187,12 @@ func decodeAcMetadataGroup(
             let quant = Int32(1 + max(0, min(kQuantMax - 1, qf)))
             for dy in 0..<cby {
                 for dx in 0..<cbx {
-                    meta.quantField[(y + dy) * bw + (x + dx)] = quant
+                    quantField[(y + dy) * bw + (x + dx)] = quant
                 }
             }
             num += 1
         }
     }
     guard num == count else { throw JXLError.malformed("AC metadata: \(num) != count \(count)") }
-    totalVarblocks += count
+    return (count, usedACs)
 }

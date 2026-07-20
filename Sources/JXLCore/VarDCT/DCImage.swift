@@ -87,50 +87,78 @@ func decodeVarDCTLowFrequency(_ d: FrameDecoder) throws -> VarDCTLowFrequency {
     let dim = d.dim
     let bw = dim.xsizeBlocks
     let bh = dim.ysizeBlocks
-    var planeX = [Float](repeating: 0, count: bw * bh)
-    var planeY = [Float](repeating: 0, count: bw * bh)
-    var planeB = [Float](repeating: 0, count: bw * bh)
-    var quantX = [Int32](repeating: 0, count: bw * bh)
-    var quantY = [Int32](repeating: 0, count: bw * bh)
-    var quantB = [Int32](repeating: 0, count: bw * bh)
 
     let ctw = divCeil(bw, kColorTileDimInBlocks)
     let cth = divCeil(bh, kColorTileDimInBlocks)
-    var meta = VarDCTACMetadata(
-        widthBlocks: bw, heightBlocks: bh,
-        strategy: [UInt8](repeating: 0, count: bw * bh),
-        isFirstBlock: [Bool](repeating: false, count: bw * bh),
-        quantField: [Int32](repeating: 0, count: bw * bh),
-        epfSharpness: [UInt8](repeating: 0, count: bw * bh),
-        ytoxMap: [Int8](repeating: 0, count: ctw * cth),
-        ytobMap: [Int8](repeating: 0, count: ctw * cth),
-        colorTileWidth: ctw, colorTileHeight: cth, varblockCount: 0, usedACs: 0,
-        dcQuantContext: [UInt8](repeating: 0, count: bw * bh))
-    // `valid[i]` mirrors libjxl AcStrategyImage validity: a block is valid once
-    // covered by a placed varblock.
-    var valid = [Bool](repeating: false, count: bw * bh)
-    var totalVarblocks = 0
-    var usedACs: UInt32 = 0
+
+    // Every per-block/per-tile target lives in one zero-initialized raw
+    // allocation for the duration of the decode: each DC group writes only its
+    // own rect (varblocks cannot cross AC-group — hence DC-group — bounds, and
+    // color tiles are DC-group-aligned), so groups can decode concurrently
+    // with nothing refcounted crossing into the workers. `valid[i]` mirrors
+    // libjxl AcStrategyImage validity: a block is valid once covered by a
+    // placed varblock.
+    let dest = LFGroupDest(blocks: bw * bh, tiles: ctw * cth)
+    defer { dest.deallocate() }
 
     let shifts = d.frameHeader.channelShifts
     let useDCFrame = d.frameHeader.flags & 32 != 0
-    for dcg in 0..<dim.numDCGroups {
-        let rect = d.dcGroupRect(dcg)
-        let reader = d.dcGroupReader(dcg)
-        if !useDCFrame {
-            try decodeVarDCTDC(
-                reader, groupIndex: dcg, rectW: rect.w, rectH: rect.h,
+    var totalVarblocks = 0
+    var usedACs: UInt32 = 0
+
+    if d.coalesced || dim.numDCGroups == 1 {
+        for dcg in 0..<dim.numDCGroups {
+            let (nv, used) = try decodeLFGroup(
+                d.dcGroupReader(dcg), dcg: dcg, rect: d.dcGroupRect(dcg), dim: dim,
                 dcGlobal: dcGlobal, dequant: dequant, shifts: shifts,
-                destX: &planeX, destY: &planeY, destB: &planeB,
-                destQX: &quantX, destQY: &quantY, destQB: &quantB,
-                destW: bw, x0: rect.x0, y0: rect.y0, dcQuantContext: &meta.dcQuantContext)
+                useDCFrame: useDCFrame, dest: dest, bw: bw, bh: bh, ctw: ctw)
+            totalVarblocks += nv
+            usedACs |= used
         }
-        // (ModularDC reads nothing without extra channels.)
-        try decodeAcMetadataGroup(
-            reader, groupIndex: dcg, rect: rect, dim: dim,
-            dcGlobal: dcGlobal, meta: &meta, valid: &valid,
-            totalVarblocks: &totalVarblocks, usedACs: &usedACs)
+    } else {
+        // Each DC group has its own TOC section and disjoint output rect, so
+        // groups decode concurrently (same pattern as the AC groups).
+        let codestream = d.codestream
+        let sectionRanges = (0..<dim.numDCGroups).map { d.sectionRange(1 + $0) }
+        let rects = (0..<dim.numDCGroups).map { d.dcGroupRect($0) }
+        typealias LFResult = Result<(varblocks: Int, usedACs: UInt32), Error>
+        var results = [LFResult?](repeating: nil, count: dim.numDCGroups)
+        results.withUnsafeMutableBufferPointer { slots in
+            nonisolated(unsafe) let out = slots
+            nonisolated(unsafe) let sharedDest = dest
+            DispatchQueue.concurrentPerform(iterations: dim.numDCGroups) { dcg in
+                out[dcg] = LFResult {
+                    try decodeLFGroup(
+                        BitReader(codestream, byteRange: sectionRanges[dcg]), dcg: dcg,
+                        rect: rects[dcg], dim: dim, dcGlobal: dcGlobal, dequant: dequant,
+                        shifts: shifts, useDCFrame: useDCFrame, dest: sharedDest,
+                        bw: bw, bh: bh, ctw: ctw)
+                }
+            }
+        }
+        for result in results {
+            let (nv, used) = try result!.get()
+            totalVarblocks += nv
+            usedACs |= used
+        }
     }
+
+    var planeX = Array(UnsafeBufferPointer(start: dest.planeX, count: bw * bh))
+    var planeY = Array(UnsafeBufferPointer(start: dest.planeY, count: bw * bh))
+    var planeB = Array(UnsafeBufferPointer(start: dest.planeB, count: bw * bh))
+    let quantX = Array(UnsafeBufferPointer(start: dest.quantX, count: bw * bh))
+    let quantY = Array(UnsafeBufferPointer(start: dest.quantY, count: bw * bh))
+    let quantB = Array(UnsafeBufferPointer(start: dest.quantB, count: bw * bh))
+    var meta = VarDCTACMetadata(
+        widthBlocks: bw, heightBlocks: bh,
+        strategy: Array(UnsafeBufferPointer(start: dest.strategy, count: bw * bh)),
+        isFirstBlock: Array(UnsafeBufferPointer(start: dest.isFirstBlock, count: bw * bh)),
+        quantField: Array(UnsafeBufferPointer(start: dest.quantField, count: bw * bh)),
+        epfSharpness: Array(UnsafeBufferPointer(start: dest.epfSharpness, count: bw * bh)),
+        ytoxMap: Array(UnsafeBufferPointer(start: dest.ytoxMap, count: ctw * cth)),
+        ytobMap: Array(UnsafeBufferPointer(start: dest.ytobMap, count: ctw * cth)),
+        colorTileWidth: ctw, colorTileHeight: cth, varblockCount: 0, usedACs: 0,
+        dcQuantContext: Array(UnsafeBufferPointer(start: dest.dcQuantContext, count: bw * bh)))
     meta.varblockCount = totalVarblocks
     meta.usedACs = usedACs
 
@@ -184,6 +212,92 @@ func decodeVarDCTLowFrequency(_ d: FrameDecoder) throws -> VarDCTLowFrequency {
     try decodeVarDCTDCImage(from: try Data(contentsOf: url))
 }
 
+/// Zero-initialized raw destinations for the low-frequency decode, sized for
+/// the full block grid / color-tile grid. Raw pointers so DC groups can write
+/// their disjoint rects concurrently without any refcounted storage crossing
+/// into workers; converted to Swift arrays once decode finishes.
+private struct LFGroupDest {
+    let planeX: UnsafeMutablePointer<Float>
+    let planeY: UnsafeMutablePointer<Float>
+    let planeB: UnsafeMutablePointer<Float>
+    let quantX: UnsafeMutablePointer<Int32>
+    let quantY: UnsafeMutablePointer<Int32>
+    let quantB: UnsafeMutablePointer<Int32>
+    let strategy: UnsafeMutablePointer<UInt8>
+    let isFirstBlock: UnsafeMutablePointer<Bool>
+    let quantField: UnsafeMutablePointer<Int32>
+    let epfSharpness: UnsafeMutablePointer<UInt8>
+    let ytoxMap: UnsafeMutablePointer<Int8>
+    let ytobMap: UnsafeMutablePointer<Int8>
+    let dcQuantContext: UnsafeMutablePointer<UInt8>
+    let valid: UnsafeMutablePointer<Bool>
+
+    init(blocks: Int, tiles: Int) {
+        func alloc<T>(_ count: Int, _ zero: T) -> UnsafeMutablePointer<T> {
+            let p = UnsafeMutablePointer<T>.allocate(capacity: count)
+            p.initialize(repeating: zero, count: count)
+            return p
+        }
+        planeX = alloc(blocks, Float(0))
+        planeY = alloc(blocks, Float(0))
+        planeB = alloc(blocks, Float(0))
+        quantX = alloc(blocks, Int32(0))
+        quantY = alloc(blocks, Int32(0))
+        quantB = alloc(blocks, Int32(0))
+        strategy = alloc(blocks, UInt8(0))
+        isFirstBlock = alloc(blocks, false)
+        quantField = alloc(blocks, Int32(0))
+        epfSharpness = alloc(blocks, UInt8(0))
+        ytoxMap = alloc(tiles, Int8(0))
+        ytobMap = alloc(tiles, Int8(0))
+        dcQuantContext = alloc(blocks, UInt8(0))
+        valid = alloc(blocks, false)
+    }
+
+    func deallocate() {
+        planeX.deallocate()
+        planeY.deallocate()
+        planeB.deallocate()
+        quantX.deallocate()
+        quantY.deallocate()
+        quantB.deallocate()
+        strategy.deallocate()
+        isFirstBlock.deallocate()
+        quantField.deallocate()
+        epfSharpness.deallocate()
+        ytoxMap.deallocate()
+        ytobMap.deallocate()
+        dcQuantContext.deallocate()
+        valid.deallocate()
+    }
+}
+
+/// Decodes one DC group: its `VarDCTDC` stream (unless the frame uses a DC
+/// frame) followed by its `AcMetadata` stream, writing the group's disjoint
+/// rect of `dest`. Returns the group's varblock count and used-strategy mask.
+private func decodeLFGroup(
+    _ reader: BitReader, dcg: Int, rect: (x0: Int, y0: Int, w: Int, h: Int),
+    dim: FrameDimensions, dcGlobal: VarDCTDCGlobalDecoded, dequant: DCDequant,
+    shifts: (h: [Int], v: [Int]), useDCFrame: Bool, dest: LFGroupDest,
+    bw: Int, bh: Int, ctw: Int
+) throws -> (varblocks: Int, usedACs: UInt32) {
+    if !useDCFrame {
+        try decodeVarDCTDC(
+            reader, groupIndex: dcg, rectW: rect.w, rectH: rect.h,
+            dcGlobal: dcGlobal, dequant: dequant, shifts: shifts,
+            destX: dest.planeX, destY: dest.planeY, destB: dest.planeB,
+            destQX: dest.quantX, destQY: dest.quantY, destQB: dest.quantB,
+            destW: bw, x0: rect.x0, y0: rect.y0, dcQuantContext: dest.dcQuantContext)
+    }
+    // (ModularDC reads nothing without extra channels.)
+    return try decodeAcMetadataGroup(
+        reader, groupIndex: dcg, rect: rect, dim: dim, dcGlobal: dcGlobal,
+        strategy: dest.strategy, isFirstBlock: dest.isFirstBlock,
+        quantField: dest.quantField, epfSharpness: dest.epfSharpness,
+        ytoxMap: dest.ytoxMap, ytobMap: dest.ytobMap, valid: dest.valid,
+        widthBlocks: bw, heightBlocks: bh, colorTileWidth: ctw)
+}
+
 /// Decodes and dequantizes one DC group's `VarDCTDC` stream into the planes.
 /// Mirrors `ModularFrameDecoder::DecodeVarDCTDC` + `DequantDC`. Subsampled
 /// channels occupy the top-left `(w >> h, h >> v)` region of their full-stride
@@ -191,9 +305,11 @@ func decodeVarDCTLowFrequency(_ d: FrameDecoder) throws -> VarDCTLowFrequency {
 private func decodeVarDCTDC(
     _ br: BitReader, groupIndex: Int, rectW: Int, rectH: Int,
     dcGlobal: VarDCTDCGlobalDecoded, dequant: DCDequant, shifts: (h: [Int], v: [Int]),
-    destX: inout [Float], destY: inout [Float], destB: inout [Float],
-    destQX: inout [Int32], destQY: inout [Int32], destQB: inout [Int32],
-    destW: Int, x0: Int, y0: Int, dcQuantContext: inout [UInt8]
+    destX: UnsafeMutablePointer<Float>, destY: UnsafeMutablePointer<Float>,
+    destB: UnsafeMutablePointer<Float>,
+    destQX: UnsafeMutablePointer<Int32>, destQY: UnsafeMutablePointer<Int32>,
+    destQB: UnsafeMutablePointer<Int32>,
+    destW: Int, x0: Int, y0: Int, dcQuantContext: UnsafeMutablePointer<UInt8>
 ) throws {
     // extra_precision: 2 bits; mul = 1 / (1 << extra_precision).
     let extraPrecision = Int(br.read(2))
@@ -245,7 +361,9 @@ private func decodeVarDCTDC(
     } else {
         // Subsampled (libjxl DequantDC non-444 path): per-channel factor, no
         // DC CfL, shifted rects.
-        func dequantChannel(_ c: Int, _ dest: inout [Float], _ destQ: inout [Int32]) {
+        func dequantChannel(
+            _ c: Int, _ dest: UnsafeMutablePointer<Float>, _ destQ: UnsafeMutablePointer<Int32>
+        ) {
             let mc = c < 2 ? c ^ 1 : c
             let q = image.channels[mc].pixels
             let w = rectW >> shifts.h[c]
@@ -262,9 +380,9 @@ private func decodeVarDCTDC(
                 }
             }
         }
-        dequantChannel(1, &destY, &destQY)
-        dequantChannel(0, &destX, &destQX)
-        dequantChannel(2, &destB, &destQB)
+        dequantChannel(1, destY, destQY)
+        dequantChannel(0, destX, destQX)
+        dequantChannel(2, destB, destQB)
     }
 
     // quant_dc (libjxl DequantDC tail): per-block DC context byte from the

@@ -486,7 +486,9 @@ extension FrameDecoder {
         dc.x.withUnsafeBufferPointer { dcXBuf in
         dc.y.withUnsafeBufferPointer { dcYBuf in
         dc.b.withUnsafeBufferPointer { dcBBuf in
+        coeffs.pool.withUnsafeBufferPointer { poolBuf in
         blocks.withUnsafeBufferPointer { blockBuf in
+            nonisolated(unsafe) let coeffPool = poolBuf.baseAddress!
             nonisolated(unsafe) let outX = pX.baseAddress!
             nonisolated(unsafe) let outY = pY.baseAddress!
             nonisolated(unsafe) let outB = pB.baseAddress!
@@ -534,20 +536,22 @@ extension FrameDecoder {
                     // block positions (empty otherwise); its plane region is
                     // the packed top-left of the full-stride plane.
                     let t = tabs[kStrategyQuantTable[strategy].rawValue]!
-                    let cX = blk.coeff[0]
-                    let cY = blk.coeff[1]
-                    let cB = blk.coeff[2]
+                    let cX = coeffPool + blk.coeffOffset
+                    let cY = cX + size
+                    let cB = cY + size
+                    let hasX = blk.channelMask & 1 != 0
+                    let hasB = blk.channelMask & 4 != 0
                     for k in 0..<size {
                         let yMul = t[size + k] * scaledDequant
                         bufY[k] = adjustQuantBias(cY[k], qbY, qbNum) * yMul
                     }
-                    if !cX.isEmpty {
+                    if hasX {
                         for k in 0..<size {
                             let xMul = t[k] * scaledDequant * xDmMul
                             bufX[k] = adjustQuantBias(cX[k], qbX, qbNum) * xMul + xCC * bufY[k]
                         }
                     }
-                    if !cB.isEmpty {
+                    if hasB {
                         for k in 0..<size {
                             let bMul = t[2 * size + k] * scaledDequant * bDmMul
                             bufB[k] = adjustQuantBias(cB[k], qbB, qbNum) * bMul + bCC * bufY[k]
@@ -560,14 +564,14 @@ extension FrameDecoder {
                     insertLLF(bufY, strategy: strategy, dc: dcY, dcStride: dcW, dcOrigin: by * dcW + bx)
                     applyInverseTransform(
                         strategy, bufY, outY + by * 8 * rowStride + bx * 8, stride: rowStride, tmp: tmp)
-                    if !cX.isEmpty {
+                    if hasX {
                         let sbx = bx >> hX
                         let sby = by >> vX
                         insertLLF(bufX, strategy: strategy, dc: dcX, dcStride: dcW, dcOrigin: sby * dcW + sbx)
                         applyInverseTransform(
                             strategy, bufX, outX + sby * 8 * rowStride + sbx * 8, stride: rowStride, tmp: tmp)
                     }
-                    if !cB.isEmpty {
+                    if hasB {
                         let sbx = bx >> hB
                         let sby = by >> vB
                         insertLLF(bufB, strategy: strategy, dc: dcB, dcStride: dcW, dcOrigin: sby * dcW + sbx)
@@ -576,6 +580,7 @@ extension FrameDecoder {
                     }
                 }
             }
+        }
         }
         }
         }
