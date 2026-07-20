@@ -20,10 +20,11 @@ it serves only as the test oracle (`cjxl`/`djxl` compare runs).
 > See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and
 > [docs/jxl-primer.md](docs/jxl-primer.md) for a format primer.
 
-Not yet supported: wide (16-bit/float) pixel output for JPEG-transcode
-(YCbCr) frames — their JPEG reconstruction is byte-exact, and 8-bit pixel
-decode works; rendering spot-color channels onto the color image; nested DC
-frames (`progressive_dc=2`). These fail cleanly with a descriptive error.
+On the official conformance corpus: 22 of 26 testcases meet their tolerances
+(5 bit-exact) — see [docs/conformance-report.md](docs/conformance-report.md).
+Not yet supported: one modular-patches frame shape (`patches_lossless`) and
+nested DC frames (`progressive_dc=2`); both fail cleanly with a descriptive
+error.
 
 ## Command-line tool
 
