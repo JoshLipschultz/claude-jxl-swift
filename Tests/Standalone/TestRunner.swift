@@ -89,6 +89,7 @@ struct TestRunner {
         nestedDCFrames()
         bitWriterRoundTrip()
         headerWriterRoundTrip()
+        encoderRoundTrip()
         orientationBaking()
         deltaPalette()
         iccOutput()
@@ -319,6 +320,67 @@ struct TestRunner {
         check(r.allReadsWithinBounds, "round-trip stayed in bounds")
         FileHandle.standardError.write(
             Data("  [bitwriter] 10k-op write->read identity\n".utf8))
+    }
+
+    /// E1: encode → decode must reproduce the input planes byte-exactly, for
+    /// a spread of shapes and contents (gradients, LCG noise, constants,
+    /// extremes; gray and RGB; 8- and 16-bit; 1×1 up to the full 256×256
+    /// single-group limit). djxl round-trips of the same files are validated
+    /// separately (`Scripts/` + fixtures); this test needs no oracle binary.
+    static func encoderRoundTrip() {
+        var state: UInt64 = 0x1234_5678_9ABC_DEF0
+        func rnd() -> UInt64 {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            return state >> 16
+        }
+        func makeImage(w: Int, h: Int, channels: Int, bits: Int, mode: Int) -> JXLDecodedImage {
+            let maxV = Int32((1 << bits) - 1)
+            var planes: [[Int32]] = []
+            for c in 0..<channels {
+                var p = [Int32](repeating: 0, count: w * h)
+                for i in 0..<(w * h) {
+                    switch mode {
+                    case 0: p[i] = Int32((i + c * 37) % (Int(maxV) + 1))  // gradient-ish
+                    case 1: p[i] = Int32(truncatingIfNeeded: Int64(rnd())) & maxV  // noise
+                    case 2: p[i] = maxV / 2  // constant
+                    default: p[i] = (i % 2 == 0) ? 0 : maxV  // alternating extremes
+                    }
+                }
+                planes.append(p)
+            }
+            return JXLDecodedImage(
+                width: w, height: h, colorChannels: channels, extraChannels: 0,
+                bitsPerSample: bits, isFloat: false, planes: planes)
+        }
+        let shapes: [(Int, Int, Int, Int, Int)] = [
+            (1, 1, 3, 8, 0), (8, 8, 3, 8, 1), (96, 64, 3, 8, 0), (96, 64, 3, 8, 1),
+            (256, 256, 3, 8, 1), (65, 33, 1, 8, 0), (40, 30, 3, 16, 1),
+            (17, 90, 1, 16, 3), (128, 5, 3, 8, 2),
+        ]
+        var failures = 0
+        for (w, h, ch, bits, mode) in shapes {
+            let img = makeImage(w: w, h: h, channels: ch, bits: bits, mode: mode)
+            do {
+                let jxl = try JXL.encodeLossless(image: img)
+                let dec = try JXL.decodeImage(from: jxl)
+                guard dec.width == w, dec.height == h, dec.colorChannels == ch,
+                    dec.bitsPerSample == bits
+                else {
+                    failures += 1
+                    continue
+                }
+                for c in 0..<ch where dec.planes[c] != img.planes[c] {
+                    failures += 1
+                    break
+                }
+            } catch {
+                check(false, "encode \(w)x\(h)/\(ch)ch/\(bits)bit mode \(mode): \(error)")
+                failures += 1
+            }
+        }
+        eq(failures, 0, "encoder round-trip byte-exact (\(shapes.count) shapes)")
+        FileHandle.standardError.write(
+            Data("  [encoder-e1] encode->decode byte-exact round-trips\n".utf8))
     }
 
     /// Header writers → the decoder's own parsers: dimensions, bit depth, and
