@@ -339,13 +339,24 @@ dcFrameSlots = dcSlots
             // convert to the file's *native* encoded RGB (no color management
             // applied), so the embedded profile — when present — describes
             // the returned samples.
-            guard format == .uint8 else {
-                throw JXLError.unsupported("wide output for YCbCr (JPEG transcode) frames")
+            let colorPlanes: [[Int32]]
+            let bits: Int
+            switch format {
+            case .uint8:
+                colorPlanes = ycbcrToRGB8Planes(xyb)
+                bits = 8
+            case .uint16:
+                colorPlanes = ycbcrToRGBWidePlanes(xyb, format: format)
+                bits = 16
+            case .float32:
+                colorPlanes = ycbcrToRGBWidePlanes(xyb, format: format)
+                bits = 32
             }
             return JXLDecodedImage(
                 width: xyb.width, height: xyb.height, colorChannels: 3,
-                extraChannels: ecPlanes.count, bitsPerSample: 8, isFloat: false,
-                planes: ycbcrToRGB8Planes(xyb) + ecPlanes,
+                extraChannels: ecPlanes.count, bitsPerSample: bits,
+                isFloat: format == .float32,
+                planes: colorPlanes + ecPlanes,
                 iccProfile: iccProfile.map { Data($0) })
         }
         // XYB: converted to the frame's declared numeric encoding (primaries/

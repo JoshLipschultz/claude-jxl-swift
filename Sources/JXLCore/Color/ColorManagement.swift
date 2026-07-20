@@ -792,6 +792,61 @@ func ycbcrToRGB8Planes(_ img: XYBImage) -> [[Int32]] {
     return [planeR, planeG, planeB]
 }
 
+/// Wide-output YCbCr→RGB: 16-bit (clamped round) or float32 bit patterns
+/// (unclamped, djxl PFM convention). Mirrors libjxl stage_ycbcr's MulAdd
+/// arithmetic (fmaf) so float output matches the reference decoder bit-close.
+func ycbcrToRGBWidePlanes(_ img: XYBImage, format: JXLSampleFormat) -> [[Int32]] {
+    let width = img.width
+    let stride = img.stride
+    let wantFloat = format == .float32
+    var planeR = [Int32](repeating: 0, count: img.width * img.height)
+    var planeG = planeR
+    var planeB = planeR
+    let crcr: Float = 1.402
+    let cgcb: Float = -0.114 * 1.772 / 0.587
+    let cgcr: Float = -0.299 * 1.402 / 0.587
+    let cbcb: Float = 1.772
+    let c128: Float = 128.0 / 255
+    planeR.withUnsafeMutableBufferPointer { rBuf in
+    planeG.withUnsafeMutableBufferPointer { gBuf in
+    planeB.withUnsafeMutableBufferPointer { bBuf in
+    img.x.withUnsafeBufferPointer { xBuf in
+    img.y.withUnsafeBufferPointer { yBuf in
+    img.b.withUnsafeBufferPointer { bSrcBuf in
+        nonisolated(unsafe) let pr = rBuf.baseAddress!
+        nonisolated(unsafe) let pg = gBuf.baseAddress!
+        nonisolated(unsafe) let pbOut = bBuf.baseAddress!
+        nonisolated(unsafe) let pcb = xBuf.baseAddress!
+        nonisolated(unsafe) let py = yBuf.baseAddress!
+        nonisolated(unsafe) let pcr = bSrcBuf.baseAddress!
+        DispatchQueue.concurrentPerform(iterations: img.height) { y in
+            let row = y * stride
+            let dstRow = y * width
+            @inline(__always) func out(_ v: Float) -> Int32 {
+                if wantFloat { return Int32(bitPattern: v.bitPattern) }
+                return Int32(max(0, min(65535, (v * 65535).rounded())))
+            }
+            for x in 0..<width {
+                let cb = pcb[row + x]
+                let cr = pcr[row + x]
+                let yy = py[row + x] + c128
+                let r = fmaf(crcr, cr, yy)
+                let g = fmaf(cgcr, cr, fmaf(cgcb, cb, yy))
+                let b = fmaf(cbcb, cb, yy)
+                pr[dstRow + x] = out(r)
+                pg[dstRow + x] = out(g)
+                pbOut[dstRow + x] = out(b)
+            }
+        }
+    }
+    }
+    }
+    }
+    }
+    }
+    return [planeR, planeG, planeB]
+}
+
 /// Converts YCbCr planes to interleaved 8-bit RGB, row-parallel.
 func ycbcrToRGB8Interleaved(_ img: XYBImage) -> [UInt8] {
     var rgb = [UInt8](repeating: 0, count: img.width * img.height * 3)

@@ -82,6 +82,7 @@ struct TestRunner {
         frameBlending()
         float32Modular()
         integerModularFloat()
+        jpegTranscodeWide()
         orientationBaking()
         deltaPalette()
         iccOutput()
@@ -162,6 +163,43 @@ struct TestRunner {
         eq(mismatches, 0, "\(base) float bit-exact vs djxl PFM")
         FileHandle.standardError.write(
             Data("  [int-modular-float] unclamped float output bit-exact vs djxl\n".utf8))
+    }
+
+    /// `96x64_jpeg444.jxl` is a 4:4:4 JPEG transcode (no chroma upsampling in
+    /// play). Wide output: float32 must sit within a few ulp of djxl's PFM
+    /// (the lossy VarDCT float pipeline itself carries ~1-ulp disagreement, so
+    /// bit-exactness is not achievable), and uint16 must equal the clamped
+    /// round of the float samples.
+    static func jpegTranscodeWide() {
+        let dir = fixturesDir()
+        let base = "96x64_jpeg444"
+        guard let jxl = try? Data(contentsOf: dir.appendingPathComponent(base + ".jxl")),
+            let pfm = try? Data(contentsOf: dir.appendingPathComponent(base + ".pfm")),
+            let oracle = parsePFM(pfm),
+            let imgF = try? JXL.decodeImage(from: [UInt8](jxl), format: .float32),
+            let img16 = try? JXL.decodeImage(from: [UInt8](jxl), format: .uint16)
+        else {
+            check(false, "\(base) wide fixtures decode")
+            return
+        }
+        check(imgF.isFloat && imgF.bitsPerSample == 32, "\(base) float output is float32")
+        eq(imgF.width, oracle.width, "\(base) width")
+        var maxDiff: Float = 0
+        var bad16 = 0
+        for c in 0..<3 {
+            for i in 0..<(imgF.width * imgF.height) {
+                let ours = Float(bitPattern: UInt32(bitPattern: imgF.planes[c][i]))
+                let ref = Float(bitPattern: UInt32(bitPattern: oracle.planes[c][i]))
+                maxDiff = max(maxDiff, abs(ours - ref))
+                let want16 = Int32(max(0, min(65535, (ours * 65535).rounded())))
+                if img16.planes[c][i] != want16 { bad16 += 1 }
+            }
+        }
+        check(maxDiff < 4e-6, "\(base) float within 4e-6 of djxl PFM (max \(maxDiff))")
+        eq(bad16, 0, "\(base) uint16 consistent with float")
+        check(img16.bitsPerSample == 16 && !img16.isFloat, "\(base) uint16 shape")
+        FileHandle.standardError.write(
+            Data("  [jpeg-wide] YCbCr transcode wide output vs djxl PFM\n".utf8))
     }
 
     /// Minimal PFM reader (color, either endianness) returning int32 bit
