@@ -191,11 +191,29 @@ private func decodeChannel(
         node.property == -1 ? node.predictor == 6 : node.property == 15
     }
     let wpState = treeUsesWP ? WPState(header: wpHeader, xsize: w, ysize: h) : nil
-    var props = [Int32](repeating: 0, count: propCount)
+    // Everything the per-pixel loop touches is a raw pointer: array subscripts
+    // here would pay exclusivity/bounds machinery per pixel (see the
+    // ARCHITECTURE.md "Decode performance" lesson).
+    let props = UnsafeMutablePointer<Int32>.allocate(capacity: propCount)
+    defer { props.deallocate() }
+    props.initialize(repeating: 0, count: propCount)
     props[0] = Int32(truncatingIfNeeded: chan)
     props[1] = Int32(truncatingIfNeeded: groupID)
+    // Reference properties flattened to one contiguous buffer, w*h per slot.
+    var refFlat = [Int32]()
+    if refCount > 0 {
+        refFlat.reserveCapacity(refCount * w * h)
+        for r in references { refFlat.append(contentsOf: r) }
+    }
 
     image.channels[chan].pixels.withUnsafeMutableBufferPointer { px in
+    tree.withUnsafeBufferPointer { treeBuf in
+    contextMap.withUnsafeBufferPointer { ctxBuf in
+    refFlat.withUnsafeBufferPointer { refBuf in
+        let treeP = treeBuf.baseAddress!
+        let ctxP = ctxBuf.baseAddress!
+        let refP = refBuf.baseAddress
+        let planeSize = w * h
         for y in 0..<h {
             props[2] = Int32(truncatingIfNeeded: y)
             props[9] = 0
@@ -233,7 +251,7 @@ private func decodeChannel(
 
                 var wpPred = wpState?.predict(
                     x: x, y: y, xsize: w, N: top, W: left, NE: topright, NW: topleft, NN: toptop,
-                    computeProperties: true, properties: &props, offset: 15) ?? 0
+                    computeProperties: true, properties: props, offset: 15) ?? 0
                 if fastTrack == .wpClamp {
                     // libjxl's WP fast track truncates the prediction to int32
                     // and clamps the WP property to the LUT range.
@@ -241,15 +259,18 @@ private func decodeChannel(
                     props[15] = min(max(props[15], Int32(-kPropRangeFast)), Int32(kPropRangeFast - 1))
                 }
 
-                for i in 0..<refCount { props[16 + i] = references[i][rowBase + x] }
+                if let refP {
+                    for i in 0..<refCount { props[16 + i] = refP[i * planeSize + rowBase + x] }
+                }
 
                 // Tree traversal -> clustered context + predictor.
                 var pos = 0
-                while tree[pos].property != -1 {
-                    pos = props[tree[pos].property] > tree[pos].splitVal ? tree[pos].lchild : tree[pos].rchild
+                while treeP[pos].property != -1 {
+                    let node = treeP[pos]
+                    pos = props[node.property] > node.splitVal ? node.lchild : node.rchild
                 }
-                let leaf = tree[pos]
-                let context = Int(contextMap[leaf.lchild])
+                let leaf = treeP[pos]
+                let context = Int(ctxP[leaf.lchild])
                 let predicted = predictOne(
                     leaf.predictor, left: left, top: top, toptop: toptop, topleft: topleft,
                     topright: topright, leftleft: leftleft, toprightright: toprightright, wpPred: wpPred)
@@ -261,6 +282,9 @@ private func decodeChannel(
                 wpState?.updateErrors(Int(px[rowBase + x]), x: x, y: y, xsize: w)
             }
         }
+    }
+    }
+    }
     }
 }
 

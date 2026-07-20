@@ -63,9 +63,16 @@ public final class ANSSymbolReader {
     private let logEntrySize: Int
     private let entrySizeMinus1: Int
 
+    // Hot-path tables as private allocations: the per-symbol loop cannot
+    // afford array borrow/bounds machinery (see ARCHITECTURE.md "Decode
+    // performance"). Copied from `code` at init; a reader decodes a whole
+    // group stream, so the one-time copies are noise.
+    private let aliasP: UnsafeMutablePointer<AliasEntry>?
+    private let uintP: UnsafeMutablePointer<HybridUintConfig>
+
     // LZ77 state.
     private let lz77Enabled: Bool
-    private var lz77Window: [UInt32]
+    private let lz77Window: UnsafeMutablePointer<UInt32>?
     private let lz77Ctx: Int
     private let lz77LengthUint: HybridUintConfig
     private let lz77Threshold: UInt32
@@ -84,11 +91,22 @@ public final class ANSSymbolReader {
             state = UInt32(truncatingIfNeeded: br.read(32))
             logEntrySize = ansLogTabSize - code.logAlphaSize
             entrySizeMinus1 = (1 << logEntrySize) - 1
+            let p = UnsafeMutablePointer<AliasEntry>.allocate(capacity: code.aliasTables.count)
+            code.aliasTables.withUnsafeBufferPointer {
+                p.initialize(from: $0.baseAddress!, count: $0.count)
+            }
+            aliasP = p
         } else {
             state = ansSignature << 16
             logEntrySize = 0
             entrySizeMinus1 = 0
+            aliasP = nil
         }
+        let up = UnsafeMutablePointer<HybridUintConfig>.allocate(capacity: code.uintConfig.count)
+        code.uintConfig.withUnsafeBufferPointer {
+            up.initialize(from: $0.baseAddress!, count: $0.count)
+        }
+        uintP = up
 
         lz77Enabled = code.lz77.enabled
         lz77Ctx = code.lz77.nonserializedDistanceContext
@@ -96,16 +114,24 @@ public final class ANSSymbolReader {
         lz77Threshold = code.lz77.minSymbol
         lz77MinLength = code.lz77.minLength
         if code.lz77.enabled {
-            lz77Window = [UInt32](repeating: 0, count: kWindowSize)
+            let w = UnsafeMutablePointer<UInt32>.allocate(capacity: kWindowSize)
+            w.initialize(repeating: 0, count: kWindowSize)
+            lz77Window = w
             numSpecialDistances = distanceMultiplier == 0 ? 0 : kNumSpecialDistances
             specialDistances = (0..<numSpecialDistances).map {
                 specialDistance(index: $0, multiplier: distanceMultiplier)
             }
         } else {
-            lz77Window = []
+            lz77Window = nil
             numSpecialDistances = 0
             specialDistances = []
         }
+    }
+
+    deinit {
+        aliasP?.deallocate()
+        uintP.deallocate()
+        lz77Window?.deallocate()
     }
 
     // MARK: Raw symbol (token) decode
@@ -115,7 +141,7 @@ public final class ANSSymbolReader {
         let res = Int(state) & ansTabMask
         let base = histoIdx << logAlphaSize
         let sym = aliasLookup(
-            code.aliasTables, base: base, value: res, logEntrySize: logEntrySize,
+            aliasP!, base: base, value: res, logEntrySize: logEntrySize,
             entrySizeMinus1: entrySizeMinus1)
         state =
             UInt32(truncatingIfNeeded: sym.freq) &* (state >> UInt32(ansLogTabSize))
@@ -142,22 +168,24 @@ public final class ANSSymbolReader {
     /// `ReadHybridUintClustered`).
     func readHybridUintClustered(_ ctx: Int, _ br: BitReader) -> UInt32 {
         if lz77Enabled && numToCopy > 0 {
-            let ret = lz77Window[copyPos & kWindowMask]
+            let window = lz77Window!
+            let ret = window[copyPos & kWindowMask]
             copyPos += 1
             numToCopy -= 1
-            lz77Window[numDecoded & kWindowMask] = ret
+            window[numDecoded & kWindowMask] = ret
             numDecoded += 1
             return ret
         }
 
         let token = readSymbol(ctx, br)
         if lz77Enabled && UInt32(token) >= lz77Threshold {
+            let window = lz77Window!
             numToCopy =
                 Int(lz77LengthUint.decode(token: UInt32(token) - lz77Threshold, reader: br))
                 + Int(lz77MinLength)
             // Distance code.
             let distToken = readSymbol(lz77Ctx, br)
-            var distance = Int(code.uintConfig[lz77Ctx].decode(token: UInt32(distToken), reader: br))
+            var distance = Int(uintP[lz77Ctx].decode(token: UInt32(distToken), reader: br))
             if distance < numSpecialDistances {
                 distance = specialDistances[distance]
             } else {
@@ -168,20 +196,20 @@ public final class ANSSymbolReader {
             copyPos = numDecoded - distance
             if distance == 0 {
                 let toFill = min(numToCopy, kWindowSize)
-                for k in 0..<toFill { lz77Window[k] = 0 }
+                for k in 0..<toFill { window[k] = 0 }
             }
             if numToCopy < Int(lz77MinLength) { return 0 }
-            let ret = lz77Window[copyPos & kWindowMask]
+            let ret = window[copyPos & kWindowMask]
             copyPos += 1
             numToCopy -= 1
-            lz77Window[numDecoded & kWindowMask] = ret
+            window[numDecoded & kWindowMask] = ret
             numDecoded += 1
             return ret
         }
 
-        let ret = code.uintConfig[ctx].decode(token: UInt32(token), reader: br)
+        let ret = uintP[ctx].decode(token: UInt32(token), reader: br)
         if lz77Enabled {
-            lz77Window[numDecoded & kWindowMask] = ret
+            lz77Window![numDecoded & kWindowMask] = ret
             numDecoded += 1
         }
         return ret

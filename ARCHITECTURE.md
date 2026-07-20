@@ -161,8 +161,8 @@ Benchmarked on a 6 MP synthetic photographic fixture (`Scripts/gen-bench.sh`,
 
 | Path | Before | After | |
 |---|---|---|---|
-| VarDCT (lossy, q95 e4) | 360 ms (16.7 MP/s) | **72 ms (~83 MP/s)** | 5.0× |
-| Modular (lossless, e3) | 3585 ms (1.7 MP/s) | **278 ms (~21.5 MP/s)** | 12.9× |
+| VarDCT (lossy, q95 e4) | 360 ms (16.7 MP/s) | **62 ms (~96 MP/s)** | 5.8× |
+| Modular (lossless, e3) | 3585 ms (1.7 MP/s) | **115 ms (~52 MP/s)** | 31× |
 
 What did it (in impact order): rewriting the weighted predictor on flat
 manually-managed buffers with scalarized 4-wide math, and skipping it entirely
@@ -185,11 +185,23 @@ thresholds, and opsin constants are now process-lifetime `UnsafePointer`s /
 scalars for exactly this reason. Per-pixel closures (even `@Sendable` ones)
 and per-pixel array temporaries are equally forbidden in hot loops.
 
-Next levers, roughly in order: SIMD4 for the weighted predictor's 4-wide
-math (lossless is now WP + entropy bound); flat per-group coefficient pooling
-(drops `VarDCTBlock`'s per-block nested arrays); parallel DC-group decode in
-the LF pass; interior/border splits for Gaborish/EPF mirror handling; a
-buffered refill in the ANS symbol reader.
+**2026-07 round (161 → ~115 ms lossless, 68 → ~62 ms lossy):** the dominant
+win was converting everything the per-pixel Modular loop touches to raw
+pointers — the MA-tree property vector (was an `inout [Int32]` paying an
+exclusivity check per pixel), the tree/context-map walks, and flattened
+reference-channel properties (~25%). The WP error window is now a per-position
+`SIMD4<UInt32>` (planes as lanes): `updateErrors` collapsed to two vector ops
+(its samples dropped 10×), though the win shows as latitude, not wall time —
+the predictor's serial dependency chain bounds the loop. WP divlookup and the
+ANS reader's alias/uint-config tables became private allocations (bounds/borrow
+machinery off the symbol path; neutral wall-time, cleaner profile).
+
+Remaining levers: flat per-group coefficient pooling (drops `VarDCTBlock`'s
+per-block nested arrays); parallel DC-group decode in the LF pass;
+interior/border splits for Gaborish/EPF mirror handling; a buffered refill in
+the ANS symbol reader. The Modular loop is now bound by the serial
+WP-predict → tree-walk → ANS-read dependency chain; further gains there mean
+restructuring (e.g., libjxl-style per-row specialization), not micro-opts.
 
 **Metal (GPU) — assessed 2026-07, deferred.** Measured stage split (release,
 6 MP / 26 MP): headers+DC/LF 24.6/97 ms, AC entropy +18.8/+82 ms,

@@ -408,7 +408,6 @@ func invPalette(
         // prediction from the already-reconstructed output channel.
         for c in 0..<nb {
             let wpState = predictor == 6 ? WPState(header: wpHeader, xsize: w, ysize: h) : nil
-            var dummyProps = [Int32](repeating: 0, count: 1)
             image.channels[c0 + c].pixels.withUnsafeMutableBufferPointer { px in
                 for y in 0..<h {
                     let rowBase = y * w
@@ -434,7 +433,7 @@ func invPalette(
                             let wpPred = wpState?.predict(
                                 x: x, y: y, xsize: w, N: top, W: left, NE: topright,
                                 NW: topleft, NN: toptop, computeProperties: false,
-                                properties: &dummyProps, offset: 0) ?? 0
+                                properties: nil, offset: 0) ?? 0
                             let guess = predictOne(
                                 predictor, left: left, top: top, toptop: toptop,
                                 topleft: topleft, topright: topright, leftleft: leftleft,

@@ -52,8 +52,10 @@ struct AliasSymbol {
 /// Constant-time mapping of a slot in [0, 4096) to (symbol, within-symbol offset,
 /// frequency). Mirrors `AliasTable::Lookup`.
 @inline(__always)
-func aliasLookup(_ table: [AliasEntry], base: Int, value: Int, logEntrySize: Int, entrySizeMinus1: Int)
-    -> AliasSymbol {
+func aliasLookup(
+    _ table: UnsafePointer<AliasEntry>, base: Int, value: Int, logEntrySize: Int,
+    entrySizeMinus1: Int
+) -> AliasSymbol {
     let i = value >> logEntrySize
     let pos = value & entrySizeMinus1
     let e = table[base + i]

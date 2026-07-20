@@ -96,10 +96,21 @@ final class WPState {
     private var pr0 = 0, pr1 = 0, pr2 = 0, pr3 = 0
     /// Two-row sliding window stride (xsize + 2).
     private let stride: Int
-    /// 4 planes of `stride * 2` per-predictor errors, contiguous.
-    private let predErrors: UnsafeMutablePointer<UInt32>
+    /// Per-position 4-lane per-predictor errors (planes interleaved as SIMD4
+    /// lanes), `stride * 2` positions — one vector load covers all four
+    /// predictors of a neighbour.
+    private let predErrors: UnsafeMutablePointer<SIMD4<UInt32>>
     /// Two rows of `stride` signed prediction errors.
     private let error: UnsafeMutablePointer<Int32>
+
+    /// Process-lifetime raw pointer: this table is read five times per pixel
+    /// (four error weights + the final division), and a Swift array subscript
+    /// would pay global-access + bounds machinery each time.
+    nonisolated(unsafe) private static let divlookupPtr: UnsafePointer<UInt32> = {
+        let p = UnsafeMutablePointer<UInt32>.allocate(capacity: divlookup.count)
+        p.initialize(from: divlookup, count: divlookup.count)
+        return UnsafePointer(p)
+    }()
 
     private static let divlookup: [UInt32] = [
         16_777_216, 8_388_608, 5_592_405, 4_194_304, 3_355_443, 2_796_202, 2_396_745, 2_097_152,
@@ -125,8 +136,8 @@ final class WPState {
         hw2 = header.w[2]
         hw3 = header.w[3]
         stride = xsize + 2
-        predErrors = .allocate(capacity: kNumWPPredictors * stride * 2)
-        predErrors.initialize(repeating: 0, count: kNumWPPredictors * stride * 2)
+        predErrors = .allocate(capacity: stride * 2)
+        predErrors.initialize(repeating: .zero, count: stride * 2)
         error = .allocate(capacity: stride * 2)
         error.initialize(repeating: 0, count: stride * 2)
     }
@@ -138,39 +149,40 @@ final class WPState {
 
     @inline(__always) private func addBits(_ x: Int) -> Int { x << kPredExtraBits }
 
+    private let divlookup = WPState.divlookupPtr
+
     @inline(__always)
     private func errorWeight(_ x: UInt64, _ maxweight: UInt32) -> UInt32 {
         var shift = floorLog2(x + 1) - 5
         if shift < 0 { shift = 0 }
-        let lookup = UInt64(Self.divlookup[Int(x >> UInt64(shift))])
+        let lookup = UInt64(divlookup[Int(x >> UInt64(shift))])
         return UInt32(truncatingIfNeeded: 4 + ((UInt64(maxweight) * lookup) >> UInt64(shift)))
     }
 
     /// Computes the weighted prediction at (x, y); when `computeProperties` is
-    /// set, writes the WP property into `properties[offset]`.
+    /// set, writes the WP property into `properties[offset]` (raw pointer —
+    /// this runs per pixel, and an inout array would pay an exclusivity check
+    /// per call).
     func predict(
         x: Int, y: Int, xsize: Int, N nIn: Int, W wIn: Int, NE neIn: Int, NW nwIn: Int,
-        NN nnIn: Int, computeProperties: Bool, properties: inout [Int32], offset: Int
+        NN nnIn: Int, computeProperties: Bool, properties: UnsafeMutablePointer<Int32>?,
+        offset: Int
     ) -> Int {
         let curRow = (y & 1) != 0 ? 0 : stride
         let prevRow = (y & 1) != 0 ? stride : 0
         let posN = prevRow + x
         let posNE = x < xsize - 1 ? posN + 1 : posN
         let posNW = x > 0 ? posN - 1 : posN
-        let planeSize = stride * 2
 
-        @inline(__always) func weight(_ plane: Int, _ maxw: UInt32) -> UInt32 {
-            let base = predErrors + plane * planeSize
-            // libjxl sums the three neighbour errors in uint32, wrapping mod
-            // 2^32 — reachable with 32-bit (float bit-pattern) samples, where
-            // per-pixel errors approach 2^32. The wrap must be reproduced.
-            let s = base[posN] &+ base[posNE] &+ base[posNW]
-            return errorWeight(UInt64(s), maxw)
-        }
-        let w0In = weight(0, hw0)
-        let w1In = weight(1, hw1)
-        let w2In = weight(2, hw2)
-        let w3In = weight(3, hw3)
+        // libjxl sums the three neighbour errors in uint32, wrapping mod
+        // 2^32 — reachable with 32-bit (float bit-pattern) samples, where
+        // per-pixel errors approach 2^32. The wrap must be reproduced
+        // (SIMD `&+` wraps per lane).
+        let s = predErrors[posN] &+ predErrors[posNE] &+ predErrors[posNW]
+        let w0In = errorWeight(UInt64(s[0]), hw0)
+        let w1In = errorWeight(UInt64(s[1]), hw1)
+        let w2In = errorWeight(UInt64(s[2]), hw2)
+        let w3In = errorWeight(UInt64(s[3]), hw3)
 
         let N = addBits(nIn)
         let W = addBits(wIn)
@@ -184,7 +196,7 @@ final class WPState {
         let sumWN = teN + teW
         let teNE = Int(error[posNE])
 
-        if computeProperties {
+        if computeProperties, let properties {
             var p = teW
             if abs(teN) > abs(p) { p = teN }
             if abs(teNW) > abs(p) { p = teNW }
@@ -212,7 +224,7 @@ final class WPState {
         // (C++ wraps in practice; Swift must not trap).
         var sum = Int(weightSum >> 1) - 1
         sum &+= pr0 &* Int(w0) &+ pr1 &* Int(w1) &+ pr2 &* Int(w2) &+ pr3 &* Int(w3)
-        pred = (sum &* Int(Self.divlookup[Int(weightSum) - 1])) >> 24
+        pred = (sum &* Int(divlookup[Int(weightSum) - 1])) >> 24
 
         if ((teN ^ teW) | (teN ^ teNW)) > 0 {
             return (pred + kPredictionRound) >> kPredExtraBits
@@ -228,16 +240,15 @@ final class WPState {
         let prevRow = (y & 1) != 0 ? stride : 0
         let val = addBits(valIn)
         error[curRow + x] = Int32(truncatingIfNeeded: pred - val)
-        let planeSize = stride * 2
-        @inline(__always) func update(_ plane: Int, _ prediction: Int) {
-            let err = UInt32(truncatingIfNeeded: (abs(prediction - val) + kPredictionRound) >> kPredExtraBits)
-            let base = predErrors + plane * planeSize
-            base[curRow + x] = err
-            base[prevRow + x + 1] &+= err
-        }
-        update(0, pr0)
-        update(1, pr1)
-        update(2, pr2)
-        update(3, pr3)
+        // All four predictors at once: |pr - val| rounded and truncated to
+        // uint32, then one vector store + one wrapping vector accumulate.
+        let pr = SIMD4<Int64>(Int64(pr0), Int64(pr1), Int64(pr2), Int64(pr3))
+        let diff = pr &- SIMD4<Int64>(repeating: Int64(val))
+        let absDiff = pointwiseMax(diff, .zero &- diff)
+        let err64 = (absDiff &+ SIMD4<Int64>(repeating: Int64(kPredictionRound)))
+            &>> Int64(kPredExtraBits)
+        let err = SIMD4<UInt32>(truncatingIfNeeded: err64)
+        predErrors[curRow + x] = err
+        predErrors[prevRow + x + 1] &+= err
     }
 }
