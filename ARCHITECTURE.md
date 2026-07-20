@@ -236,6 +236,42 @@ and reuses the proven CGImage zoom architecture).
 tail → fused Gaborish+EPF compute kernel; animation playback, where the GPU
 tail of frame N overlaps CPU entropy of frame N+1.
 
+**Display-color lessons (2026-07 user-assisted A/B; full post-mortems in the
+two "display verification" commit messages).** Five bugs shipped past every
+headless harness and were caught only on a real display. The transferable
+rules:
+
+1. *Decoded samples are signed.* Lossy output legitimately rings below 0 /
+   above maxVal. Any output stage that reinterprets via `UInt32(bitPattern:)`
+   turns α = −1 into *opaque* — the JXLKit converter painted encoder garbage
+   under transparent regions as black fringes for months. Clamp signed at
+   every presentation boundary (the CLI writers learned this in the
+   conformance round; JXLKit had the same bug independently).
+2. *"Linear light + linear tag" is not automatically correct display.* For
+   BT.709-transfer content the display convention (Apple `itur_709`, libjxl's
+   generated ICCs) decodes with an 1886-style curve, NOT the encoding OETF's
+   inverse — the asymmetry is the intended rendering. A display path must
+   reproduce the reference decoder's *rendering*, not its math.
+3. *SDR display paths must clamp to [0,1].* Extended-range float formats
+   faithfully preserve out-of-gamut DCT ringing that wide-gamut (P3) panels
+   can actually show — as blocky hue shifts the 8-bit path's clamp hides.
+4. *Know what each harness cannot see.* GPU-vs-CPU parity consumes the same
+   decoded planes, so it cannot catch decode-side geometry bugs (cross-check
+   against `decodeImage` output). An sRGB-context compare clamps away
+   P3-visible out-of-gamut errors. CG normalizes alpha before interpolating,
+   so CA-compositor behavior cannot be reproduced in a CGContext. The
+   decisive oracle for display work: composite against djxl's own PNG through
+   ColorSync, then confirm on a physical display.
+5. *Tag SDR CGImages.* DeviceRGB means "skip color management": 709-encoded
+   samples rendered with the panel response shift every mid-tone. Every
+   enumerated sRGB-primary encoding now maps to a named space
+   (`itur_709`/`sRGB`/`linearSRGB`); display images are premultiplied
+   (straight alpha bleeds transparent-pixel garbage when the compositor
+   scales).
+
+Known follow-up: the viewer's Metal route decodes the file twice (once for
+the sampler/CPU fallback, once for XYB planes) — fold into one decode.
+
 **M3 status (implemented).** The full entropy substrate is ported from libjxl
 v0.11.2: the hybrid-uint integer coder, canonical prefix codes, the rANS
 alias-method decoder (histogram reading, alias-table construction, 32-bit state
