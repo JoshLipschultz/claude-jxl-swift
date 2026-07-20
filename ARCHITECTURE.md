@@ -211,14 +211,30 @@ the GPU-shaped part (Gaborish/EPF/XYB→sRGB — streaming, bandwidth-bound) is
 ~15% of decode and already saturates cores via `concurrentPerform`. GPU float
 rounding (FMA contraction) also breaks CPU/oracle bit-parity — fine for the
 >50 dB gates, a new flakiness class otherwise. JXLCore stays pure CPU Swift.
-**Future TODO — revisit Metal at three triggers:** (1) the HDR/display work
-in M8: hand float XYB planes to JXLKit as an `MTLTexture`/IOSurface and do
-XYB→display-space in a shader at draw time (deletes a full-image CPU pass +
-a copy from time-to-pixels; PQ/HLG + EDR want this anyway — the conversion
-belongs to the display, not the decoder); (2) EPF iters ≠ 1 lands and a
-profile shows the ~3× filter tail dominant → fused Gaborish+EPF compute
-kernel; (3) animation playback, where the GPU tail of frame N overlaps CPU
-entropy of frame N+1 and adds real capacity instead of stealing idle cores.
+JXLCore's *decode* stays pure CPU Swift for oracle bit-parity. The **display
+color transform**, however, is exactly the GPU-shaped, parity-optional tail
+that belongs on the GPU — and that trigger has now landed.
+
+**Metal display-time color (implemented).** `JXLKit.JXLMetalColorConverter`
+runs the opsin-inverse + primaries matrix + HLG OOTF in a compute kernel,
+turning a lossy frame's pre-color-transform XYB float planes
+(`JXL.decodeXYBForDisplay`) into **linear** target-space RGB — the input an
+extended-linear/EDR display path wants (the compositor applies the display
+transfer and HDR headroom). The kernel reproduces `ConvertState.linear`
+exactly, so a full-precision render read back matches the CPU reference
+(`jxlXYBToLinearPlanes`) to < 1e-4 absolute across all lossy fixtures — a
+headless validation (`Scripts/metal-parity.sh`) that sidesteps the GPU/oracle
+bit-parity problem by checking absolute error, not bit-equality. The viewer
+uses it for SDR XYB stills (opsin/matrix on the GPU, extended-linear CGImage
+into the existing `layer.contents` path). Still deferred: the full **HDR EDR**
+normalization (mapping PQ/HLG absolute nits to extended-linear multiples of
+SDR white — the CPU 16-bit PQ/HLG-tagged path stays authoritative for HDR),
+and a true draw-time `MTKView` blit (the current path converts once at decode
+and reuses the proven CGImage zoom architecture).
+
+**Other Metal triggers, still open:** EPF iters ≠ 1 with a dominant filter
+tail → fused Gaborish+EPF compute kernel; animation playback, where the GPU
+tail of frame N overlaps CPU entropy of frame N+1.
 
 **M3 status (implemented).** The full entropy substrate is ported from libjxl
 v0.11.2: the hybrid-uint integer coder, canonical prefix codes, the rANS

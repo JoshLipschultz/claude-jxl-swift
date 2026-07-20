@@ -18,6 +18,7 @@ RES_DIR="$APP/Contents/Resources"
 mkdir -p "$BUILD"
 
 CORE_SRC=$(find "$ROOT/Sources/JXLCore" -name '*.swift' | sort)
+KIT_SRC=$(find "$ROOT/Sources/JXLKit" -name '*.swift' | sort)
 APP_SRC=$(find "$ROOT/Apps/JXLViewer" -name '*.swift' | sort)
 
 echo "==> Building JXLCore module + static library"
@@ -28,12 +29,21 @@ swiftc -O -parse-as-library \
     -emit-library -static -o "$BUILD/libJXLCore.a" \
     $CORE_SRC
 
+echo "==> Building JXLKit module + static library"
+# shellcheck disable=SC2086
+swiftc -O -parse-as-library \
+    -module-name JXLKit \
+    -I "$BUILD" -L "$BUILD" -lJXLCore \
+    -emit-module -emit-module-path "$BUILD/JXLKit.swiftmodule" \
+    -emit-library -static -o "$BUILD/libJXLKit.a" \
+    $KIT_SRC
+
 echo "==> Compiling JXLViewer executable"
 # shellcheck disable=SC2086
 swiftc -O \
     -module-name JXLViewer \
-    -I "$BUILD" -L "$BUILD" -lJXLCore \
-    -framework AppKit \
+    -I "$BUILD" -L "$BUILD" -lJXLKit -lJXLCore \
+    -framework AppKit -framework Metal -framework CoreGraphics \
     -o "$BUILD/JXLViewer" \
     $APP_SRC
 

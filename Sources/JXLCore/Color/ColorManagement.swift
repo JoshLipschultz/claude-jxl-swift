@@ -637,7 +637,7 @@ private func linearSRGBToTargetMatrix(
 /// The pre-bound scalar/pointer state one conversion worker needs: matrix as
 /// scalars, quantizer tables as raw pointers (no per-pixel closures, no
 /// per-pixel refcounted accesses — see the decode-performance notes).
-private struct ConvertState: @unchecked Sendable {
+struct ConvertState: @unchecked Sendable {
     let hasMatrix: Bool
     let m00, m01, m02, m10, m11, m12, m20, m21, m22: Float
     let th: UnsafePointer<Float>

@@ -108,6 +108,10 @@ struct PixelSampler: Sendable {
 
 enum DecodePipeline {
 
+    /// One GPU color converter, built lazily and shared across decodes (the
+    /// compute pipeline compiles once). nil when Metal is unavailable.
+    static let metalConverter: JXLMetalColorConverter? = JXLMetalColorConverter()
+
     /// A fast 1/8-scale preview (VarDCT DC image) for immediate display while
     /// the full decode runs; `nil` when no cheap preview exists (Modular) or
     /// anything fails — callers just wait for the full image then.
@@ -140,11 +144,23 @@ enum DecodePipeline {
                 info.colorEncoding.transferFunction == 16
                 || info.colorEncoding.transferFunction == 18
             let decoded = try JXL.decodeImage(from: data, format: isHDR ? .uint16 : .uint8)
-            let cg = try JXLImageConverter.makeCGImage(
-                from: decoded, orientation: info.orientation,
-                colorEncoding: info.colorEncoding)
+            // GPU display path: for an SDR lossy (XYB) still with default
+            // orientation, do the opsin-inverse + primaries color conversion on
+            // the GPU and hand the compositor extended-linear (EDR-native)
+            // content. Falls back to the CPU CGImage for HDR, oriented, layered,
+            // YCbCr and native-Modular frames (decodeXYBForDisplay returns nil).
+            var cg: CGImage? = nil
+            if !isHDR, info.orientation == 1, let converter = metalConverter,
+                let xyb = try? JXL.decodeXYBForDisplay(from: data)
+            {
+                cg = converter.makeLinearCGImage(from: xyb)
+            }
+            let image = try cg
+                ?? JXLImageConverter.makeCGImage(
+                    from: decoded, orientation: info.orientation,
+                    colorEncoding: info.colorEncoding)
             return DecodeResult(
-                image: cg,
+                image: image,
                 sampler: PixelSampler(decoded, orientation: info.orientation),
                 summary: summarize(info: info, image: decoded),
                 report: report)

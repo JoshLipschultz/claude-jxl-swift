@@ -552,7 +552,7 @@ final class FrameDecoder {
 
     /// Upsamples the reconstructed planes by the frame's upsampling factor and
     /// crops to the image dimensions.
-    private func upsampleXYB(_ xyb: XYBImage) throws -> XYBImage {
+    func upsampleXYB(_ xyb: XYBImage) throws -> XYBImage {
         let shift = Int(frameHeader.upsampling).trailingZeroBitCount  // 2→1, 4→2, 8→3
         let weights: [Float]
         switch shift {
