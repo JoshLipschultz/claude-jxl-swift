@@ -309,9 +309,11 @@ dcFrameSlots = dcSlots
     /// Decodes the frame to pixel planes: Modular frames in their native
     /// samples, VarDCT frames rendered to `format` (8-bit is the default; 16
     /// bits or transfer-encoded float preserve HDR precision).
-    func decodeImage(format: JXLSampleFormat = .uint8) throws -> JXLDecodedImage {
+    func decodeImage(
+        format: JXLSampleFormat = .uint8, dither: Bool = false
+    ) throws -> JXLDecodedImage {
         if frameHeader.isModular {
-            return try decodeModularImage(format: format)
+            return try decodeModularImage(format: format, dither: dither)
         }
         var xyb = try reconstructXYB()
         // Patches blend in after the restoration filters, before the color
@@ -343,7 +345,7 @@ dcFrameSlots = dcSlots
             let bits: Int
             switch format {
             case .uint8:
-                colorPlanes = ycbcrToRGB8Planes(xyb)
+                colorPlanes = dither ? ycbcrToRGB8PlanesDithered(xyb) : ycbcrToRGB8Planes(xyb)
                 bits = 8
             case .uint16:
                 colorPlanes = ycbcrToRGBWidePlanes(xyb, format: format)
@@ -371,7 +373,10 @@ dcFrameSlots = dcSlots
         let isFloat: Bool
         switch format {
         case .uint8:
-            colorPlanes = xybToRGB8Planes(xyb, spec: spec)
+            colorPlanes =
+                dither
+                ? xybToRGB8PlanesDithered(xyb, spec: spec)
+                : xybToRGB8Planes(xyb, spec: spec)
             bits = 8
             isFloat = false
         case .uint16:
@@ -552,8 +557,12 @@ dcFrameSlots = dcSlots
     /// Decodes a Modular (lossless) frame. Native-space frames return their
     /// native samples regardless of `format` (integers as values, 32-bit float
     /// as IEEE-754 bit patterns); Modular-XYB (lossy modular) frames render
-    /// through the color pipeline at the requested format.
-    func decodeModularImage(format: JXLSampleFormat = .uint8) throws -> JXLDecodedImage {
+    /// through the color pipeline at the requested format. `dither` applies
+    /// only to the Modular-XYB float pipeline — native integer samples are
+    /// exact and returned untouched.
+    func decodeModularImage(
+        format: JXLSampleFormat = .uint8, dither: Bool = false
+    ) throws -> JXLDecodedImage {
         guard frameHeader.isModular else { throw JXLError.unsupported("VarDCT frame is not Modular") }
         // Splines (16) and noise (1) are supported on Modular-XYB frames,
         // where the pipeline float planes exist; native-space Modular frames
@@ -624,7 +633,10 @@ dcFrameSlots = dcSlots
             let isFloat: Bool
             switch format {
             case .uint8:
-                colorPlanes = xybToRGB8Planes(xyb, spec: spec)
+                colorPlanes =
+                    dither
+                    ? xybToRGB8PlanesDithered(xyb, spec: spec)
+                    : xybToRGB8Planes(xyb, spec: spec)
                 bits = 8
                 isFloat = false
             case .uint16:

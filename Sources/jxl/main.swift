@@ -30,7 +30,10 @@ func usage() -> Never {
         USAGE:
           jxl info   <file.jxl>            Print dimensions and container layout
           jxl boxes  <file.jxl>            List ISOBMFF container boxes
-          jxl decode <file.jxl> <out.pnm>  Decode image (lossless or lossy) to PNM
+          jxl decode <file.jxl> <out.pnm> [16|float|nospot|dither]
+                                           Decode image (lossless or lossy) to PNM;
+                                           "dither" = blue-noise dither 8-bit output
+                                           (djxl 0.12 default)
           jxl icc    <file.jxl> [out.icc]  Extract the embedded ICC profile
           jxl vardct <file.jxl>            Preflight VarDCT global metadata
           jxl vardct-dc <file.jxl> [dump]  Decode VarDCT XYB DC image (lossy)
@@ -102,16 +105,18 @@ do {
         guard args.count >= 4 else { usage() }
         var format = JXLSampleFormat.uint8
         var renderSpots = true
+        var dither = false
         for arg in args.dropFirst(4) {
             switch arg {
             case "16": format = .uint16
             case "float": format = .float32
             case "nospot": renderSpots = false  // djxl --norender_spotcolors
+            case "dither": dither = true  // djxl 0.12 8-bit default
             default: usage()
             }
         }
         var image = try JXL.decodeImage(
-            from: bytes, format: format, renderSpotColors: renderSpots)
+            from: bytes, format: format, renderSpotColors: renderSpots, dither: dither)
         // Match djxl: EXIF orientation is applied to the output raster.
         if let info = try? JXL.readInfo(from: bytes), info.orientation != 1 {
             image = JXL.applyOrientation(image, orientation: info.orientation)

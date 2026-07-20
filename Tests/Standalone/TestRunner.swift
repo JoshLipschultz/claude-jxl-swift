@@ -92,9 +92,74 @@ struct TestRunner {
         progressiveAC()
         progressiveDC()
         wideExtraChannels()
+        ditherOutput()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
+    }
+
+    // MARK: - Blue-noise dithered 8-bit output (djxl 0.12 default)
+
+    /// `96x64_dither.jxl` is an 8-bit gradient encoded with cjxl -d 1.0
+    /// (VarDCT); `96x64_dither.ppm` is djxl v0.12's 8-bit PPM output, which
+    /// applies channel-offset blue-noise dithering by default. Decoding with
+    /// `dither: true` must match the oracle within ±1 on a tiny fraction of
+    /// samples (the residue of ~1-ulp float-pipeline differences landing on
+    /// opposite sides of a dithered rounding threshold). The flag defaults to
+    /// off, and dithering is a no-op on lossless (exact-integer) content.
+    static func ditherOutput() {
+        let dir = fixturesDir()
+        guard let jxl = try? Data(contentsOf: dir.appendingPathComponent("96x64_dither.jxl")),
+            let ppm = try? Data(contentsOf: dir.appendingPathComponent("96x64_dither.ppm")),
+            let dithered = try? JXL.decodeImage(from: [UInt8](jxl), dither: true),
+            let plain = try? JXL.decodeImage(from: [UInt8](jxl)),
+            let defaulted = try? JXL.decodeImage(from: [UInt8](jxl), dither: false)
+        else {
+            check(false, "dither fixtures decode")
+            return
+        }
+        // Oracle: raw samples start after the 3rd newline (P6\n96 64\n255\n).
+        var newlines = 0
+        var offset = 0
+        for (i, byte) in ppm.enumerated() where byte == 0x0A {
+            newlines += 1
+            if newlines == 3 {
+                offset = i + 1
+                break
+            }
+        }
+        let oracle = [UInt8](ppm[offset...])
+        let n = dithered.width * dithered.height
+        check(oracle.count == n * 3, "dither oracle size")
+        var maxDiff = 0
+        var mismatches = 0
+        for c in 0..<3 {
+            for i in 0..<n {
+                let d = abs(Int(oracle[i * 3 + c]) - Int(dithered.planes[c][i]))
+                if d != 0 { mismatches += 1 }
+                maxDiff = max(maxDiff, d)
+            }
+        }
+        check(maxDiff <= 1, "dithered output within ±1 of djxl 0.12 (max \(maxDiff))")
+        check(
+            mismatches * 100 < n * 3,
+            "dithered output mismatches <1% of samples (\(mismatches)/\(n * 3))")
+        // Dither actually does something on lossy content...
+        check(dithered.planes != plain.planes, "dither changes lossy 8-bit output")
+        // ...and the flag defaults to off (non-dithered path unchanged).
+        check(defaulted.planes == plain.planes, "dither defaults to off")
+        // Lossless (native integer modular) output is exact: dithering is a
+        // byte-identical no-op there.
+        if let ll = try? Data(contentsOf: dir.appendingPathComponent("64x48_lossless.jxl")),
+            let llPlain = try? JXL.decodeImage(from: [UInt8](ll)),
+            let llDither = try? JXL.decodeImage(from: [UInt8](ll), dither: true)
+        {
+            check(llPlain.planes == llDither.planes, "dither is a no-op on lossless")
+        } else {
+            check(false, "lossless dither no-op fixtures decode")
+        }
+        FileHandle.standardError.write(
+            Data("  [dither] blue-noise 8-bit vs djxl 0.12 (max ±1), default off, lossless no-op\n".utf8))
     }
 
     // MARK: - Lossless float32 modular (conformance: lossless_pfm)

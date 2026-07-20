@@ -326,16 +326,26 @@ func compositeFrame(
 // MARK: - Canvas -> JXLDecodedImage quantization
 
 /// Quantizes an encoded-space canvas to the requested output format.
+/// `dither` applies blue-noise dithering to the 8-bit color channels
+/// (extra channels come from native integers — dithering them is a no-op by
+/// construction, so they keep the plain round).
 func quantizeCanvas(
     _ canvas: FrameCanvas, colorChannels: Int, extraChannels: Int,
-    format: JXLSampleFormat
+    format: JXLSampleFormat, dither: Bool = false
 ) -> JXLDecodedImage {
     let n = canvas.width * canvas.height
+    let width = canvas.width
     var planes: [[Int32]] = []
-    for plane in canvas.planes {
+    for (c, plane) in canvas.planes.enumerated() {
         var out = [Int32](repeating: 0, count: n)
         switch format {
         case .uint8:
+            if dither && c < colorChannels {
+                for i in 0..<n {
+                    out[i] = Int32(ditherQuantize8(plane[i], i % width, i / width, c))
+                }
+                break
+            }
             for i in 0..<n { out[i] = Int32((clamp01(plane[i]) * 255).rounded()) }
         case .uint16:
             for i in 0..<n { out[i] = Int32((clamp01(plane[i]) * 65535).rounded()) }

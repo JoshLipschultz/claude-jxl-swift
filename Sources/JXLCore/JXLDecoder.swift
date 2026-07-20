@@ -161,10 +161,14 @@ public enum JXL {
     /// their native samples (integers as values, 32-bit float as IEEE-754 bit
     /// patterns); VarDCT (lossy) frames reconstruct to three 8-bit sRGB planes.
     /// A single regular frame is supported. `limits` bounds the allocations a
-    /// (possibly hostile) header can demand.
+    /// (possibly hostile) header can demand. `dither` (opt-in) applies djxl
+    /// 0.12's channel-offset blue-noise dithering when quantizing
+    /// float-pipeline output to 8 bits; it affects only `format == .uint8`
+    /// and never native integer Modular samples (those are exact).
     public static func decodeImage(
         from data: [UInt8], limits: JXLDecodeLimits = .default,
-        format: JXLSampleFormat = .uint8, renderSpotColors: Bool = true
+        format: JXLSampleFormat = .uint8, renderSpotColors: Bool = true,
+        dither: Bool = false
     ) throws -> JXLDecodedImage {
         let decoder = try FrameDecoder(data: data, limits: limits)
         let header = decoder.frameHeader
@@ -183,13 +187,13 @@ public enum JXL {
             && (!header.isLast || !coversCanvas || header.needsBlending)
         {
             let frames = try decodeFrames(
-                from: data, limits: limits, maxFrames: 256, format: format)
+                from: data, limits: limits, maxFrames: 256, format: format, dither: dither)
             guard let last = frames.last, last.isLast else {
                 throw JXLError.unsupported("layered still with too many layers")
             }
             image = last.image
         } else {
-            image = try decoder.decodeImage(format: format)
+            image = try decoder.decodeImage(format: format, dither: dither)
         }
         if renderSpotColors {
             image = spotColorsRendered(image, extraChannels: decoder.metadata.extraChannels)
@@ -285,16 +289,17 @@ public enum JXL {
 
     public static func decodeImage(
         from data: Data, limits: JXLDecodeLimits = .default,
-        format: JXLSampleFormat = .uint8
+        format: JXLSampleFormat = .uint8, dither: Bool = false
     ) throws -> JXLDecodedImage {
-        try decodeImage(from: [UInt8](data), limits: limits, format: format)
+        try decodeImage(from: [UInt8](data), limits: limits, format: format, dither: dither)
     }
 
     public static func decodeImage(
         contentsOf url: URL, limits: JXLDecodeLimits = .default,
-        format: JXLSampleFormat = .uint8
+        format: JXLSampleFormat = .uint8, dither: Bool = false
     ) throws -> JXLDecodedImage {
-        try decodeImage(from: try Data(contentsOf: url), limits: limits, format: format)
+        try decodeImage(
+            from: try Data(contentsOf: url), limits: limits, format: format, dither: dither)
     }
 
     /// Returns the raw bytes for one logical frame section. The section range is
@@ -355,7 +360,7 @@ public enum JXL {
     /// composited image.
     public static func decodeFrames(
         from data: [UInt8], limits: JXLDecodeLimits = .default, maxFrames: Int = 4096,
-        format: JXLSampleFormat = .uint8
+        format: JXLSampleFormat = .uint8, dither: Bool = false
     ) throws -> [Frame] {
         var frames: [Frame] = []
         var references = [FrameCanvas?](repeating: nil, count: 4)
@@ -376,7 +381,8 @@ public enum JXL {
                 Frame(
                     image: quantizeCanvas(
                         canvas, colorChannels: 3,
-                        extraChannels: metadata.extraChannelCount, format: format),
+                        extraChannels: metadata.extraChannelCount, format: format,
+                        dither: dither),
                     durationTicks: header.duration, isLast: header.isLast))
             if header.isLast { break }
         }
@@ -385,9 +391,11 @@ public enum JXL {
 
     public static func decodeFrames(
         from data: Data, limits: JXLDecodeLimits = .default, maxFrames: Int = 4096,
-        format: JXLSampleFormat = .uint8
+        format: JXLSampleFormat = .uint8, dither: Bool = false
     ) throws -> [Frame] {
-        try decodeFrames(from: [UInt8](data), limits: limits, maxFrames: maxFrames, format: format)
+        try decodeFrames(
+            from: [UInt8](data), limits: limits, maxFrames: maxFrames, format: format,
+            dither: dither)
     }
 
     /// Decodes a fast 1/8-scale preview of a VarDCT (lossy) frame — the

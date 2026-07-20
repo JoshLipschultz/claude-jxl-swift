@@ -999,6 +999,107 @@ func xybToRGB16Planes(_ img: XYBImage, spec: OutputColorSpec) -> [[Int32]] {
     return [planeR, planeG, planeB]
 }
 
+/// Dithered 8-bit XYB output (djxl 0.12 default for 8-bit): the encoded
+/// float is computed exactly as the float32 path (libjxl's transfer
+/// approximations, unclamped — the values djxl's write stage sees), then
+/// quantized with channel-offset blue-noise dithering (`ditherQuantize8`).
+/// Embedded-ICC output keeps the exact TRC (`encode`); its float path is
+/// deliberately linear, which is not what an 8-bit quantizer should see.
+func xybToRGB8PlanesDithered(_ img: XYBImage, spec: OutputColorSpec) -> [[Int32]] {
+    let width = img.width
+    let stride = img.stride
+    var planeR = [Int32](repeating: 0, count: img.width * img.height)
+    var planeG = planeR
+    var planeB = planeR
+    let state = ConvertState(spec)
+    let transfer = spec.transfer
+    let isCurve: Bool
+    if case .curve = transfer { isCurve = true } else { isCurve = false }
+    planeR.withUnsafeMutableBufferPointer { rBuf in
+    planeG.withUnsafeMutableBufferPointer { gBuf in
+    planeB.withUnsafeMutableBufferPointer { bBuf in
+    img.x.withUnsafeBufferPointer { xBuf in
+    img.y.withUnsafeBufferPointer { yBuf in
+    img.b.withUnsafeBufferPointer { bSrcBuf in
+        nonisolated(unsafe) let pr = rBuf.baseAddress!
+        nonisolated(unsafe) let pg = gBuf.baseAddress!
+        nonisolated(unsafe) let pbOut = bBuf.baseAddress!
+        nonisolated(unsafe) let px = xBuf.baseAddress!
+        nonisolated(unsafe) let py = yBuf.baseAddress!
+        nonisolated(unsafe) let pb = bSrcBuf.baseAddress!
+        DispatchQueue.concurrentPerform(iterations: img.height) { y in
+            let row = y * stride
+            let dstRow = y * width
+            @inline(__always) func enc(_ v: Float) -> Float {
+                isCurve ? transfer.encode(v) : transfer.encodeExtended(v)
+            }
+            for x in 0..<width {
+                let (lr, lg, lb) = state.linear(px[row + x], py[row + x], pb[row + x])
+                pr[dstRow + x] = Int32(ditherQuantize8(enc(lr), x, y, 0))
+                pg[dstRow + x] = Int32(ditherQuantize8(enc(lg), x, y, 1))
+                pbOut[dstRow + x] = Int32(ditherQuantize8(enc(lb), x, y, 2))
+            }
+        }
+        withExtendedLifetime(spec.quantizer) {}
+    }
+    }
+    }
+    }
+    }
+    }
+    return [planeR, planeG, planeB]
+}
+
+/// Dithered 8-bit YCbCr→RGB output: libjxl stage_ycbcr's MulAdd arithmetic
+/// (fmaf, the values djxl's write stage sees) followed by blue-noise
+/// dithered quantization.
+func ycbcrToRGB8PlanesDithered(_ img: XYBImage) -> [[Int32]] {
+    let width = img.width
+    let stride = img.stride
+    var planeR = [Int32](repeating: 0, count: img.width * img.height)
+    var planeG = planeR
+    var planeB = planeR
+    let crcr: Float = 1.402
+    let cgcb: Float = -0.114 * 1.772 / 0.587
+    let cgcr: Float = -0.299 * 1.402 / 0.587
+    let cbcb: Float = 1.772
+    let c128: Float = 128.0 / 255
+    planeR.withUnsafeMutableBufferPointer { rBuf in
+    planeG.withUnsafeMutableBufferPointer { gBuf in
+    planeB.withUnsafeMutableBufferPointer { bBuf in
+    img.x.withUnsafeBufferPointer { xBuf in
+    img.y.withUnsafeBufferPointer { yBuf in
+    img.b.withUnsafeBufferPointer { bSrcBuf in
+        nonisolated(unsafe) let pr = rBuf.baseAddress!
+        nonisolated(unsafe) let pg = gBuf.baseAddress!
+        nonisolated(unsafe) let pbOut = bBuf.baseAddress!
+        nonisolated(unsafe) let pcb = xBuf.baseAddress!
+        nonisolated(unsafe) let py = yBuf.baseAddress!
+        nonisolated(unsafe) let pcr = bSrcBuf.baseAddress!
+        DispatchQueue.concurrentPerform(iterations: img.height) { y in
+            let row = y * stride
+            let dstRow = y * width
+            for x in 0..<width {
+                let cb = pcb[row + x]
+                let cr = pcr[row + x]
+                let yy = py[row + x] + c128
+                let r = fmaf(crcr, cr, yy)
+                let g = fmaf(cgcr, cr, fmaf(cgcb, cb, yy))
+                let b = fmaf(cbcb, cb, yy)
+                pr[dstRow + x] = Int32(ditherQuantize8(r, x, y, 0))
+                pg[dstRow + x] = Int32(ditherQuantize8(g, x, y, 1))
+                pbOut[dstRow + x] = Int32(ditherQuantize8(b, x, y, 2))
+            }
+        }
+    }
+    }
+    }
+    }
+    }
+    }
+    return [planeR, planeG, planeB]
+}
+
 /// Converts XYB planes to three planar 32-bit float channels holding the
 /// transfer-encoded values (IEEE-754 bit patterns in Int32, matching the
 /// Modular float convention), row-parallel. Unlike the integer paths, values
