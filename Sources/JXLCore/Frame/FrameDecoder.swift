@@ -338,6 +338,17 @@ final class FrameDecoder {
         if frameHeader.isModular {
             return try decodeModularImage(format: format, dither: dither)
         }
+        let xyb = try renderedXYB()
+        return try convertRenderedXYB(xyb, format: format, dither: dither)
+    }
+
+    /// The frame's fully rendered pre-color-transform planes: reconstruction,
+    /// then patches → splines → upsampling → noise (libjxl render-pipeline
+    /// order) — the last stop before the color transform. Entropy stages are
+    /// cached; the reconstruction/filter tail runs per call, so callers
+    /// needing both a display image and pixels should render once and convert
+    /// twice (`decodeImageWithDisplayXYB`).
+    func renderedXYB() throws -> XYBImage {
         var xyb = try reconstructXYB()
         // Patches blend in after the restoration filters, before the color
         // transform (libjxl render pipeline order), in the frame's XYB space.
@@ -353,6 +364,14 @@ final class FrameDecoder {
         }
         // Noise lands after upsampling, right before the color transform.
         try renderNoise(into: &xyb)
+        return xyb
+    }
+
+    /// The color-transform tail of `decodeImage`: rendered XYB (or YCbCr)
+    /// planes to output pixels in `format`.
+    func convertRenderedXYB(
+        _ xyb: XYBImage, format: JXLSampleFormat, dither: Bool
+    ) throws -> JXLDecodedImage {
         // Extra channels ride the frame's modular sub-streams (8-bit native);
         // they are rescaled to match wider color formats.
         let ecPlanes = try finalizeExtraChannels().enumerated().map { e, plane in

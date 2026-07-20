@@ -144,18 +144,21 @@ enum DecodePipeline {
             let isHDR =
                 info.colorEncoding.transferFunction == 16
                 || info.colorEncoding.transferFunction == 18
-            let decoded = try JXL.decodeImage(from: data, format: isHDR ? .uint16 : .uint8)
+            // Single decode: pixels (sampler + CPU fallback) and, when the
+            // GPU fast path covers the frame, the display XYB planes — one
+            // entropy decode + one render pass for both.
+            let (decoded, displayXYB) = try JXL.decodeImageForDisplay(
+                from: data, format: isHDR ? .uint16 : .uint8)
             // GPU display path: for an SDR lossy (XYB) still with default
-            // orientation, do the opsin-inverse + primaries color conversion on
-            // the GPU and hand the compositor extended-linear (EDR-native)
-            // content. Falls back to the CPU CGImage for HDR, oriented, layered,
-            // YCbCr and native-Modular frames (decodeXYBForDisplay returns nil).
+            // orientation, do the color conversion on the GPU and hand the
+            // compositor properly tagged content. HDR, oriented, layered,
+            // YCbCr and native-Modular frames keep the CPU CGImage path.
             // JXL_CPU_COLOR=1 forces the CPU path for A/B verification.
             var cg: CGImage? = nil
             if !isHDR, info.orientation == 1,
                 ProcessInfo.processInfo.environment["JXL_CPU_COLOR"] == nil,
                 let converter = metalConverter,
-                let xyb = try? JXL.decodeXYBForDisplay(from: data)
+                let xyb = displayXYB
             {
                 cg = converter.makeLinearCGImage(from: xyb)
             }

@@ -57,24 +57,25 @@ extension FrameDecoder {
     /// transform and returns the visible-cropped XYB planes + color params, or
     /// nil for frames the GPU display path does not cover.
     func decodeXYBForDisplay() throws -> JXLXYBFloatImage? {
-        // Only a single regular XYB VarDCT frame that covers the canvas without
-        // blending: everything else (layered, animated, YCbCr, native Modular)
-        // takes the CPU path.
-        guard !frameHeader.isModular, frameHeader.colorTransform == .xyb,
-            frameHeader.frameType == .regular, frameHeader.isLast,
-            !frameHeader.customSizeOrOrigin, !frameHeader.needsBlending
-        else { return nil }
+        guard displayFastPathApplies else { return nil }
+        return try displayXYBImage(from: renderedXYB())
+    }
 
-        var xyb = try reconstructXYB()
-        if let patches = patchDictionary, !patches.isEmpty {
-            try renderPatches(patches, into: &xyb) { try self.referenceXYBFrame($0) }
-        }
-        try renderSplines(into: &xyb)
-        if frameHeader.upsampling > 1 {
-            xyb = try upsampleXYB(xyb)
-        }
-        try renderNoise(into: &xyb)
+    /// Whether the GPU display fast path covers this frame: a single regular
+    /// XYB VarDCT frame that covers the canvas without blending and without
+    /// spot channels (the GPU path does not render spot colors; showing them
+    /// unrendered would diverge from the CPU path). Everything else (layered,
+    /// animated, YCbCr, native Modular) takes the CPU path.
+    var displayFastPathApplies: Bool {
+        !frameHeader.isModular && frameHeader.colorTransform == .xyb
+            && frameHeader.frameType == .regular && frameHeader.isLast
+            && !frameHeader.customSizeOrOrigin && !frameHeader.needsBlending
+            && !metadata.extraChannels.contains { $0.type == 2 }
+    }
 
+    /// Builds the display image from already-rendered pre-color-transform
+    /// planes (crop to visible, normalized alpha, shader color params).
+    func displayXYBImage(from xyb: XYBImage) throws -> JXLXYBFloatImage? {
         let spec = try makeOutputColorSpec(
             metadata.colorEncoding, toneMapping: metadata.toneMapping,
             customOpsin: customOpsin, icc: iccOutput)
@@ -201,5 +202,40 @@ extension JXL {
         from data: Data, limits: JXLDecodeLimits = .default
     ) throws -> JXLXYBFloatImage? {
         try decodeXYBForDisplay(from: [UInt8](data), limits: limits)
+    }
+
+    /// Single-decode combined API for viewers: the decoded pixels (identical
+    /// to `decodeImage`) plus, when the GPU display fast path covers the
+    /// frame, the display XYB planes — both produced from ONE entropy decode
+    /// and ONE render-pipeline pass (the separate `decodeXYBForDisplay` call
+    /// repeats the whole decode).
+    public static func decodeImageForDisplay(
+        from data: [UInt8], limits: JXLDecodeLimits = .default,
+        format: JXLSampleFormat = .uint8, renderSpotColors: Bool = true,
+        dither: Bool = false
+    ) throws -> (image: JXLDecodedImage, displayXYB: JXLXYBFloatImage?) {
+        let decoder = try FrameDecoder(data: data, limits: limits)
+        guard decoder.displayFastPathApplies else {
+            // Layered stills / animations / Modular / YCbCr / spot files:
+            // the standard route (incl. compositing and spot rendering).
+            let image = try decodeImage(
+                from: data, limits: limits, format: format,
+                renderSpotColors: renderSpotColors, dither: dither)
+            return (image, nil)
+        }
+        let xyb = try decoder.renderedXYB()
+        let display = try decoder.displayXYBImage(from: xyb)
+        let image = try decoder.convertRenderedXYB(xyb, format: format, dither: dither)
+        return (image, display)
+    }
+
+    public static func decodeImageForDisplay(
+        from data: Data, limits: JXLDecodeLimits = .default,
+        format: JXLSampleFormat = .uint8, renderSpotColors: Bool = true,
+        dither: Bool = false
+    ) throws -> (image: JXLDecodedImage, displayXYB: JXLXYBFloatImage?) {
+        try decodeImageForDisplay(
+            from: [UInt8](data), limits: limits, format: format,
+            renderSpotColors: renderSpotColors, dither: dither)
     }
 }
