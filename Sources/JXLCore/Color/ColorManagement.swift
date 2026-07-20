@@ -44,6 +44,82 @@ func srgbEncode(_ d: Float) -> Float {
 
 private let kOpsinBiasCbrt = cbrtf(kOpsinBias)
 
+
+// MARK: - libjxl fast-math ports (fast_math-inl.h, transfer_functions-inl.h)
+//
+// djxl's float output goes through these approximations, not exact powf; a
+// conformant-to-the-reference decoder must reproduce them (the conformance
+// references were produced by libjxl). Scalar ports with fmaf mirroring the
+// SIMD MulAdd structure.
+
+/// FastLog2f: 2,2 rational approximation of log2 after range reduction.
+@inline(__always)
+func fastLog2f(_ x: Float) -> Float {
+    let xBits = Int32(bitPattern: x.bitPattern)
+    let expBits = xBits &- 0x3f2a_aaab  // 2/3
+    let expShifted = expBits >> 23
+    let mantissa = Float(bitPattern: UInt32(bitPattern: xBits &- (expShifted << 23)))
+    let expVal = Float(expShifted)
+    let m = mantissa - 1.0
+    var yp: Float = 7.4245873327820566e-01
+    yp = fmaf(yp, m, 1.4287160470083755e+00)
+    yp = fmaf(yp, m, -1.8503833400518310e-06)
+    var yq: Float = 1.7409343003366853e-01
+    yq = fmaf(yq, m, 1.0096718572241148e+00)
+    yq = fmaf(yq, m, 9.9032814277590719e-01)
+    return yp / yq + expVal
+}
+
+/// FastPow2f: max relative error ~3e-7.
+@inline(__always)
+func fastPow2f(_ x: Float) -> Float {
+    let floorx = x.rounded(.down)
+    let exp = Float(bitPattern: UInt32(bitPattern: (Int32(floorx) &+ 127) << 23))
+    let frac = x - floorx
+    var num = frac + 1.01749063e+01
+    num = fmaf(num, frac, 4.88687798e+01)
+    num = fmaf(num, frac, 9.85506591e+01)
+    num *= exp
+    var den = fmaf(frac, 2.10242958e-01, -2.22328856e-02)
+    den = fmaf(den, frac, -1.94414990e+01)
+    den = fmaf(den, frac, 9.85506633e+01)
+    return num / den
+}
+
+/// FastPowf: max relative error ~3e-5.
+@inline(__always)
+func fastPowf(_ base: Float, _ exponent: Float) -> Float {
+    fastPow2f(fastLog2f(base) * exponent)
+}
+
+/// TF_SRGB::EncodedFromDisplay — sign-mirrored rational polynomial in sqrt(x)
+/// (error ~5e-7); negatives keep their sign, the branch tests |x|.
+@inline(__always)
+func srgbEncodedFromDisplay(_ x: Float) -> Float {
+    let v = abs(x)
+    let sq = v.squareRoot()
+    var num: Float = 7.352629620e-01
+    num = fmaf(num, sq, 1.474205315e+00)
+    num = fmaf(num, sq, 3.903842876e-01)
+    num = fmaf(num, sq, 5.287254571e-03)
+    num = fmaf(num, sq, -5.135152395e-04)
+    var den: Float = 2.424867759e-02
+    den = fmaf(den, sq, 9.258482155e-01)
+    den = fmaf(den, sq, 1.340816930e+00)
+    den = fmaf(den, sq, 3.036675394e-01)
+    den = fmaf(den, sq, 1.004519624e-02)
+    let magnitude = v > 0.0031308 ? num / den : 12.92 * v
+    return x < 0 ? -magnitude : magnitude
+}
+
+/// TF_709::EncodedFromDisplay — libjxl's rounded constants (1.099/0.099/0.018,
+/// not the extended-precision variants) and FastPowf; the branch tests the raw
+/// value, so negatives take the 4.5x linear extension.
+@inline(__always)
+func bt709EncodedFromDisplay(_ x: Float) -> Float {
+    x <= 0.018 ? 4.5 * x : fmaf(1.099, fastPowf(x, 0.45), -0.099)
+}
+
 // MARK: - Output transfer functions
 
 // SMPTE ST 2084 (PQ) constants (libjxl TF_PQ_Base).
@@ -90,11 +166,12 @@ enum OutputTransfer {
         case .linear:
             return v
         case .srgb:
+            // Exact curve here: the quantizers need a monotone encode (the
+            // libjxl rational approximation wobbles by an ulp); the float
+            // path (encodeExtended) uses the approximations for djxl parity.
             return srgbEncode(v)
         case .bt709:
-            return v < 0.018053968510807
-                ? 4.5 * v
-                : 1.099296826809442 * powf(v, 0.45) - 0.099296826809442
+            return v < 0.018 ? 4.5 * v : 1.099 * powf(v, 0.45) - 0.099
         case .dci:
             return powf(v, 1.0 / 2.6)
         case .gamma(let g):
@@ -125,16 +202,9 @@ enum OutputTransfer {
         case .pq, .hlgOETF:
             return encode(d)
         case .srgb:
-            let v = abs(d)
-            let e = v <= 0.0031308 ? 12.92 * v : 1.055 * powf(v, 1.0 / 2.4) - 0.055
-            return d < 0 ? -e : e
+            return srgbEncodedFromDisplay(d)
         case .bt709:
-            let v = abs(d)
-            let e =
-                v < 0.018053968510807
-                ? 4.5 * v
-                : 1.099296826809442 * powf(v, 0.45) - 0.099296826809442
-            return d < 0 ? -e : e
+            return bt709EncodedFromDisplay(d)
         case .dci:
             let e = powf(abs(d), 1.0 / 2.6)
             return d < 0 ? -e : e
@@ -157,9 +227,7 @@ enum OutputTransfer {
         case .srgb:
             return s <= 0.0031308 * 12.92 ? s / 12.92 : pow((s + 0.055) / 1.055, 2.4)
         case .bt709:
-            return s < 4.5 * 0.018053968510807
-                ? s / 4.5
-                : pow((s + 0.099296826809442) / 1.099296826809442, 1.0 / 0.45)
+            return s < 0.081 ? s / 4.5 : pow((s + 0.099) / 1.099, 1.0 / 0.45)
         case .dci:
             return pow(s, 2.6)
         case .gamma(let g):

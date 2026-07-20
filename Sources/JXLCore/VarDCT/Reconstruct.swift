@@ -39,7 +39,7 @@ private func adjustQuantBias(_ q: Int32, _ bias: Float, _ numerator: Float) -> F
 /// the edge (N/S/E/W) weight, `weight2` the corner weight; the center is 1,
 /// then all are normalized to sum to 1. Output rows depend only on the input
 /// snapshot, so rows run concurrently.
-private func gaborish(_ p: inout [Float], w: Int, h: Int, weight1: Float, weight2: Float) {
+private func gaborish(_ p: inout [Float], w: Int, h: Int, stride: Int, weight1: Float, weight2: Float) {
     let div = 1.0 + 4.0 * (weight1 + weight2)
     let c0 = 1.0 / div
     let c1 = weight1 / div
@@ -54,14 +54,14 @@ private func gaborish(_ p: inout [Float], w: Int, h: Int, weight1: Float, weight
                     // Mirror: -1 -> 0, w -> w-1 (edge-reflecting, libjxl Mirror).
                     let mx = x < 0 ? 0 : (x >= w ? w - 1 : x)
                     let my = yy < 0 ? 0 : (yy >= h ? h - 1 : yy)
-                    return src[my * w + mx]
+                    return src[my * stride + mx]
                 }
                 for x in 0..<w {
-                    let center = src[y * w + x]
+                    let center = src[y * stride + x]
                     let side = at(x - 1, y) + at(x + 1, y) + at(x, y - 1) + at(x, y + 1)
                     let corner =
                         at(x - 1, y - 1) + at(x + 1, y - 1) + at(x - 1, y + 1) + at(x + 1, y + 1)
-                    dst[y * w + x] = center * c0 + side * c1 + corner * c2
+                    dst[y * stride + x] = center * c0 + side * c1 + corner * c2
                 }
             }
         }
@@ -106,7 +106,7 @@ private func computeEPFSigma(meta: VarDCTACMetadata, quantScale: Float) -> [Floa
 /// Output rows depend only on the input snapshots, so rows run concurrently;
 /// the neighborhood SAD is fully scalarized (no per-pixel temporaries).
 private func epf1(
-    x: inout [Float], y: inout [Float], b: inout [Float], w: Int, h: Int,
+    x: inout [Float], y: inout [Float], b: inout [Float], w: Int, h: Int, stride: Int,
     sigmaInv: [Float], bw: Int
 ) {
     let sxCopy = x, syCopy = y, sbCopy = b
@@ -133,7 +133,7 @@ private func epf1(
                 return max(0, min(n - 1, v))
             }
             @inline(__always) func px(_ p: UnsafePointer<Float>, _ xx: Int, _ yy: Int) -> Float {
-                p[mir(yy, h) * w + mir(xx, w)]
+                p[mir(yy, h) * stride + mir(xx, w)]
             }
             // Plus-neighborhood SAD between (cx,cy) and (cx+dx,cy+dy) on one plane.
             @inline(__always) func sadPlane(
@@ -164,9 +164,9 @@ private func epf1(
                 let invSigma = rowSigma * sm
 
                 var wsum: Float = 1
-                var accX = sx[cy * w + cx]
-                var accY = sy[cy * w + cx]
-                var accB = sb[cy * w + cx]
+                var accX = sx[cy * stride + cx]
+                var accY = sy[cy * stride + cx]
+                var accB = sb[cy * stride + cx]
                 @inline(__always) func tap(_ dx: Int, _ dy: Int) {
                     let weight = max(0, 1 + sad(cx, dx, dy) * invSigma)
                     wsum += weight
@@ -179,9 +179,9 @@ private func epf1(
                 tap(1, 0)
                 tap(0, 1)
                 let invW = 1.0 / wsum
-                dx_[cy * w + cx] = accX * invW
-                dy_[cy * w + cx] = accY * invW
-                db_[cy * w + cx] = accB * invW
+                dx_[cy * stride + cx] = accX * invW
+                dy_[cy * stride + cx] = accY * invW
+                db_[cy * stride + cx] = accB * invW
             }
         }
     }
@@ -197,7 +197,7 @@ private func epf1(
 /// weighted by a 3x3 plus-shaped SAD — a 7x7 filter (libjxl EPF0Stage). Sigma
 /// is scaled by epf_pass0_sigma_scale.
 private func epf0(
-    x: inout [Float], y: inout [Float], b: inout [Float], w: Int, h: Int,
+    x: inout [Float], y: inout [Float], b: inout [Float], w: Int, h: Int, stride: Int,
     sigmaInv: [Float], bw: Int
 ) {
     let sxCopy = x, syCopy = y, sbCopy = b
@@ -224,7 +224,7 @@ private func epf0(
                 return max(0, min(n - 1, v))
             }
             @inline(__always) func px(_ p: UnsafePointer<Float>, _ xx: Int, _ yy: Int) -> Float {
-                p[mir(yy, h) * w + mir(xx, w)]
+                p[mir(yy, h) * stride + mir(xx, w)]
             }
             @inline(__always) func sadPlane(
                 _ p: UnsafePointer<Float>, _ cx: Int, _ dx: Int, _ dy: Int
@@ -254,9 +254,9 @@ private func epf0(
                 let invSigma = rowSigma * sm
 
                 var wsum: Float = 1
-                var accX = sx[cy * w + cx]
-                var accY = sy[cy * w + cx]
-                var accB = sb[cy * w + cx]
+                var accX = sx[cy * stride + cx]
+                var accY = sy[cy * stride + cx]
+                var accB = sb[cy * stride + cx]
                 @inline(__always) func tap(_ dx: Int, _ dy: Int) {
                     let weight = max(0, 1 + sad(cx, dx, dy) * invSigma)
                     wsum += weight
@@ -278,9 +278,9 @@ private func epf0(
                 tap(1, 1)
                 tap(0, 2)
                 let invW = 1.0 / wsum
-                dx_[cy * w + cx] = accX * invW
-                dy_[cy * w + cx] = accY * invW
-                db_[cy * w + cx] = accB * invW
+                dx_[cy * stride + cx] = accX * invW
+                dy_[cy * stride + cx] = accY * invW
+                db_[cy * stride + cx] = accB * invW
             }
         }
     }
@@ -296,7 +296,7 @@ private func epf0(
 /// its single-pixel channel-scaled difference from the center (libjxl
 /// EPF2Stage). Sigma is scaled by epf_pass2_sigma_scale.
 private func epf2(
-    x: inout [Float], y: inout [Float], b: inout [Float], w: Int, h: Int,
+    x: inout [Float], y: inout [Float], b: inout [Float], w: Int, h: Int, stride: Int,
     sigmaInv: [Float], bw: Int
 ) {
     let sxCopy = x, syCopy = y, sbCopy = b
@@ -323,7 +323,7 @@ private func epf2(
                 return max(0, min(n - 1, v))
             }
             @inline(__always) func px(_ p: UnsafePointer<Float>, _ xx: Int, _ yy: Int) -> Float {
-                p[mir(yy, h) * w + mir(xx, w)]
+                p[mir(yy, h) * stride + mir(xx, w)]
             }
 
             let borderRow = (cy % 8 == 0) || (cy % 8 == 7)
@@ -336,9 +336,9 @@ private func epf2(
                 let sm = onEdge ? base * kEpfBorderSadMul : base
                 let invSigma = rowSigma * sm
 
-                let cxv = sx[cy * w + cx]
-                let cyv = sy[cy * w + cx]
-                let cbv = sb[cy * w + cx]
+                let cxv = sx[cy * stride + cx]
+                let cyv = sy[cy * stride + cx]
+                let cbv = sb[cy * stride + cx]
                 var wsum: Float = 1
                 var accX = cxv
                 var accY = cyv
@@ -362,9 +362,9 @@ private func epf2(
                 tap(1, 0)
                 tap(0, 1)
                 let invW = 1.0 / wsum
-                dx_[cy * w + cx] = accX * invW
-                dy_[cy * w + cx] = accY * invW
-                db_[cy * w + cx] = accB * invW
+                dx_[cy * stride + cx] = accX * invW
+                dy_[cy * stride + cx] = accY * invW
+                db_[cy * stride + cx] = accB * invW
             }
         }
     }
@@ -588,9 +588,11 @@ extension FrameDecoder {
         // planes with 1-pixel mirror border.
         if frameHeader.loopFilterGab {
             let fh = frameHeader
-            gaborish(&planeX, w: rowStride, h: paddedH, weight1: fh.gabXWeight1, weight2: fh.gabXWeight2)
-            gaborish(&planeY, w: rowStride, h: paddedH, weight1: fh.gabYWeight1, weight2: fh.gabYWeight2)
-            gaborish(&planeB, w: rowStride, h: paddedH, weight1: fh.gabBWeight1, weight2: fh.gabBWeight2)
+            // Filters mirror at the *visible* image edge (libjxl render
+            // pipeline), not the block padding.
+            gaborish(&planeX, w: dim.xsize, h: dim.ysize, stride: rowStride, weight1: fh.gabXWeight1, weight2: fh.gabXWeight2)
+            gaborish(&planeY, w: dim.xsize, h: dim.ysize, stride: rowStride, weight1: fh.gabYWeight1, weight2: fh.gabYWeight2)
+            gaborish(&planeB, w: dim.xsize, h: dim.ysize, stride: rowStride, weight1: fh.gabBWeight1, weight2: fh.gabBWeight2)
         }
         // EPF (edge-preserving filter). Pass order per libjxl dec_cache.cc:
         // stage 0 when iters >= 3, stage 1 when iters >= 1, stage 2 when
@@ -600,16 +602,16 @@ extension FrameDecoder {
             let sigmaInv = computeEPFSigma(meta: meta, quantScale: quantScale)
             if frameHeader.loopFilterEpfIters >= 3 {
                 epf0(
-                    x: &planeX, y: &planeY, b: &planeB, w: rowStride, h: paddedH,
-                    sigmaInv: sigmaInv, bw: dim.xsizeBlocks)
+                    x: &planeX, y: &planeY, b: &planeB, w: dim.xsize, h: dim.ysize,
+                    stride: rowStride, sigmaInv: sigmaInv, bw: dim.xsizeBlocks)
             }
             epf1(
-                x: &planeX, y: &planeY, b: &planeB, w: rowStride, h: paddedH,
-                sigmaInv: sigmaInv, bw: dim.xsizeBlocks)
+                x: &planeX, y: &planeY, b: &planeB, w: dim.xsize, h: dim.ysize,
+                stride: rowStride, sigmaInv: sigmaInv, bw: dim.xsizeBlocks)
             if frameHeader.loopFilterEpfIters >= 2 {
                 epf2(
-                    x: &planeX, y: &planeY, b: &planeB, w: rowStride, h: paddedH,
-                    sigmaInv: sigmaInv, bw: dim.xsizeBlocks)
+                    x: &planeX, y: &planeY, b: &planeB, w: dim.xsize, h: dim.ysize,
+                    stride: rowStride, sigmaInv: sigmaInv, bw: dim.xsizeBlocks)
             }
         }
 
@@ -642,9 +644,9 @@ func modularRestorationFilters(
     header fh: FrameHeader
 ) {
     if fh.loopFilterGab {
-        gaborish(&x, w: w, h: h, weight1: fh.gabXWeight1, weight2: fh.gabXWeight2)
-        gaborish(&y, w: w, h: h, weight1: fh.gabYWeight1, weight2: fh.gabYWeight2)
-        gaborish(&b, w: w, h: h, weight1: fh.gabBWeight1, weight2: fh.gabBWeight2)
+        gaborish(&x, w: w, h: h, stride: w, weight1: fh.gabXWeight1, weight2: fh.gabXWeight2)
+        gaborish(&y, w: w, h: h, stride: w, weight1: fh.gabYWeight1, weight2: fh.gabYWeight2)
+        gaborish(&b, w: w, h: h, stride: w, weight1: fh.gabBWeight1, weight2: fh.gabBWeight2)
     }
     if fh.loopFilterEpfIters >= 1 {
         let bw = (w + 7) / 8
@@ -653,11 +655,11 @@ func modularRestorationFilters(
         if !invSigma.isFinite { invSigma = kInvSigmaNum }
         let sigmaInv = [Float](repeating: invSigma, count: bw * bh)
         if fh.loopFilterEpfIters >= 3 {
-            epf0(x: &x, y: &y, b: &b, w: w, h: h, sigmaInv: sigmaInv, bw: bw)
+            epf0(x: &x, y: &y, b: &b, w: w, h: h, stride: w, sigmaInv: sigmaInv, bw: bw)
         }
-        epf1(x: &x, y: &y, b: &b, w: w, h: h, sigmaInv: sigmaInv, bw: bw)
+        epf1(x: &x, y: &y, b: &b, w: w, h: h, stride: w, sigmaInv: sigmaInv, bw: bw)
         if fh.loopFilterEpfIters >= 2 {
-            epf2(x: &x, y: &y, b: &b, w: w, h: h, sigmaInv: sigmaInv, bw: bw)
+            epf2(x: &x, y: &y, b: &b, w: w, h: h, stride: w, sigmaInv: sigmaInv, bw: bw)
         }
     }
 }
