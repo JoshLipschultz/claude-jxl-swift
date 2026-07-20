@@ -1,84 +1,117 @@
 # JXL — a pure-Swift JPEG XL decoder
 
 A from-scratch implementation of a [JPEG XL](https://jpeg.org/jpegxl/)
-(ISO/IEC 18181) decoder in Swift, for use in macOS applications and a Quick Look
-extension. No dependency on libjxl; libjxl is used only as a test oracle.
+(ISO/IEC 18181) decoder in Swift: a dependency-free core library
+(`JXLCore`), a CoreGraphics bridge (`JXLKit`), a command-line tool (`jxl`),
+a macOS viewer app, and a Quick Look extension. libjxl is not linked —
+it serves only as the test oracle (`cjxl`/`djxl` compare runs).
 
-> **Status: both pipelines decode pixels.** Container → headers → entropy
-> (ANS / prefix / LZ77) → frame/TOC, then **Modular (lossless)** — byte-exact
-> vs `djxl` across the fixture corpus (gray/RGB/RGBA, 8/16-bit/float32, RCT +
-> Palette, single + multi-group) — and **VarDCT (lossy)** — all transforms up
-> to 32×32 with Gaborish + EPF1, ~54 dB vs `djxl` — both behind one
-> `JXL.decodeImage`, driven by a single-parse `FrameDecoder` with decode
-> limits and a mutation-fuzz harness. Embedded **ICC profiles** decode
-> byte-exact vs `djxl` (`JXL.readICCProfile`). Squeeze, progressive, DCT64+,
-> the rest of the color pipeline (16-bit/float lossy output, CMS), and
-> animation remain. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and
-> milestone status.
+> **Status: feature-complete for real-world files.** Both coding modes decode
+> end to end — **Modular** (lossless and lossy, byte-exact vs `djxl` including
+> float32 bit patterns) and **VarDCT** (all transform sizes, Gaborish + EPF,
+> chroma-from-luma, adaptive quantization) — plus animation with frame
+> blending, progressive (multi-pass AC and LF frames), patches, splines, noise
+> synthesis, delta palette, squeeze, extra channels at any depth/upsampling,
+> JPEG bitstream reconstruction (byte-exact), and a color pipeline covering
+> 8/16-bit/float output, PQ/HLG HDR, custom opsin matrices, and CMS output to
+> embedded matrix+TRC ICC profiles. On the libjxl conformance corpus, every
+> testcase whose pixels we decode meets its official error tolerance, and float
+> output matches libjxl's own fast-math transfer functions to >120 dB PSNR.
+> See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and
+> [docs/jxl-primer.md](docs/jxl-primer.md) for a format primer.
 
-## What works today
+Not yet supported: wide (16-bit/float) pixel output for JPEG-transcode
+(YCbCr) frames — their JPEG reconstruction is byte-exact, and 8-bit pixel
+decode works; rendering spot-color channels onto the color image; nested DC
+frames (`progressive_dc=2`). These fail cleanly with a descriptive error.
+
+## Command-line tool
 
 ```
-$ jxl info  image.jxl                 # dimensions + metadata + container layout
+$ jxl info image.jxl                    # dimensions + metadata + color encoding
 640 x 480  8-bit RGB  (bare codestream)
 color: RGB white_point=1 primaries=1 tf=13 intent=1
 
-$ jxl boxes image.jxl                 # ISOBMFF box listing
-'JXL '  12 bytes  (payload 4)
-'ftyp'  20 bytes  (payload 12)
-'jxlc'  7952 bytes  (payload 7944)
-
-$ jxl decode image.jxl out.ppm        # decode (lossless or lossy) -> PGM/PPM
-decoded 640 x 480 -> out.ppm
+$ jxl boxes image.jxl                   # ISOBMFF container box listing
+$ jxl frames anim.jxl out               # decode animation frames -> out_<i>.ppm
+$ jxl decode image.jxl out.ppm          # decode to PGM/PPM (or .pam with alpha)
+$ jxl decode image.jxl out.ppm 16       # ... at 16-bit, or `float` -> PFM
+$ jxl tojpeg recon.jxl out.jpg          # byte-exact JPEG reconstruction
+$ jxl icc image.jxl out.icc             # extract the embedded ICC profile
+$ jxl bench image.jxl                   # decode benchmark
 ```
 
-Library:
+(plus `vardct*` debug subcommands that dump intermediate VarDCT state.)
+
+## Library
 
 ```swift
 import JXLCore
 
-let info = try JXL.readInfo(contentsOf: url)        // metadata only
-let image = try JXL.decodeImage(contentsOf: url)    // pixel planes (lossless native, lossy sRGB8)
-print(image.width, image.height, image.colorChannels, image.planes.count)
+let info  = try JXL.readInfo(contentsOf: url)       // metadata only, no pixel work
+let image = try JXL.decodeImage(contentsOf: url)    // pixel planes (uint8/uint16/float32)
+let anim  = try JXL.decodeFrames(contentsOf: url)   // composited animation frames + durations
+let jpeg  = try JXL.reconstructJPEG(contentsOf: url) // byte-exact JPEG, when jbrd is present
+let icc   = try JXL.readICCProfile(contentsOf: url)
 ```
+
+`JXLKit` wraps the same decode paths in `CGImage` construction — 8- and
+16-bit-per-channel images tagged with the matching color space (Display P3,
+BT.2020, PQ/HLG for HDR, or the embedded ICC profile), with EXIF orientation
+baked in.
+
+## Apps
+
+- `Apps/JXLViewer` — a macOS viewer (window/zoom/inspector, animation
+  playback honoring per-frame durations, HDR display via EDR).
+  Build with `sh Scripts/build-viewer.sh`.
+- `Apps/JXLQuickLook` — Quick Look thumbnail extension
+  (generate the Xcode project from `project.yml` with xcodegen).
 
 ## Building & testing
 
-The macOS 26/27 Command Line Tools ship a **broken SwiftPM build service**
-(`swift build`/`swift test` crash in dyld before reaching the compiler). Until
-full Xcode is installed, build with the provided scripts, which call `swiftc`
-directly:
+Standard SwiftPM (requires full Xcode; on macOS 26/27 the bare Command Line
+Tools ship a broken SwiftPM build service):
 
 ```
-sh Scripts/build.sh        # builds .build/manual/jxl
-sh Scripts/run-tests.sh    # compiles + runs the standalone test suite
-sh Scripts/fuzz.sh [n]     # mutation-fuzzes the decoder over the fixtures
-```
-
-Once full Xcode is present, the standard flow works against `Package.swift`:
-
-```
-swift build
+swift build -c release
 swift test
 ```
 
-Both test paths cover the same ground; `Tests/Standalone/TestRunner.swift` is the
-dependency-free runner used now, and `Tests/JXLCoreTests/*` is the XCTest mirror
-for `swift test`.
+The `swiftc`-direct scripts remain the fast day-to-day loop:
 
-## Test fixtures
+```
+sh Scripts/build.sh        # builds .build/manual/jxl
+sh Scripts/run-tests.sh    # compiles + runs the standalone suite (~18,000 tests)
+sh Scripts/fuzz.sh [n]     # mutation-fuzzes the decoder over the fixtures
+sh Scripts/gen-bench.sh    # regenerates the 6-megapixel benchmark images
+```
 
-`Tests/JXLCoreTests/Fixtures/*.jxl` are generated by libjxl's `cjxl` from PPMs of
-known dimensions, in lossless / lossy / container variants. Dimensions are also
-encoded in the filenames, so structural tests pass without any oracle present.
+Both test paths cover the same ground; `Tests/Standalone/TestRunner.swift` is
+the dependency-free runner, and `Tests/JXLCoreTests/*` is the XCTest mirror.
+
+## Testing methodology
+
+Every feature is validated against libjxl (`cjxl`/`djxl` v0.11.x) as an
+oracle: lossless decodes must be **byte-exact** (including float32 bit
+patterns), lossy decodes must meet PSNR thresholds against `djxl`'s output,
+and JPEG reconstruction must be byte-exact. Small generated fixtures
+(`Tests/JXLCoreTests/Fixtures/*.jxl`, with expected rasters committed
+alongside) keep the suite self-contained — no oracle binaries are needed to
+run the tests. Bitstream-touching changes additionally get a mutation-fuzz
+round and a decode-benchmark regression check (~65 ms lossy / ~170 ms
+lossless per 6-megapixel image on Apple Silicon, single image,
+`DispatchQueue.concurrentPerform` across groups).
 
 ## Repository layout
 
 - `Sources/JXLCore` — the decoder library (see [ARCHITECTURE.md](ARCHITECTURE.md))
+- `Sources/JXLKit` — CGImage/color-space bridge for Apple platforms
 - `Sources/jxl` — the `jxl` command-line tool
-- `Apps/` — Quick Look extension source, to be added to an Xcode project (M10)
-- `Scripts/` — `swiftc`-based build/test scripts
+- `Apps/` — viewer app + Quick Look extension
+- `Scripts/` — build/test/fuzz/bench scripts
 - `Tests/` — XCTest suite + standalone runner + fixtures
+- `docs/` — [JPEG XL primer](docs/jxl-primer.md), [conformance report](docs/conformance-report.md)
 
 ## License & provenance
 
