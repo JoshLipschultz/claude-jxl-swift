@@ -1,5 +1,15 @@
 # JPEG XL conformance scorecard — pure-Swift decoder
 
+## Update (2026-07-19, later): 24 / 26 after float animation frames
+
+`jxl frames <in> <prefix> float` now emits per-frame PFMs (decodeFrames
+already quantized to any format; only the CLI was 8-bit). Both animation
+stragglers flip to PASS against the unclamped float references:
+animation_icos4d worst-frame 38.5 → **127.0 dB** (tol 80),
+animation_spline 74.8 → **133.9 dB** (tol 80); newtons_cradle stays at 146.3.
+Remaining non-passes: patches (skcms TRC-fit residual, deliberate) and
+patches_lossless (unsupported frame shape).
+
 ## Full re-sweep (2026-07-19, final): 22 / 26 official PASS
 
 All 26 full-resolution testcases re-run after the float-parity round plus three

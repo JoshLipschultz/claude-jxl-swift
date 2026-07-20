@@ -130,10 +130,20 @@ do {
 
     case "frames":
         guard args.count >= 4 else { usage() }
-        let frames = try JXL.decodeFrames(from: bytes)
+        var frameFormat = JXLSampleFormat.uint8
+        if args.count >= 5 {
+            switch args[4] {
+            case "16": frameFormat = .uint16
+            case "float": frameFormat = .float32
+            default: usage()
+            }
+        }
+        let frames = try JXL.decodeFrames(from: bytes, format: frameFormat)
         for (i, frame) in frames.enumerated() {
-            let path = "\(args[3])_\(i).ppm"
-            try Data(encodePNM(frame.image)).write(to: URL(fileURLWithPath: path))
+            let isFloat = frame.image.isFloat
+            let path = "\(args[3])_\(i).\(isFloat ? "pfm" : "ppm")"
+            let out = isFloat ? encodePFM(frame.image) : encodePNM(frame.image)
+            try Data(out).write(to: URL(fileURLWithPath: path))
             print("frame \(i): \(frame.image.width) x \(frame.image.height)  duration \(frame.durationTicks) ticks -> \(path)")
         }
 
