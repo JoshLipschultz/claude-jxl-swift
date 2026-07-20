@@ -23,9 +23,9 @@ it serves only as the test oracle (`cjxl`/`djxl` compare runs).
 On the official conformance corpus: **25 of 26 testcases** meet their official
 tolerances (6 bit-exact); the one exception embeds a third-party CMS
 approximation in the reference itself — see
-[docs/conformance-report.md](docs/conformance-report.md). The only
-unsupported feature left is nested DC frames (`progressive_dc=2`), which
-fails cleanly with a descriptive error.
+[docs/conformance-report.md](docs/conformance-report.md). Every JPEG XL
+codestream feature the corpus exercises now decodes, including nested DC
+frames (`progressive_dc=2`) and custom parametric dequantization matrices.
 
 ## Command-line tool
 

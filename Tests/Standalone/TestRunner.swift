@@ -86,6 +86,7 @@ struct TestRunner {
         spotColorRendering()
         jxlpOutOfOrder()
         modularPatches()
+        nestedDCFrames()
         orientationBaking()
         deltaPalette()
         iccOutput()
@@ -231,6 +232,42 @@ struct TestRunner {
         eq(mismatches, 0, "\(base) float bit-exact vs djxl PFM")
         FileHandle.standardError.write(
             Data("  [int-modular-float] unclamped float output bit-exact vs djxl\n".utf8))
+    }
+
+    /// `128x128_pdc2.jxl` (cjxl -d 1.5 --progressive_dc=2): a VarDCT frame
+    /// whose DC comes from a level-1 DC frame that *itself* uses a level-2 DC
+    /// frame (a two-deep kUseDcFrame chain, DCLEVELS=[2,1]). The intermediate
+    /// DC frame is VarDCT and uses custom parametric dequant matrices (mode 6),
+    /// so this also exercises the custom-quant-table decode. Oracle is djxl's
+    /// float PFM; lossy, so compared at PSNR.
+    static func nestedDCFrames() {
+        let dir = fixturesDir()
+        let base = "128x128_pdc2"
+        guard let jxl = try? Data(contentsOf: dir.appendingPathComponent(base + ".jxl")),
+            let pfm = try? Data(contentsOf: dir.appendingPathComponent(base + ".pfm")),
+            let oracle = parsePFM(pfm),
+            let img = try? JXL.decodeImage(from: [UInt8](jxl), format: .float32)
+        else {
+            check(false, "\(base) fixtures decode")
+            return
+        }
+        eq(img.width, oracle.width, "\(base) width")
+        eq(img.height, oracle.height, "\(base) height")
+        var se = 0.0
+        let n = img.width * img.height
+        for c in 0..<3 {
+            for i in 0..<n {
+                let ours = Float(bitPattern: UInt32(bitPattern: img.planes[c][i]))
+                let ref = Float(bitPattern: UInt32(bitPattern: oracle.planes[c][i]))
+                let d = Double(ours - ref)
+                se += d * d
+            }
+        }
+        let rms = (se / Double(n * 3)).squareRoot()
+        let psnr = rms == 0 ? 999 : -20 * log10(rms)
+        check(psnr > 70, "nested DC frames match djxl (PSNR \(Int(psnr)) dB)")
+        FileHandle.standardError.write(
+            Data("  [nested-dc] progressive_dc=2 + custom parametric dequant vs djxl\n".utf8))
     }
 
     /// `256x192_patmod.jxl` (cjxl -d 0 -e 9 --patches=1, 16-bit RGBA with

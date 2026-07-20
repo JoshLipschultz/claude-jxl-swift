@@ -208,9 +208,32 @@ final class FrameDecoder {
         }
         slot = current
         referenceSlots = preceding
-dcFrameSlots = dcSlots
+        dcFrameSlots = dcSlots
         visibleFrameIndex = visIndex
         nonvisibleFrameIndex = nonvisIndex
+    }
+
+    /// A sub-decoder pinned to a different frame `slot` of the same file — used
+    /// to decode a VarDCT DC frame that feeds a `kUseDcFrame` above it
+    /// (progressive_dc ≥ 2). All parsed file state (metadata, transform data,
+    /// reference and DC slots) is shared, so a DC frame that *itself* uses a
+    /// deeper DC frame recurses naturally through the same `dcFrameSlots`.
+    private init(sharing parent: FrameDecoder, slot: FrameSlot) {
+        limits = parent.limits
+        fileData = parent.fileData
+        parsed = parent.parsed
+        size = parent.size
+        metadata = parent.metadata
+        upsamplingWeights = parent.upsamplingWeights
+        customOpsin = parent.customOpsin
+        iccProfile = parent.iccProfile
+        self.slot = slot
+        referenceSlots = parent.referenceSlots
+        dcFrameSlots = parent.dcFrameSlots
+        // DC frames are never visible; the counters only seed the noise RNG,
+        // which DC frames do not use.
+        visibleFrameIndex = 0
+        nonvisibleFrameIndex = 0
     }
 
     /// Parses one frame header + TOC from `reader` and validates every section
@@ -964,19 +987,44 @@ dcFrameSlots = dcSlots
 
     /// Decodes (and caches) the DC frame feeding this frame's kUseDcFrame
     /// flag: the `frameType == .dc` slot at `dc_level + 1`, whose
-    /// pre-color-transform planes become this frame's DC image.
+    /// pre-color-transform XYB planes become this frame's DC image. The
+    /// deepest DC frame is a Modular-XYB image; intermediate DC frames
+    /// (progressive_dc ≥ 2) are VarDCT frames that themselves set kUseDcFrame,
+    /// decoded through a sub-decoder that recurses to the next-deeper level.
     func dcXYBFrame() throws -> ReferenceXYBFrame {
         if let cached = cachedDCFrame { return cached }
         let level = frameHeader.dcLevel + 1
         guard let frame = dcFrameSlots.last(where: { $0.header.dcLevel == level }) else {
             throw JXLError.malformed("kUseDcFrame without a level-\(level) DC frame")
         }
-        guard frame.header.flags & 32 == 0 else {
-            // A DC frame may itself use a deeper DC frame (progressive_dc=2);
-            // recursion is a follow-up.
-            throw JXLError.unsupported("nested DC frames (progressive_dc > 1)")
+        let ref: ReferenceXYBFrame
+        if frame.header.isModular {
+            ref = try modularXYBPlanes(of: frame, role: "DC frame")
+        } else {
+            // A VarDCT DC frame: reconstruct it fully to XYB planes (its own
+            // kUseDcFrame recurses to the deeper level via the shared slots),
+            // then crop the block-padded result to the DC frame's dimensions.
+            guard frame.header.colorTransform == .xyb else {
+                throw JXLError.unsupported("non-XYB VarDCT DC frame")
+            }
+            let sub = FrameDecoder(sharing: self, slot: frame)
+            let xyb = try sub.reconstructXYB()
+            let w = frame.dim.xsize
+            let h = frame.dim.ysize
+            var x = [Float](repeating: 0, count: w * h)
+            var y = x
+            var b = x
+            for row in 0..<h {
+                let src = row * xyb.stride
+                let dst = row * w
+                for col in 0..<w {
+                    x[dst + col] = xyb.x[src + col]
+                    y[dst + col] = xyb.y[src + col]
+                    b[dst + col] = xyb.b[src + col]
+                }
+            }
+            ref = ReferenceXYBFrame(width: w, height: h, x: x, y: y, b: b)
         }
-        let ref = try modularXYBPlanes(of: frame, role: "DC frame")
         cachedDCFrame = ref
         return ref
     }
@@ -1030,7 +1078,7 @@ dcFrameSlots = dcSlots
     /// supported for YCbCr frames (JPEG transcodes) without restoration filters.
     func requireSupportedVarDCT() throws {
         guard !frameHeader.isModular else { throw JXLError.unsupported("Modular frame is not VarDCT") }
-        guard frameHeader.frameType == .regular else {
+        guard frameHeader.frameType == .regular || frameHeader.frameType == .dc else {
             throw JXLError.unsupported("non-regular VarDCT frame")
         }
         guard !frameHeader.needsBlending || allowBlendingDecode else {

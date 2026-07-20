@@ -260,6 +260,14 @@ func decodeVarDCTACGlobal(
                     image.channels[0].pixels + image.channels[1].pixels
                         + image.channels[2].pixels
                 )
+            case 1, 2, 3, 4, 5, 6:
+                // Parametric quant matrices (ID / DCT2 / DCT4 / DCT4X8 / AFV /
+                // DCT): read the mode's params and compute the dequant table
+                // through the same builders as the library defaults.
+                guard let table = decodeCustomQuantTable(br, mode: Int(mode), idx: idx) else {
+                    throw JXLError.malformed("invalid custom quant matrix (mode \(mode))")
+                }
+                customDequant[idx] = table
             default:
                 throw JXLError.unsupported("custom VarDCT quant mode \(mode)")
             }

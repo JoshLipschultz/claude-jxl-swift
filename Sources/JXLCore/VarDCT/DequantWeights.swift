@@ -367,3 +367,190 @@ private let dequantTables: [[Float]] = QuantTableKind.allCases.map { kind in
 func defaultDequantTable(_ kind: QuantTableKind) -> [Float] {
     dequantTables[kind.rawValue]
 }
+
+// MARK: - Custom-encoded quant matrices (libjxl quant_weights.cc Decode +
+// ComputeQuantTable, modes 1-6; mode 0 = library and mode 7 = RAW are handled
+// by the caller). Reads the mode's parameters from `br`, computes the weight
+// matrix through the same builders as the library defaults, and returns the
+// dequant table (1 / weight) in coefficient-storage layout, or nil if the
+// bitstream is malformed.
+
+private let kAlmostZeroQ: Float = 1e-8
+
+/// libjxl `DecodeDctParams`: `num_distance_bands = read(4) + 1`, then 3×num
+/// F16 bands; each channel's seed is validated and scaled by 64.
+private func readDctParams(_ br: BitReader) -> [[Float]]? {
+    let numBands = Int(br.read(4)) + 1
+    var dist = [[Float]](repeating: [], count: 3)
+    for c in 0..<3 {
+        var band = [Float](repeating: 0, count: numBands)
+        for i in 0..<numBands { band[i] = br.readF16() }
+        if band[0] < kAlmostZeroQ { return nil }
+        band[0] *= 64
+        dist[c] = band
+    }
+    return dist
+}
+
+/// The dequant table (1 / weight) for one AC coefficient, with the validity
+/// check libjxl applies before inverting.
+private func invert(_ weights: [Float]) -> [Float]? {
+    var table = weights
+    for i in 0..<table.count {
+        let w = table[i]
+        if w >= 1.0 / kAlmostZeroQ || w < kAlmostZeroQ { return nil }
+        table[i] = 1.0 / w
+    }
+    return table
+}
+
+/// Reads a custom-encoded quant matrix (modes 1-6) for table `idx` and returns
+/// its dequant table, matching `ComputeQuantTable`.
+func decodeCustomQuantTable(_ br: BitReader, mode: Int, idx: Int) -> [Float]? {
+    switch mode {
+    case 1:  // kQuantModeID (num == 64)
+        var id = [[Float]](repeating: [0, 0, 0], count: 3)
+        for c in 0..<3 {
+            for i in 0..<3 {
+                let v = br.readF16()
+                if abs(v) < kAlmostZeroQ { return nil }
+                id[c][i] = v * 64
+            }
+        }
+        var w = [Float](repeating: 0, count: 3 * 64)
+        for c in 0..<3 {
+            for i in 0..<64 { w[64 * c + i] = id[c][0] }
+            w[64 * c + 1] = id[c][1]
+            w[64 * c + 8] = id[c][1]
+            w[64 * c + 9] = id[c][2]
+        }
+        return invert(w)
+
+    case 2:  // kQuantModeDCT2 (num == 64)
+        var dw = [[Float]](repeating: [Float](repeating: 0, count: 6), count: 3)
+        for c in 0..<3 {
+            for i in 0..<6 {
+                let v = br.readF16()
+                if abs(v) < kAlmostZeroQ { return nil }
+                dw[c][i] = v * 64
+            }
+        }
+        var w = [Float](repeating: 0, count: 3 * 64)
+        for c in 0..<3 {
+            let d = dw[c]
+            let s = c * 64
+            w[s] = 0xBAD  // LLF, unused
+            w[s + 1] = d[0]
+            w[s + 8] = d[0]
+            w[s + 9] = d[1]
+            for y in 0..<2 {
+                for x in 0..<2 {
+                    w[s + y * 8 + x + 2] = d[2]
+                    w[s + (y + 2) * 8 + x] = d[2]
+                    w[s + (y + 2) * 8 + x + 2] = d[3]
+                }
+            }
+            for y in 0..<4 {
+                for x in 0..<4 {
+                    w[s + y * 8 + x + 4] = d[4]
+                    w[s + (y + 4) * 8 + x] = d[4]
+                    w[s + (y + 4) * 8 + x + 4] = d[5]
+                }
+            }
+        }
+        return invert(w)
+
+    case 3:  // kQuantModeDCT4 (num == 64)
+        var mult = [[Float]](repeating: [0, 0], count: 3)
+        for c in 0..<3 {
+            for i in 0..<2 {
+                let v = br.readF16()
+                if abs(v) < kAlmostZeroQ { return nil }
+                mult[c][i] = v
+            }
+        }
+        guard let dist = readDctParams(br) else { return nil }
+        let w44 = dctQuantWeights(rows: 4, cols: 4, dist: dist)
+        var w = [Float](repeating: 0, count: 3 * 64)
+        for c in 0..<3 {
+            for y in 0..<8 {
+                for x in 0..<8 { w[c * 64 + y * 8 + x] = w44[c * 16 + (y / 2) * 4 + (x / 2)] }
+            }
+            w[c * 64 + 1] /= mult[c][0]
+            w[c * 64 + 8] /= mult[c][0]
+            w[c * 64 + 9] /= mult[c][1]
+        }
+        return invert(w)
+
+    case 4:  // kQuantModeDCT4X8 (num == 64)
+        var mult = [Float](repeating: 0, count: 3)
+        for c in 0..<3 {
+            let v = br.readF16()
+            if abs(v) < kAlmostZeroQ { return nil }
+            mult[c] = v
+        }
+        guard let dist = readDctParams(br) else { return nil }
+        let w48 = dctQuantWeights(rows: 4, cols: 8, dist: dist)
+        var w = [Float](repeating: 0, count: 3 * 64)
+        for c in 0..<3 {
+            for y in 0..<8 {
+                for x in 0..<8 { w[c * 64 + y * 8 + x] = w48[c * 32 + (y / 2) * 8 + x] }
+            }
+            w[c * 64 + 8] /= mult[c]
+        }
+        return invert(w)
+
+    case 5:  // kQuantModeAFV (num == 64)
+        var afv = [[Float]](repeating: [Float](repeating: 0, count: 9), count: 3)
+        for c in 0..<3 {
+            for i in 0..<9 { afv[c][i] = br.readF16() }
+            for i in 0..<6 { afv[c][i] *= 64 }
+        }
+        guard let dist = readDctParams(br), let dist44 = readDctParams(br) else { return nil }
+        let w48 = dctQuantWeights(rows: 4, cols: 8, dist: dist)
+        let w44 = dctQuantWeights(rows: 4, cols: 4, dist: dist44)
+        let lo: Float = 0.8517778890324296
+        let hi: Float = 12.97166202570235 - lo + 1e-6
+        var w = [Float](repeating: 0, count: 3 * 64)
+        for c in 0..<3 {
+            let a = afv[c]
+            let bands = expandBands([a[5], a[6], a[7], a[8]])
+            if bands[0] < kAlmostZeroQ { return nil }
+            let s = c * 64
+            w[s] = 1
+            w[s + 1 * 8 + 0] = a[0]
+            w[s + 0 * 8 + 1] = a[1]
+            w[s + 2 * 8 + 0] = a[2]
+            w[s + 0 * 8 + 2] = a[3]
+            w[s + 2 * 8 + 2] = a[4]
+            for y in 0..<4 {
+                for x in 0..<4 {
+                    if x < 2 && y < 2 { continue }
+                    w[s + (2 * y) * 8 + 2 * x] = interpolate(kAFVFreqs[y * 4 + x] - lo, hi, bands)
+                }
+            }
+            for y in 0..<4 {
+                for x in 0..<8 {
+                    if x == 0 && y == 0 { continue }
+                    w[s + (2 * y + 1) * 8 + x] = w48[c * 32 + y * 8 + x]
+                }
+            }
+            for y in 0..<4 {
+                for x in 0..<4 {
+                    if x == 0 && y == 0 { continue }
+                    w[s + (2 * y) * 8 + 2 * x + 1] = w44[c * 16 + y * 4 + x]
+                }
+            }
+        }
+        return invert(w)
+
+    case 6:  // kQuantModeDCT (the general parametric DCT, any table size)
+        guard let dist = readDctParams(br) else { return nil }
+        let rows = kRequiredQuantSizeX[idx] * 8
+        let cols = kRequiredQuantSizeY[idx] * 8
+        return invert(dctQuantWeights(rows: rows, cols: cols, dist: dist))
+
+    default:
+        return nil
+    }
+}
