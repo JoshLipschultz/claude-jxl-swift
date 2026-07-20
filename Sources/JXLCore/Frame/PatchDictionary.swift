@@ -173,16 +173,11 @@ func decodePatchDictionary(
             guard px + pxsize <= xsize, py + pysize <= ysize else {
                 throw JXLError.malformed("invalid patch position \(px),\(py)")
             }
-            for j in 0..<blendingsStride {
+            for _ in 0..<blendingsStride {
                 let rawMode = readNum(kPatchBlendModeContext)
                 guard rawMode < Int(PatchBlendMode.count),
                     let mode = PatchBlendMode(rawValue: UInt32(rawMode))
                 else { throw JXLError.malformed("invalid patch blend mode") }
-                if (mode.usesAlpha || (mode != .none && j > 0)) && numExtraChannels > 0 {
-                    // Extra-channel-involving blends need the extra-channel
-                    // planes, which the VarDCT pipeline does not carry yet.
-                    throw JXLError.unsupported("patches touching extra channels")
-                }
                 var alphaChannel: UInt32 = 0
                 if mode.usesAlpha && chooseAlpha {
                     alphaChannel = UInt32(readNum(kPatchAlphaChannelContext))
@@ -238,6 +233,7 @@ func renderPatches(
     let width = image.width
     let height = image.height
     let stride = image.stride
+    var blendError: JXLError? = nil
 
     image.x.withUnsafeMutableBufferPointer { bx in
         image.y.withUnsafeMutableBufferPointer { by in
@@ -248,6 +244,17 @@ func renderPatches(
                     let ref = refs[refPos.ref]!
                     let blending = dict.blendings[index * dict.blendingsStride]
                     guard blending.mode != .none else { continue }
+                    // This renderer carries color planes only; alpha- or
+                    // extra-channel-involving blends need the full-plane
+                    // renderer (native modular path).
+                    for j in 0..<dict.blendingsStride {
+                        let b = dict.blendings[index * dict.blendingsStride + j]
+                        if b.mode.usesAlpha || (b.mode != .none && j > 0) {
+                            blendError = JXLError.unsupported(
+                                "patches touching extra channels in VarDCT frames")
+                        }
+                    }
+                    guard blendError == nil else { break }
                     // Clip to the visible region (patches may reach into the
                     // block padding, which is never displayed).
                     let y1 = min(pos.y + refPos.ysize, height)
@@ -271,6 +278,294 @@ func renderPatches(
                 }
             }
         }
+    }
+    if let e = blendError { throw e }
+}
+
+/// Full-plane patch rendering (libjxl stage_patches + blending.cc
+/// PerformBlending, all eight PatchBlendModes including the alpha-driven and
+/// "below" variants): blends every patch onto image-sized float planes
+/// (3 color + one per extra channel). Used by native-space Modular frames,
+/// whose pipeline carries every channel. References must supply the same
+/// plane layout.
+func renderPatchesMulti(
+    _ dict: PatchDictionary, planes: inout [[Float]], width: Int, height: Int,
+    extraChannels: [JXLExtraChannelInfo],
+    reference: (Int) throws -> FloatFrame
+) throws {
+    guard !dict.isEmpty else { return }
+    let numEC = extraChannels.count
+    precondition(planes.count == 3 + numEC)
+
+    var refs: [Int: FloatFrame] = [:]
+    for refPos in dict.refPositions where refs[refPos.ref] == nil {
+        refs[refPos.ref] = try reference(refPos.ref)
+    }
+
+    for (index, pos) in dict.positions.enumerated() {
+        let refPos = dict.refPositions[pos.refPosIndex]
+        let ref = refs[refPos.ref]!
+        guard ref.planes.count == 3 + numEC else {
+            throw JXLError.malformed("patch reference frame channel layout")
+        }
+        let base = index * dict.blendingsStride
+        let colorInfo = dict.blendings[base]
+        let ecInfo = Array(dict.blendings[(base + 1)..<(base + dict.blendingsStride)])
+        // Clip to the visible region (positions are validated against the
+        // padded frame, which extends past the visible edge).
+        let y1 = min(pos.y + refPos.ysize, height)
+        let x1 = min(pos.x + refPos.xsize, width)
+        guard pos.y < y1, pos.x < x1 else { continue }
+        let count = x1 - pos.x
+        for y in pos.y..<y1 {
+            let outOffset = y * width + pos.x
+            let fgOffset = (refPos.y0 + y - pos.y) * ref.width + refPos.x0
+            performPatchBlendRow(
+                bg: planes, bgOffset: outOffset, fg: ref.planes, fgOffset: fgOffset,
+                out: &planes, outOffset: outOffset, count: count,
+                colorInfo: colorInfo, ecInfo: ecInfo, extraChannels: extraChannels)
+        }
+    }
+}
+
+/// One row of blending.cc PerformBlending in the full 8-mode PatchBlendMode
+/// space. `bg`/`fg` are full plane arrays (color first, then extras) read at
+/// the given offsets; results land in `out` (which may alias `bg` — a
+/// temporary row is used, as in libjxl). "Below" modes swap the layer roles;
+/// alpha-weighted adds of the alpha channel onto itself reduce to the
+/// background copy (alpha.cc's `fg == fga` shortcut).
+private func performPatchBlendRow(
+    bg: [[Float]], bgOffset: Int, fg: [[Float]], fgOffset: Int,
+    out: inout [[Float]], outOffset: Int, count: Int,
+    colorInfo: PatchBlending, ecInfo: [PatchBlending],
+    extraChannels: [JXLExtraChannelInfo]
+) {
+    guard count > 0 else { return }
+    let numEC = ecInfo.count
+    var hasAlpha = false
+    for info in extraChannels where info.type == 0 { hasAlpha = true }
+    var tmp = [[Float]](repeating: [Float](repeating: 0, count: count), count: 3 + numEC)
+
+    // Row segment helpers over the array+offset views.
+    func withRow(_ src: [[Float]], _ c: Int, _ off: Int, _ body: (UnsafePointer<Float>) -> Void) {
+        src[c].withUnsafeBufferPointer { body($0.baseAddress! + off) }
+    }
+    func intoTmp(_ c: Int, _ body: (UnsafeMutablePointer<Float>) -> Void) {
+        tmp[c].withUnsafeMutableBufferPointer { body($0.baseAddress!) }
+    }
+    func copyRow(_ src: [[Float]], _ c: Int, _ off: Int, into t: Int) {
+        tmp[t].replaceSubrange(0..<count, with: src[c][off..<(off + count)])
+    }
+
+    // Extra channels first (pre-blending alpha is what color blending reads).
+    for i in 0..<numEC {
+        let info = ecInfo[i]
+        let c = 3 + i
+        let a = 3 + Int(info.alphaChannel)
+        switch info.mode {
+        case .add:
+            withRow(bg, c, bgOffset) { bgp in
+                withRow(fg, c, fgOffset) { fgp in
+                    intoTmp(c) { outp in
+                        for x in 0..<count { outp[x] = bgp[x] + fgp[x] }
+                    }
+                }
+            }
+        case .blendAbove:
+            let premult = extraChannels[Int(info.alphaChannel)].alphaAssociated
+            if c == a {
+                withRow(bg, a, bgOffset) { bgap in
+                    withRow(fg, a, fgOffset) { fgap in
+                        intoTmp(c) { outp in
+                            alphaBlendAlpha(
+                                bga: bgap, fga: fgap, out: outp, count: count, clamp: info.clamp)
+                        }
+                    }
+                }
+            } else {
+                withRow(bg, c, bgOffset) { bgp in
+                withRow(bg, a, bgOffset) { bgap in
+                withRow(fg, c, fgOffset) { fgp in
+                withRow(fg, a, fgOffset) { fgap in
+                    intoTmp(c) { outp in
+                        alphaBlendColor(
+                            bg: bgp, bga: bgap, fg: fgp, fga: fgap, out: outp,
+                            count: count, premultiplied: premult, clamp: info.clamp)
+                    }
+                }
+                }
+                }
+                }
+            }
+        case .blendBelow:
+            let premult = extraChannels[Int(info.alphaChannel)].alphaAssociated
+            if c == a {
+                withRow(fg, a, fgOffset) { bgap in
+                    withRow(bg, a, bgOffset) { fgap in
+                        intoTmp(c) { outp in
+                            alphaBlendAlpha(
+                                bga: bgap, fga: fgap, out: outp, count: count, clamp: info.clamp)
+                        }
+                    }
+                }
+            } else {
+                withRow(fg, c, fgOffset) { bgp in
+                withRow(fg, a, fgOffset) { bgap in
+                withRow(bg, c, bgOffset) { fgp in
+                withRow(bg, a, bgOffset) { fgap in
+                    intoTmp(c) { outp in
+                        alphaBlendColor(
+                            bg: bgp, bga: bgap, fg: fgp, fga: fgap, out: outp,
+                            count: count, premultiplied: premult, clamp: info.clamp)
+                    }
+                }
+                }
+                }
+                }
+            }
+        case .alphaWeightedAddAbove:
+            if c == a {
+                copyRow(bg, c, bgOffset, into: c)  // alpha.cc fg == fga shortcut
+            } else {
+                withRow(bg, c, bgOffset) { bgp in
+                withRow(fg, c, fgOffset) { fgp in
+                withRow(fg, a, fgOffset) { fgap in
+                    intoTmp(c) { outp in
+                        alphaWeightedAdd(
+                            bg: bgp, fg: fgp, fga: fgap, out: outp, count: count,
+                            clamp: info.clamp)
+                    }
+                }
+                }
+                }
+            }
+        case .alphaWeightedAddBelow:
+            if c == a {
+                copyRow(fg, c, fgOffset, into: c)  // roles swapped, same shortcut
+            } else {
+                withRow(fg, c, fgOffset) { bgp in
+                withRow(bg, c, bgOffset) { fgp in
+                withRow(bg, a, bgOffset) { fgap in
+                    intoTmp(c) { outp in
+                        alphaWeightedAdd(
+                            bg: bgp, fg: fgp, fga: fgap, out: outp, count: count,
+                            clamp: info.clamp)
+                    }
+                }
+                }
+                }
+            }
+        case .mul:
+            withRow(bg, c, bgOffset) { bgp in
+                withRow(fg, c, fgOffset) { fgp in
+                    intoTmp(c) { outp in
+                        mulBlend(bg: bgp, fg: fgp, out: outp, count: count, clamp: info.clamp)
+                    }
+                }
+            }
+        case .replace:
+            copyRow(fg, c, fgOffset, into: c)
+        case .none:
+            copyRow(bg, c, bgOffset, into: c)
+        }
+    }
+
+    // Color channels (the alpha-weighted blends also rewrite the alpha plane,
+    // per PerformAlphaBlending's four-plane form).
+    let a = 3 + Int(colorInfo.alphaChannel)
+    func addColor() {
+        for c in 0..<3 {
+            withRow(bg, c, bgOffset) { bgp in
+                withRow(fg, c, fgOffset) { fgp in
+                    intoTmp(c) { outp in
+                        for x in 0..<count { outp[x] = bgp[x] + fgp[x] }
+                    }
+                }
+            }
+        }
+    }
+    func copyColor(_ src: [[Float]], _ off: Int) {
+        for c in 0..<3 { copyRow(src, c, off, into: c) }
+    }
+    func blendWeighted(bottom: [[Float]], bottomOff: Int, top: [[Float]], topOff: Int) {
+        let premult = extraChannels[Int(colorInfo.alphaChannel)].alphaAssociated
+        for c in 0..<3 {
+            withRow(bottom, c, bottomOff) { bgp in
+            withRow(bottom, a, bottomOff) { bgap in
+            withRow(top, c, topOff) { fgp in
+            withRow(top, a, topOff) { fgap in
+                intoTmp(c) { outp in
+                    alphaBlendColor(
+                        bg: bgp, bga: bgap, fg: fgp, fga: fgap, out: outp,
+                        count: count, premultiplied: premult, clamp: colorInfo.clamp)
+                }
+            }
+            }
+            }
+            }
+        }
+        withRow(bottom, a, bottomOff) { bgap in
+            withRow(top, a, topOff) { fgap in
+                intoTmp(a) { outp in
+                    alphaBlendAlpha(
+                        bga: bgap, fga: fgap, out: outp, count: count, clamp: colorInfo.clamp)
+                }
+            }
+        }
+    }
+    func addWeighted(bottom: [[Float]], bottomOff: Int, top: [[Float]], topOff: Int) {
+        for c in 0..<3 {
+            withRow(bottom, c, bottomOff) { bgp in
+            withRow(top, c, topOff) { fgp in
+            withRow(top, a, topOff) { fgap in
+                intoTmp(c) { outp in
+                    alphaWeightedAdd(
+                        bg: bgp, fg: fgp, fga: fgap, out: outp, count: count,
+                        clamp: colorInfo.clamp)
+                }
+            }
+            }
+            }
+        }
+    }
+
+    switch colorInfo.mode {
+    case .add:
+        addColor()
+    case .alphaWeightedAddAbove:
+        if hasAlpha {
+            addWeighted(bottom: bg, bottomOff: bgOffset, top: fg, topOff: fgOffset)
+        } else { addColor() }
+    case .alphaWeightedAddBelow:
+        if hasAlpha {
+            addWeighted(bottom: fg, bottomOff: fgOffset, top: bg, topOff: bgOffset)
+        } else { addColor() }
+    case .blendAbove:
+        if hasAlpha {
+            blendWeighted(bottom: bg, bottomOff: bgOffset, top: fg, topOff: fgOffset)
+        } else { copyColor(fg, fgOffset) }
+    case .blendBelow:
+        if hasAlpha {
+            blendWeighted(bottom: fg, bottomOff: fgOffset, top: bg, topOff: bgOffset)
+        } else { copyColor(fg, fgOffset) }
+    case .mul:
+        for c in 0..<3 {
+            withRow(bg, c, bgOffset) { bgp in
+                withRow(fg, c, fgOffset) { fgp in
+                    intoTmp(c) { outp in
+                        mulBlend(bg: bgp, fg: fgp, out: outp, count: count, clamp: colorInfo.clamp)
+                    }
+                }
+            }
+        }
+    case .replace:
+        copyColor(fg, fgOffset)
+    case .none:
+        copyColor(bg, bgOffset)
+    }
+
+    for c in 0..<(3 + numEC) {
+        out[c].replaceSubrange(outOffset..<(outOffset + count), with: tmp[c])
     }
 }
 

@@ -556,9 +556,9 @@ dcFrameSlots = dcSlots
     func decodeModularImage(format: JXLSampleFormat = .uint8) throws -> JXLDecodedImage {
         guard frameHeader.isModular else { throw JXLError.unsupported("VarDCT frame is not Modular") }
         // Splines (16) and noise (1) are supported on Modular-XYB frames,
-        // where the pipeline float planes exist; other feature flags (and any
-        // flags on native-space Modular frames) remain unsupported.
-        let allowedFlags: UInt64 = frameHeader.colorTransform == .xyb ? (16 | 1) : 0
+        // where the pipeline float planes exist; native-space Modular frames
+        // support patches (2), rendered with the full-plane blender.
+        let allowedFlags: UInt64 = frameHeader.colorTransform == .xyb ? (16 | 1) : 2
         guard frameHeader.frameType == .regular, frameHeader.flags & ~allowedFlags == 0 else {
             throw JXLError.unsupported("non-regular or feature-flagged frames")
         }
@@ -651,14 +651,18 @@ dcFrameSlots = dcSlots
         // lossy modular legitimately produces out-of-range samples that the
         // integer paths clamp away).
         let wantFloat = format == .float32 && !metadata.bitDepth.isFloatingPoint
+        let hasPatches = frameHeader.flags & 2 != 0 && !(patchDictionary?.isEmpty ?? true)
+        guard !(hasPatches && metadata.bitDepth.isFloatingPoint) else {
+            throw JXLError.unsupported("patches on floating-point Modular frames")
+        }
         var floatColor: [[Float]]? = nil
-        if (frameHeader.loopFilterGab || frameHeader.loopFilterEpfIters > 0)
-            && !metadata.bitDepth.isFloatingPoint
-        {
-            // Restoration filters run on the pipeline floats (samples scaled
-            // by 1/(2^bits - 1)); grayscale replicates its channel into all
-            // three color slots first (libjxl rgb_from_gray), which keeps the
-            // three planes identical through the symmetric filters.
+        var floatECs: [[Float]]? = nil
+        let needsFilters = frameHeader.loopFilterGab || frameHeader.loopFilterEpfIters > 0
+        if (needsFilters || hasPatches) && !metadata.bitDepth.isFloatingPoint {
+            // The float pipeline: samples scaled by 1/(2^bits - 1); grayscale
+            // replicates its channel into all three color slots (libjxl
+            // rgb_from_gray). Restoration filters run first, then patches
+            // blend in (libjxl render-pipeline stage order).
             let w = dim.xsize
             let h = dim.ysize
             let maxVal = Float((1 << Int(metadata.bitDepth.bitsPerSample)) - 1)
@@ -667,17 +671,44 @@ dcFrameSlots = dcSlots
             var r = toFloat(planes[0])
             var g = colorChannels >= 3 ? toFloat(planes[1]) : r
             var b = colorChannels >= 3 ? toFloat(planes[2]) : r
-            modularRestorationFilters(x: &r, y: &g, b: &b, w: w, h: h, header: frameHeader)
+            if needsFilters {
+                modularRestorationFilters(x: &r, y: &g, b: &b, w: w, h: h, header: frameHeader)
+            }
+            var ecFloats: [[Float]]? = nil
+            if hasPatches, let patches = patchDictionary {
+                var fplanes = [r, g, b]
+                for e in 0..<extra {
+                    let ecScale = 1.0 / Float(
+                        (1 << Int(metadata.extraChannels[e].bitDepth.bitsPerSample)) - 1)
+                    fplanes.append(planes[colorChannels + e].map { Float($0) * ecScale })
+                }
+                try renderPatchesMulti(
+                    patches, planes: &fplanes, width: w, height: h,
+                    extraChannels: metadata.extraChannels
+                ) { try self.referenceNativeFrame($0) }
+                r = fplanes[0]
+                g = fplanes[1]
+                b = fplanes[2]
+                ecFloats = Array(fplanes[3...])
+            }
             if wantFloat {
                 floatColor = colorChannels >= 3 ? [r, g, b] : [r]
+                floatECs = ecFloats
             } else {
-                func toInt(_ p: [Float]) -> [Int32] {
-                    p.map { Int32(min(max(($0 * maxVal).rounded(), 0), maxVal)) }
+                func toInt(_ p: [Float], _ maxV: Float) -> [Int32] {
+                    p.map { Int32(min(max(($0 * maxV).rounded(), 0), maxV)) }
                 }
-                planes[0] = toInt(r)
+                planes[0] = toInt(r, maxVal)
                 if colorChannels >= 3 {
-                    planes[1] = toInt(g)
-                    planes[2] = toInt(b)
+                    planes[1] = toInt(g, maxVal)
+                    planes[2] = toInt(b, maxVal)
+                }
+                if let ecFloats {
+                    for e in 0..<extra {
+                        let ecMax = Float(
+                            (1 << Int(metadata.extraChannels[e].bitDepth.bitsPerSample)) - 1)
+                        planes[colorChannels + e] = toInt(ecFloats[e], ecMax)
+                    }
                 }
             }
         }
@@ -689,11 +720,15 @@ dcFrameSlots = dcSlots
                 floatColor ?? planes[0..<colorChannels].map { p in p.map { Float($0) * scale } }
             var out = color.map { p in p.map { Int32(bitPattern: $0.bitPattern) } }
             for e in 0..<extra {
-                out.append(
-                    scaleECPlane(
-                        planes[colorChannels + e],
-                        bits: Int(metadata.extraChannels[e].bitDepth.bitsPerSample),
-                        to: .float32))
+                if let floatECs {
+                    out.append(floatECs[e].map { Int32(bitPattern: $0.bitPattern) })
+                } else {
+                    out.append(
+                        scaleECPlane(
+                            planes[colorChannels + e],
+                            bits: Int(metadata.extraChannels[e].bitDepth.bitsPerSample),
+                            to: .float32))
+                }
             }
             return JXLDecodedImage(
                 width: dim.xsize, height: dim.ysize, colorChannels: colorChannels,
@@ -724,8 +759,8 @@ dcFrameSlots = dcSlots
         // then the global modular stream.
         let r0 = BitReader(parsed.codestream, byteRange: slot.sectionRange(0))
         let flags = slot.header.flags
-        guard flags & 2 == 0 else {
-            throw JXLError.unsupported("patches on Modular frames")
+        if flags & 2 != 0 {
+            patchDictionary = try parsePatchDictionary(r0)
         }
         if flags & 16 != 0 {
             splinesData = try decodeSplines(r0, numPixels: dim.xsize * dim.ysize)
@@ -867,6 +902,51 @@ dcFrameSlots = dcSlots
         }
         let ref = try modularXYBPlanes(of: frame, role: "patch reference frame")
         cachedReferences[index] = ref
+        return ref
+    }
+
+    private var cachedNativeReferences: [Int: FloatFrame] = [:]
+
+    /// Decodes (and caches) the reference frame in slot `index` as native-space
+    /// float planes (3 color — grayscale replicated — plus every extra
+    /// channel, each scaled by 1/(2^bits − 1)). Patch sources for native-space
+    /// Modular frames, whose pipeline carries native samples.
+    func referenceNativeFrame(_ index: Int) throws -> FloatFrame {
+        if let cached = cachedNativeReferences[index] { return cached }
+        guard let frame = latestReferenceSlot(index) else {
+            throw JXLError.malformed("patch reference frame \(index) not present")
+        }
+        let h = frame.header
+        guard h.isModular, h.colorTransform == .none, h.flags & ~UInt64(128) == 0 else {
+            throw JXLError.unsupported("non-native-Modular patch reference frame")
+        }
+        let w = frame.dim.xsize
+        let ht = frame.dim.ysize
+        let isGray = metadata.colorSpace == .grayscale
+        let colorChannels = isGray ? 1 : 3
+        let extra = metadata.extraChannelCount
+        let samples = UInt64(w) * UInt64(ht) * UInt64(colorChannels + extra)
+        if samples > UInt64(limits.maxTotalSamples) {
+            throw JXLError.limitExceeded("patch reference frame \(w)x\(ht)")
+        }
+        let (image, _) = try decodeModularChannels(
+            in: frame, channelCount: colorChannels + extra)
+        guard image.channels.count >= colorChannels + extra,
+            image.channels.allSatisfy({ $0.pixels.count >= w * ht })
+        else { throw JXLError.malformed("patch reference frame channel layout") }
+        let scale = 1.0 / Float((1 << Int(metadata.bitDepth.bitsPerSample)) - 1)
+        var planes: [[Float]] = []
+        for c in 0..<colorChannels {
+            planes.append(image.channels[c].pixels.map { Float($0) * scale })
+        }
+        while planes.count < 3 { planes.append(planes[0]) }  // rgb_from_gray
+        for e in 0..<extra {
+            let ecScale = 1.0 / Float(
+                (1 << Int(metadata.extraChannels[e].bitDepth.bitsPerSample)) - 1)
+            planes.append(image.channels[colorChannels + e].pixels.map { Float($0) * ecScale })
+        }
+        let ref = FloatFrame(width: w, height: ht, planes: planes)
+        cachedNativeReferences[index] = ref
         return ref
     }
 

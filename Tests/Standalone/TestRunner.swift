@@ -85,6 +85,7 @@ struct TestRunner {
         jpegTranscodeWide()
         spotColorRendering()
         jxlpOutOfOrder()
+        modularPatches()
         orientationBaking()
         deltaPalette()
         iccOutput()
@@ -165,6 +166,48 @@ struct TestRunner {
         eq(mismatches, 0, "\(base) float bit-exact vs djxl PFM")
         FileHandle.standardError.write(
             Data("  [int-modular-float] unclamped float output bit-exact vs djxl\n".utf8))
+    }
+
+    /// `256x192_patmod.jxl` (cjxl -d 0 -e 9 --patches=1, 16-bit RGBA with
+    /// repeated alpha-blended stamps): a native-space Modular frame whose
+    /// kPatches flag pulls crops from a referenceOnly frame through the
+    /// full-plane blender (all-mode PerformBlending port, incl. alpha and
+    /// extra-channel blendings). Oracle is djxl's 16-bit PAM; lossless, so
+    /// byte-exact — color and alpha.
+    static func modularPatches() {
+        let dir = fixturesDir()
+        guard let jxl = try? Data(contentsOf: dir.appendingPathComponent("256x192_patmod.jxl")),
+            let pam = try? Data(contentsOf: dir.appendingPathComponent("256x192_patmod.pam")),
+            let img = try? JXL.decodeImage(from: [UInt8](jxl), format: .uint16),
+            img.planes.count == 4,
+            let headerEnd = pam.range(of: Data("ENDHDR\n".utf8))
+        else {
+            check(false, "patmod fixture decodes")
+            return
+        }
+        // The fixture must actually exercise the patch path.
+        if let decoder = try? FrameDecoder(data: [UInt8](jxl)) {
+            check(decoder.frameHeader.flags & 2 != 0, "patmod frame has kPatches set")
+        } else {
+            check(false, "patmod frame header parses")
+        }
+        let bytes = [UInt8](pam[headerEnd.upperBound...])
+        let n = img.width * img.height
+        guard bytes.count == n * 4 * 2 else {
+            check(false, "patmod oracle size")
+            return
+        }
+        var mismatches = 0
+        for i in 0..<n {
+            for c in 0..<4 {
+                let idx = (i * 4 + c) * 2
+                let ref = Int(bytes[idx]) << 8 | Int(bytes[idx + 1])
+                if ref != Int(img.planes[c][i]) { mismatches += 1 }
+            }
+        }
+        eq(mismatches, 0, "patmod byte-exact vs djxl (RGBA)")
+        FileHandle.standardError.write(
+            Data("  [modular-patches] native-modular patches byte-exact vs djxl\n".utf8))
     }
 
     /// Out-of-order `jxlp` boxes (ftyp minor version 1, libjxl v0.12):

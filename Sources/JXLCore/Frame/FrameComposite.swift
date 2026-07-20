@@ -36,10 +36,10 @@ struct FrameCanvas {
 // alpha-plane variant, which is what djxl executes)
 
 @inline(__always)
-private func clamp01(_ x: Float) -> Float { max(min(1, x), 0) }
+func clamp01(_ x: Float) -> Float { max(min(1, x), 0) }
 
 /// Color blend with alpha (PerformAlphaBlending, separate-channel form).
-private func alphaBlendColor(
+func alphaBlendColor(
     bg: UnsafePointer<Float>, bga: UnsafePointer<Float>,
     fg: UnsafePointer<Float>, fga: UnsafePointer<Float>,
     out: UnsafeMutablePointer<Float>, count: Int, premultiplied: Bool, clamp: Bool
@@ -59,19 +59,20 @@ private func alphaBlendColor(
     }
 }
 
-/// Alpha-plane blend (PerformAlphaBlending where bg==bga and fg==fga; note
-/// libjxl's inverted clamp condition here — mirrored deliberately).
-private func alphaBlendAlpha(
+/// Alpha-plane blend (PerformAlphaBlending where bg==bga and fg==fga).
+/// libjxl v0.11 had the clamp condition inverted here; v0.12 fixed it —
+/// we follow v0.12 (clamp means clamp).
+func alphaBlendAlpha(
     bga: UnsafePointer<Float>, fga: UnsafePointer<Float>,
     out: UnsafeMutablePointer<Float>, count: Int, clamp: Bool
 ) {
     for x in 0..<count {
-        let fa = clamp ? fga[x] : clamp01(fga[x])
+        let fa = clamp ? clamp01(fga[x]) : fga[x]
         out[x] = 1 - (1 - fa) * (1 - bga[x])
     }
 }
 
-private func alphaWeightedAdd(
+func alphaWeightedAdd(
     bg: UnsafePointer<Float>, fg: UnsafePointer<Float>, fga: UnsafePointer<Float>,
     out: UnsafeMutablePointer<Float>, count: Int, clamp: Bool
 ) {
@@ -82,7 +83,7 @@ private func alphaWeightedAdd(
     }
 }
 
-private func mulBlend(
+func mulBlend(
     bg: UnsafePointer<Float>, fg: UnsafePointer<Float>,
     out: UnsafeMutablePointer<Float>, count: Int, clamp: Bool
 ) {
