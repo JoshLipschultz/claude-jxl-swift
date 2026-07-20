@@ -103,7 +103,7 @@ and JPEG reconstruction must be byte-exact. Small generated fixtures
 (`Tests/JXLCoreTests/Fixtures/*.jxl`, with expected rasters committed
 alongside) keep the suite self-contained — no oracle binaries are needed to
 run the tests. Bitstream-touching changes additionally get a mutation-fuzz
-round and a decode-benchmark regression check (~62 ms lossy / ~115 ms
+round and a decode-benchmark regression check (~43 ms lossy / ~115 ms
 lossless per 6-megapixel image on Apple Silicon, single image,
 `DispatchQueue.concurrentPerform` across groups).
 

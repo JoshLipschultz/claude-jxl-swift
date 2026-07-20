@@ -161,7 +161,7 @@ Benchmarked on a 6 MP synthetic photographic fixture (`Scripts/gen-bench.sh`,
 
 | Path | Before | After | |
 |---|---|---|---|
-| VarDCT (lossy, q95 e4) | 360 ms (16.7 MP/s) | **62 ms (~96 MP/s)** | 5.8× |
+| VarDCT (lossy, q95 e4) | 360 ms (16.7 MP/s) | **43 ms (~138 MP/s)** | 8.3× |
 | Modular (lossless, e3) | 3585 ms (1.7 MP/s) | **115 ms (~52 MP/s)** | 31× |
 
 What did it (in impact order): rewriting the weighted predictor on flat
@@ -196,10 +196,13 @@ the predictor's serial dependency chain bounds the loop. WP divlookup and the
 ANS reader's alias/uint-config tables became private allocations (bounds/borrow
 machinery off the symbol path; neutral wall-time, cleaner profile).
 
-Remaining levers: flat per-group coefficient pooling (drops `VarDCTBlock`'s
-per-block nested arrays); parallel DC-group decode in the LF pass;
-interior/border splits for Gaborish/EPF mirror handling; a buffered refill in
-the ANS symbol reader. The Modular loop is now bound by the serial
+**VarDCT tail round (2026-07-20, 62 → ~43 ms lossy):** flat coefficient
+pooling (one frame-wide pool + per-block offsets, disjoint per-group raw-
+pointer writes; ~14 ms) and parallel DC-group decode in the LF pass (~3.5 ms)
+landed; the Gaborish/EPF interior/border split (branch prediction already
+near-perfect) and a buffered ANS refill (loses to the existing 64-bit
+unaligned-load path) were measured and *reverted* under the ≥2 ms bit-exact
+gate — recorded here so they aren't re-attempted without new evidence. The Modular loop is now bound by the serial
 WP-predict → tree-walk → ANS-read dependency chain; further gains there mean
 restructuring (e.g., libjxl-style per-row specialization), not micro-opts.
 
