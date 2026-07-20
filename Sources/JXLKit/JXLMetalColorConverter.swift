@@ -45,7 +45,8 @@ public final class JXLMetalColorConverter {
     /// precision, half the bandwidth) or `.rgba32Float` for exact readback.
     public func makeLinearTexture(
         from image: JXLXYBFloatImage, pixelFormat: MTLPixelFormat = .rgba16Float,
-        usage: MTLTextureUsage = [.shaderRead], premultiply: Bool = false
+        usage: MTLTextureUsage = [.shaderRead], premultiply: Bool = false,
+        displayMode: Float = 0
     ) -> MTLTexture? {
         let w = image.width
         let h = image.height
@@ -77,6 +78,7 @@ public final class JXLMetalColorConverter {
 
         var params = Self.packParams(image.params)
         params.append(premultiply ? 1 : 0)
+        params.append(displayMode)
         guard let cmd = queue.makeCommandBuffer(),
             let enc = cmd.makeComputeCommandEncoder()
         else { return nil }
@@ -132,12 +134,18 @@ public final class JXLMetalColorConverter {
     /// that the CPU 16-bit + PQ/HLG-tagged path already handles correctly, so
     /// callers keep that path for HDR.
     public func makeLinearCGImage(from image: JXLXYBFloatImage) -> CGImage? {
+        // Covered transfers: sRGB (13, or 0/2 rendered as sRGB), linear (8),
+        // and BT.709 (1, encoded in-shader). Everything else — PQ/HLG (whose
+        // EDR nits mapping the CPU path owns), DCI, gamma — falls back to the
+        // CPU converter.
         let tf = image.params.transferFunction
-        if tf == 16 || tf == 18 { return nil }  // PQ / HLG → CPU path
+        guard tf == 0 || tf == 1 || tf == 2 || tf == 8 || tf == 13 else { return nil }
+        let is709 = tf == 1
         guard
             let tex = makeLinearTexture(
                 from: image, pixelFormat: .rgba16Float, usage: [.shaderRead],
-                premultiply: image.alpha != nil && !image.alphaPremultiplied)
+                premultiply: image.alpha != nil && !image.alphaPremultiplied,
+                displayMode: is709 ? 2 : 1)
         else { return nil }
         let w = image.width
         let h = image.height
@@ -149,10 +157,14 @@ public final class JXLMetalColorConverter {
                 from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
         }
         let name: CFString
-        switch image.params.primaries {
-        case 11: name = CGColorSpace.extendedLinearDisplayP3
-        case 9: name = CGColorSpace.extendedLinearITUR_2020
-        default: name = CGColorSpace.extendedLinearSRGB
+        if is709 {
+            name = CGColorSpace.itur_709
+        } else {
+            switch image.params.primaries {
+            case 11: name = CGColorSpace.extendedLinearDisplayP3
+            case 9: name = CGColorSpace.extendedLinearITUR_2020
+            default: name = CGColorSpace.extendedLinearSRGB
+            }
         }
         guard let cs = CGColorSpace(name: name) else { return nil }
         // Premultiplied: scaling straight-alpha content bleeds transparent
@@ -234,7 +246,25 @@ public final class JXLMetalColorConverter {
                     lr *= ratio; lg *= ratio; lb *= ratio;
                 }
             }
-            // Premultiply for display when requested (u[31]).
+            // Display modes (u[32]): 1 = clamp SDR linear to [0,1]
+            // (extended-linear would carry DCT ringing outside the sRGB gamut
+            // onto wide-gamut displays; the CPU path clamps at uint8);
+            // 2 = additionally encode with the BT.709 OETF — 709 content is
+            // *displayed* through the 1886-style convention, so raw linear
+            // skips the intended OETF/EOTF asymmetry (washed-out mid-tones).
+            if (u[32] > 0.5) {
+                lr = clamp(lr, 0.0, 1.0);
+                lg = clamp(lg, 0.0, 1.0);
+                lb = clamp(lb, 0.0, 1.0);
+            }
+            if (u[32] > 1.5) {
+                lr = lr < 0.018 ? 4.5 * lr : 1.099 * pow(lr, 0.45) - 0.099;
+                lg = lg < 0.018 ? 4.5 * lg : 1.099 * pow(lg, 0.45) - 0.099;
+                lb = lb < 0.018 ? 4.5 * lb : 1.099 * pow(lb, 0.45) - 0.099;
+            }
+            // Premultiply for display when requested (u[31]), in the output
+            // space (matching the CPU converter, which premultiplies the
+            // encoded bytes).
             if (u[31] > 0.5) {
                 lr *= xyba.w; lg *= xyba.w; lb *= xyba.w;
             }
