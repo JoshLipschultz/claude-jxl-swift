@@ -18,6 +18,9 @@ public struct JXLImageInfo: Equatable, Sendable {
     public let colorChannelCount: Int
     public let extraChannelCount: Int
     public let hasAlpha: Bool
+    /// `true` when the alpha channel's samples are already premultiplied
+    /// (associated alpha) — display paths must not multiply again.
+    public let alphaPremultiplied: Bool
     public let orientation: UInt32
     public let hasAnimation: Bool
     /// Tick rate and loop count when `hasAnimation`.
@@ -86,6 +89,20 @@ public struct JXLDecodedImage: Sendable {
     /// `nil` for VarDCT frames, whose planes are always converted to sRGB —
     /// use `JXL.readICCProfile` to obtain the raw embedded profile regardless.
     public let iccProfile: Data?
+
+    public init(
+        width: Int, height: Int, colorChannels: Int, extraChannels: Int,
+        bitsPerSample: Int, isFloat: Bool, planes: [[Int32]], iccProfile: Data? = nil
+    ) {
+        self.width = width
+        self.height = height
+        self.colorChannels = colorChannels
+        self.extraChannels = extraChannels
+        self.bitsPerSample = bitsPerSample
+        self.isFloat = isFloat
+        self.planes = planes
+        self.iccProfile = iccProfile
+    }
 }
 
 /// Output sample representation for rendered (lossy/XYB) frames.
@@ -125,6 +142,9 @@ public enum JXL {
             colorChannelCount: metadata.colorChannelCount,
             extraChannelCount: metadata.extraChannelCount,
             hasAlpha: metadata.hasAlpha,
+            alphaPremultiplied: metadata.extraChannels.contains {
+                $0.type == 0 && $0.alphaAssociated
+            },
             orientation: metadata.orientation,
             hasAnimation: metadata.hasAnimation,
             animation: metadata.animation,

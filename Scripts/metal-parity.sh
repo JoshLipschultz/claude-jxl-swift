@@ -36,4 +36,6 @@ exec "$BUILD/metal-parity" \
     "$FIX/128x128_pdc2.jxl" \
     "$FIX/384x256_prog.jxl" \
     "$FIX/384x256_progq.jxl" \
+    "$FIX/96x64_ecups.jxl" \
+    "$FIX/96x64_alpha16.jxl" \
     "$@"

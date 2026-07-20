@@ -20,7 +20,8 @@ final class ThumbnailProvider: QLThumbnailProvider {
             let info = try JXL.readInfo(contentsOf: request.fileURL)
             let decoded = try JXL.decodeImage(contentsOf: request.fileURL)
             let image = try JXLImageConverter.makeCGImage(
-                from: decoded, orientation: info.orientation)
+                from: decoded, orientation: info.orientation,
+                alphaPremultiplied: info.alphaPremultiplied)
             let imageSize = CGSize(width: image.width, height: image.height)
 
             let contextSize = Self.aspectFitSize(for: imageSize, in: request.maximumSize)

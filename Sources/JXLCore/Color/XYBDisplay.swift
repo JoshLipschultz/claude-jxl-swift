@@ -46,6 +46,9 @@ public struct JXLXYBFloatImage: Sendable {
     public let b: [Float]
     /// Normalized alpha (0…1), or nil when the frame has no alpha channel.
     public let alpha: [Float]?
+    /// `true` when the file's alpha is associated (samples already
+    /// premultiplied) — display paths must not multiply again.
+    public let alphaPremultiplied: Bool
     public let params: JXLXYBColorParams
 }
 
@@ -79,8 +82,10 @@ extension FrameDecoder {
         // the GPU path targets enumerated primaries + transfer only.
         if case .curve = spec.transfer { return nil }
 
-        let w = dim.xsize
-        let h = dim.ysize
+        // Visible dimensions AFTER upsampling (xyb.width/height track the
+        // upsampled size; dim.xsize is the coded, pre-upsampling size).
+        let w = xyb.width
+        let h = xyb.height
         var x = [Float](repeating: 0, count: w * h)
         var y = [Float](repeating: 0, count: w * h)
         var b = [Float](repeating: 0, count: w * h)
@@ -94,19 +99,26 @@ extension FrameDecoder {
             }
         }
 
-        // Alpha (first alpha extra channel), normalized to 0…1.
+        // Alpha (first alpha extra channel), normalized to 0…1. Extra channels
+        // finalize at output (post-upsampling) resolution; anything else is a
+        // layout we don't understand — drop to the CPU path rather than
+        // composite a misaligned plane.
         var alpha: [Float]? = nil
+        var alphaPremultiplied = false
         if let ai = metadata.extraChannels.firstIndex(where: { $0.type == 0 }) {
             let ecPlanes = try finalizeExtraChannels()
             if ai < ecPlanes.count {
+                guard ecPlanes[ai].count == w * h else { return nil }
                 let bits = Int(metadata.extraChannels[ai].bitDepth.bitsPerSample)
                 let scale = 1.0 / Float((1 << bits) - 1)
                 alpha = ecPlanes[ai].map { Float($0) * scale }
+                alphaPremultiplied = metadata.extraChannels[ai].alphaAssociated
             }
         }
 
         return JXLXYBFloatImage(
             width: w, height: h, x: x, y: y, b: b, alpha: alpha,
+            alphaPremultiplied: alphaPremultiplied,
             params: spec.displayParams(colorEncoding: metadata.colorEncoding,
                 intensityTarget: metadata.toneMapping.intensityTarget))
     }

@@ -120,7 +120,8 @@ enum DecodePipeline {
             let decoded = try? JXL.decodePreview(from: data),
             let cg = try? JXLImageConverter.makeCGImage(
                 from: decoded, orientation: info.orientation,
-                colorEncoding: info.colorEncoding)
+                colorEncoding: info.colorEncoding,
+                alphaPremultiplied: info.alphaPremultiplied)
         else { return nil }
         // Displayed size is the full image's (orientation-swapped when needed).
         let swapped = info.orientation >= 5
@@ -149,20 +150,28 @@ enum DecodePipeline {
             // the GPU and hand the compositor extended-linear (EDR-native)
             // content. Falls back to the CPU CGImage for HDR, oriented, layered,
             // YCbCr and native-Modular frames (decodeXYBForDisplay returns nil).
+            // JXL_CPU_COLOR=1 forces the CPU path for A/B verification.
             var cg: CGImage? = nil
-            if !isHDR, info.orientation == 1, let converter = metalConverter,
+            if !isHDR, info.orientation == 1,
+                ProcessInfo.processInfo.environment["JXL_CPU_COLOR"] == nil,
+                let converter = metalConverter,
                 let xyb = try? JXL.decodeXYBForDisplay(from: data)
             {
                 cg = converter.makeLinearCGImage(from: xyb)
             }
+            let usedGPU = cg != nil
             let image = try cg
                 ?? JXLImageConverter.makeCGImage(
                     from: decoded, orientation: info.orientation,
-                    colorEncoding: info.colorEncoding)
+                    colorEncoding: info.colorEncoding,
+                    alphaPremultiplied: info.alphaPremultiplied)
+            // Status-bar tag names the display color path so the Metal route
+            // is verifiable at a glance.
+            let pathTag = usedGPU ? "  ·  Metal linear" : "  ·  CPU color"
             return DecodeResult(
                 image: image,
                 sampler: PixelSampler(decoded, orientation: info.orientation),
-                summary: summarize(info: info, image: decoded),
+                summary: summarize(info: info, image: decoded) + pathTag,
                 report: report)
         } catch {
             let reason = (error as? JXLError).map(String.init(describing:))
@@ -215,7 +224,8 @@ enum DecodePipeline {
             guard
                 let cg = try? JXLImageConverter.makeCGImage(
                     from: frame.image, orientation: info.orientation,
-                    colorEncoding: info.colorEncoding)
+                    colorEncoding: info.colorEncoding,
+                    alphaPremultiplied: info.alphaPremultiplied)
             else { return .failed }
             images.append(cg)
             durations.append(Double(frame.durationTicks) * secondsPerTick)

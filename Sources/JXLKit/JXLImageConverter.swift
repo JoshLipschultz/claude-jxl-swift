@@ -33,7 +33,10 @@ public enum JXLImageConverter {
 
     /// The CGColorSpace describing samples rendered with `encoding`'s numeric
     /// color encoding, when a well-known one matches (ITU-R 2100 PQ/HLG for
-    /// HDR, Display P3, ITU-R 2020). nil falls back to device RGB.
+    /// HDR, Display P3, ITU-R 2020, BT.709, sRGB). nil falls back to device
+    /// RGB. Tagging matters even for SDR: untagged (device) content skips
+    /// color management entirely — BT.709-transfer samples read as the
+    /// display's own response shift every mid-tone.
     public static func displayColorSpace(for encoding: JXLColorEncoding?) -> CGColorSpace? {
         guard let encoding, !encoding.wantICC, !encoding.hasGamma else { return nil }
         switch (encoding.primaries, encoding.transferFunction) {
@@ -41,6 +44,13 @@ public enum JXLImageConverter {
         case (9, 18): return CGColorSpace(name: CGColorSpace.itur_2100_HLG)
         case (9, _): return CGColorSpace(name: CGColorSpace.itur_2020)
         case (11, 13): return CGColorSpace(name: CGColorSpace.displayP3)
+        // sRGB primaries (or unsignaled = sRGB): match the transfer. Custom
+        // primaries (2) stay nil — their samples are in a space CG has no
+        // name for.
+        case (0, 1), (1, 1): return CGColorSpace(name: CGColorSpace.itur_709)
+        case (0, 8), (1, 8): return CGColorSpace(name: CGColorSpace.linearSRGB)
+        case (0, 0), (0, 2), (0, 13), (1, 0), (1, 2), (1, 13):
+            return CGColorSpace(name: CGColorSpace.sRGB)
         default: return nil
         }
     }
@@ -53,14 +63,17 @@ public enum JXLImageConverter {
     /// it correctly, including EDR.
     public static func makeCGImage(
         from image: JXLDecodedImage, orientation: UInt32 = 1,
-        colorEncoding: JXLColorEncoding? = nil
+        colorEncoding: JXLColorEncoding? = nil,
+        alphaPremultiplied: Bool = false
     ) throws -> CGImage {
         guard image.width > 0, image.height > 0 else { throw ConversionError.emptyImage }
         guard image.colorChannels >= 1, image.planes.count >= image.colorChannels else {
             throw ConversionError.missingPlanes
         }
         if image.bitsPerSample == 16 && !image.isFloat {
-            return try makeCGImage16(from: image, orientation: orientation, colorEncoding: colorEncoding)
+            return try makeCGImage16(
+                from: image, orientation: orientation, colorEncoding: colorEncoding,
+                alphaPremultiplied: alphaPremultiplied)
         }
 
         let width = image.width
@@ -73,7 +86,10 @@ public enum JXLImageConverter {
         let b = isGray ? image.planes[0] : image.planes[2]
         let alpha: [Int32]? = image.extraChannels > 0 ? image.planes[image.colorChannels] : nil
 
-        // Per-sample normaliser to 0...255.
+        // Per-sample normaliser to 0...255. Samples are SIGNED: lossy decode
+        // legitimately produces values below 0 / above maxVal (libjxl clamps
+        // at output). Reinterpreting as unsigned wraps −1 to opaque/full —
+        // black fringes wherever a lossy alpha edge rings negative.
         let maxVal = image.bitsPerSample >= 31 ? 0 : (1 << image.bitsPerSample) - 1
         let inv = maxVal > 0 ? 255.0 / Double(maxVal) : 0
         @inline(__always) func norm(_ sample: Int32) -> UInt8 {
@@ -82,18 +98,30 @@ public enum JXLImageConverter {
                 let clamped = f.isNaN ? 0 : min(max(f, 0), 1)
                 return UInt8(clamped * 255 + 0.5)
             }
-            let v = Double(UInt32(bitPattern: sample)) * inv
+            let v = Double(sample) * inv
             return UInt8(min(max(v, 0), 255) + 0.5)
         }
 
+        // Premultiplied for display: scaling/filtering straight-alpha content
+        // bleeds the (arbitrary) RGB of fully transparent pixels into visible
+        // edges — dark halos around lossy alpha edges. Files with associated
+        // alpha are already premultiplied; only the tag changes for them.
         var rgba = [UInt8](repeating: 0, count: pixelCount * 4)
         rgba.withUnsafeMutableBufferPointer { out in
             for i in 0..<pixelCount {
                 let o = i * 4
-                out[o + 0] = norm(r[i])
-                out[o + 1] = norm(g[i])
-                out[o + 2] = norm(b[i])
-                out[o + 3] = alpha.map { norm($0[i]) } ?? 255
+                let a = alpha.map { norm($0[i]) } ?? 255
+                if let _ = alpha, !alphaPremultiplied, a != 255 {
+                    let ai = Int(a)
+                    out[o + 0] = UInt8((Int(norm(r[i])) * ai + 127) / 255)
+                    out[o + 1] = UInt8((Int(norm(g[i])) * ai + 127) / 255)
+                    out[o + 2] = UInt8((Int(norm(b[i])) * ai + 127) / 255)
+                } else {
+                    out[o + 0] = norm(r[i])
+                    out[o + 1] = norm(g[i])
+                    out[o + 2] = norm(b[i])
+                }
+                out[o + 3] = a
             }
         }
 
@@ -103,7 +131,10 @@ public enum JXLImageConverter {
         let colorSpace = image.iccProfile.flatMap { CGColorSpace(iccData: $0 as CFData) }
             ?? displayColorSpace(for: colorEncoding)
             ?? CGColorSpaceCreateDeviceRGB()
-        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue)
+        let bitmapInfo = CGBitmapInfo(
+            rawValue: alpha != nil
+                ? CGImageAlphaInfo.premultipliedLast.rawValue
+                : CGImageAlphaInfo.last.rawValue)
         guard
             let provider = CGDataProvider(data: Data(rgba) as CFData),
             let cg = CGImage(
@@ -121,7 +152,8 @@ public enum JXLImageConverter {
     /// HLG, whose 8-bit quantization visibly bands) and tags the HDR color
     /// space so the window server applies the right tone mapping / EDR.
     private static func makeCGImage16(
-        from image: JXLDecodedImage, orientation: UInt32, colorEncoding: JXLColorEncoding?
+        from image: JXLDecodedImage, orientation: UInt32, colorEncoding: JXLColorEncoding?,
+        alphaPremultiplied: Bool = false
     ) throws -> CGImage {
         let width = image.width
         let height = image.height
@@ -132,21 +164,33 @@ public enum JXLImageConverter {
         let b = isGray ? image.planes[0] : image.planes[2]
         let alpha: [Int32]? = image.extraChannels > 0 ? image.planes[image.colorChannels] : nil
 
+        // Premultiplied for display (see the 8-bit path).
         var rgba = [UInt16](repeating: 0, count: pixelCount * 4)
         rgba.withUnsafeMutableBufferPointer { out in
             for i in 0..<pixelCount {
                 let o = i * 4
-                out[o + 0] = UInt16(clamping: r[i])
-                out[o + 1] = UInt16(clamping: g[i])
-                out[o + 2] = UInt16(clamping: b[i])
-                out[o + 3] = alpha.map { UInt16(clamping: $0[i]) } ?? 65535
+                let a = alpha.map { UInt16(clamping: $0[i]) } ?? 65535
+                if let _ = alpha, !alphaPremultiplied, a != 65535 {
+                    let ai = Int(a)
+                    out[o + 0] = UInt16((Int(UInt16(clamping: r[i])) * ai + 32767) / 65535)
+                    out[o + 1] = UInt16((Int(UInt16(clamping: g[i])) * ai + 32767) / 65535)
+                    out[o + 2] = UInt16((Int(UInt16(clamping: b[i])) * ai + 32767) / 65535)
+                } else {
+                    out[o + 0] = UInt16(clamping: r[i])
+                    out[o + 1] = UInt16(clamping: g[i])
+                    out[o + 2] = UInt16(clamping: b[i])
+                }
+                out[o + 3] = a
             }
         }
         let colorSpace = displayColorSpace(for: colorEncoding)
             ?? image.iccProfile.flatMap { CGColorSpace(iccData: $0 as CFData) }
             ?? CGColorSpaceCreateDeviceRGB()
         let bitmapInfo = CGBitmapInfo(
-            rawValue: CGImageAlphaInfo.last.rawValue | CGBitmapInfo.byteOrder16Little.rawValue)
+            rawValue: (alpha != nil
+                ? CGImageAlphaInfo.premultipliedLast.rawValue
+                : CGImageAlphaInfo.last.rawValue)
+                | CGBitmapInfo.byteOrder16Little.rawValue)
         let data = rgba.withUnsafeBufferPointer { Data(buffer: $0) }
         guard
             let provider = CGDataProvider(data: data as CFData),

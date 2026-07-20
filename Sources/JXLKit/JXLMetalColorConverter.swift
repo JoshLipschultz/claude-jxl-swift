@@ -45,7 +45,7 @@ public final class JXLMetalColorConverter {
     /// precision, half the bandwidth) or `.rgba32Float` for exact readback.
     public func makeLinearTexture(
         from image: JXLXYBFloatImage, pixelFormat: MTLPixelFormat = .rgba16Float,
-        usage: MTLTextureUsage = [.shaderRead]
+        usage: MTLTextureUsage = [.shaderRead], premultiply: Bool = false
     ) -> MTLTexture? {
         let w = image.width
         let h = image.height
@@ -76,6 +76,7 @@ public final class JXLMetalColorConverter {
         guard let dstTex = device.makeTexture(descriptor: dstDesc) else { return nil }
 
         var params = Self.packParams(image.params)
+        params.append(premultiply ? 1 : 0)
         guard let cmd = queue.makeCommandBuffer(),
             let enc = cmd.makeComputeCommandEncoder()
         else { return nil }
@@ -135,7 +136,8 @@ public final class JXLMetalColorConverter {
         if tf == 16 || tf == 18 { return nil }  // PQ / HLG → CPU path
         guard
             let tex = makeLinearTexture(
-                from: image, pixelFormat: .rgba16Float, usage: [.shaderRead])
+                from: image, pixelFormat: .rgba16Float, usage: [.shaderRead],
+                premultiply: image.alpha != nil && !image.alphaPremultiplied)
         else { return nil }
         let w = image.width
         let h = image.height
@@ -153,8 +155,12 @@ public final class JXLMetalColorConverter {
         default: name = CGColorSpace.extendedLinearSRGB
         }
         guard let cs = CGColorSpace(name: name) else { return nil }
+        // Premultiplied: scaling straight-alpha content bleeds transparent
+        // pixels' (arbitrary) RGB into visible edges.
+        let alphaInfo: CGImageAlphaInfo =
+            image.alpha != nil ? .premultipliedLast : .last
         let bitmapInfo = CGBitmapInfo(
-            rawValue: CGImageAlphaInfo.last.rawValue
+            rawValue: alphaInfo.rawValue
                 | CGBitmapInfo.floatComponents.rawValue
                 | CGBitmapInfo.byteOrder16Little.rawValue)
         let data = halfs.withUnsafeBufferPointer { Data(buffer: $0) }
@@ -227,6 +233,10 @@ public final class JXLMetalColorConverter {
                     float ratio = min(pow(lum, u[27]), 1e9);
                     lr *= ratio; lg *= ratio; lb *= ratio;
                 }
+            }
+            // Premultiply for display when requested (u[31]).
+            if (u[31] > 0.5) {
+                lr *= xyba.w; lg *= xyba.w; lb *= xyba.w;
             }
             dst.write(float4(lr, lg, lb, xyba.w), gid);
         }
