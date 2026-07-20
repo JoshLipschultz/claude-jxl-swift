@@ -1,5 +1,15 @@
 # JPEG XL conformance scorecard — pure-Swift decoder
 
+## Update (2026-07-19, latest): 25 / 26 — patches_lossless bit-exact
+
+Patches on native-space Modular frames landed (full blending.cc
+PerformBlending port: all 8 PatchBlendModes incl. alpha above/below variants
+and per-extra-channel blendings; referenceOnly frames decoded as native float
+planes). `patches_lossless`, the last decode-refusing testcase, now decodes
+**bit-exact** against its reference. The only remaining non-pass is `patches`
+(57.4 vs tol 80) — the deliberate skcms-parametric-TRC-fit residual inside the
+reference itself. Oracle binaries are libjxl v0.12.0 throughout.
+
 ## Update (2026-07-19, later): 24 / 26 after float animation frames
 
 `jxl frames <in> <prefix> float` now emits per-frame PFMs (decodeFrames

@@ -20,11 +20,12 @@ it serves only as the test oracle (`cjxl`/`djxl` compare runs).
 > See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and
 > [docs/jxl-primer.md](docs/jxl-primer.md) for a format primer.
 
-On the official conformance corpus: 22 of 26 testcases meet their tolerances
-(5 bit-exact) — see [docs/conformance-report.md](docs/conformance-report.md).
-Not yet supported: one modular-patches frame shape (`patches_lossless`) and
-nested DC frames (`progressive_dc=2`); both fail cleanly with a descriptive
-error.
+On the official conformance corpus: **25 of 26 testcases** meet their official
+tolerances (6 bit-exact); the one exception embeds a third-party CMS
+approximation in the reference itself — see
+[docs/conformance-report.md](docs/conformance-report.md). The only
+unsupported feature left is nested DC frames (`progressive_dc=2`), which
+fails cleanly with a descriptive error.
 
 ## Command-line tool
 
@@ -37,6 +38,8 @@ $ jxl boxes image.jxl                   # ISOBMFF container box listing
 $ jxl frames anim.jxl out               # decode animation frames -> out_<i>.ppm
 $ jxl decode image.jxl out.ppm          # decode to PGM/PPM (or .pam with alpha)
 $ jxl decode image.jxl out.ppm 16       # ... at 16-bit, or `float` -> PFM
+$ jxl decode image.jxl out.ppm dither   # blue-noise dither 8-bit output
+                                        #   (`nospot` = don't render spot colors)
 $ jxl tojpeg recon.jxl out.jpg          # byte-exact JPEG reconstruction
 $ jxl icc image.jxl out.icc             # extract the embedded ICC profile
 $ jxl bench image.jxl                   # decode benchmark
