@@ -110,6 +110,11 @@ struct PrefixCodeSpec {
     let alphabetSize: Int  // trimmed: last used symbol + 1 (min 1)
     let lengths: [UInt8]
     let codes: [UInt32]
+    /// Set when exactly one symbol is used: the decoder builds a 0-bit table
+    /// (both via `alphabetSize == 1` and via the simple 1-symbol form), so
+    /// writeSymbol must emit NOTHING — a phantom 1-bit code here desyncs any
+    /// stream where tokens aren't the section's final field.
+    let singleSymbol: Int?
 
     init(histogram: [Int]) {
         var maxUsed = -1
@@ -117,14 +122,18 @@ struct PrefixCodeSpec {
         alphabetSize = max(1, maxUsed + 1)
         var h = Array(histogram.prefix(alphabetSize))
         if maxUsed < 0 { h = [1] }  // degenerate: nothing to code
-        lengths = limitedHuffmanLengths(histogram: h, maxBits: kPrefixMaxBits)
-        codes = canonicalPrefixCodes(lengths: lengths)
+        let l = limitedHuffmanLengths(histogram: h, maxBits: kPrefixMaxBits)
+        lengths = l
+        codes = canonicalPrefixCodes(lengths: l)
+        let used = l.indices.filter { l[$0] > 0 }
+        singleSymbol = used.count == 1 ? used[0] : nil
     }
 
     var usedSymbols: [Int] { lengths.indices.filter { lengths[$0] > 0 } }
 
     @inline(__always)
     func writeSymbol(_ w: BitWriter, _ sym: Int) {
+        if singleSymbol != nil { return }  // 0-bit code
         w.write(UInt64(codes[sym]), Int(lengths[sym]))
     }
 
@@ -295,59 +304,154 @@ struct EncToken {
     var value: UInt32
 }
 
-/// Prefix-code entropy encoder for one entropy header: builds a single shared
-/// histogram over every stream's tokens (all contexts map to cluster 0 — the
-/// clustering knob comes with E2), writes the header, then writes token
-/// streams. Dual of `decodeHistograms` + `ANSSymbolReader` on the prefix path.
-struct PrefixEntropyEncoder {
-    static let uintConfig = HybridUintConfig(splitExponent: 4, msbInToken: 2, lsbInToken: 0)
+let encUintConfig = HybridUintConfig(splitExponent: 4, msbInToken: 2, lsbInToken: 0)
 
-    let numContexts: Int
-    let spec: PrefixCodeSpec
+// Free functions rather than locals inside ClusteredHistograms.init: the
+// Swift 6.4 beta optimizer (LoopInvariantCodeMotion) crashes at -O on the
+// nested-closure form of that init.
+private func clusterEntropyBits(_ h: [Int]) -> Double {
+    let total = h.reduce(0, +)
+    if total == 0 { return 0 }
+    var bits = 0.0
+    for c in h where c > 0 {
+        bits += Double(c) * -log2(Double(c) / Double(total))
+    }
+    return bits
+}
 
-    /// `streams` are every token run that will be coded under this header
-    /// (their concatenation feeds the shared histogram).
-    init(numContexts: Int, streams: [[EncToken]]) {
-        self.numContexts = numContexts
-        var histogram = [Int](repeating: 0, count: 1)
-        for stream in streams {
-            for t in stream {
-                let (token, _, _) = Self.uintConfig.encode(t.value)
-                if Int(token) >= histogram.count {
-                    histogram.append(contentsOf: repeatElement(0, count: Int(token) + 1 - histogram.count))
+private func clusterMerged(_ a: [Int], _ b: [Int]) -> [Int] {
+    var m = a.count >= b.count ? a : b
+    let s = a.count >= b.count ? b : a
+    for i in 0..<s.count { m[i] += s[i] }
+    return m
+}
+
+private func accumulatePerContext(numContexts: Int, streams: [[EncToken]]) -> [[Int]] {
+    var perCtx = [[Int]](repeating: [0], count: numContexts)
+    for stream in streams {
+        for t in stream {
+            let (token, _, _) = encUintConfig.encode(t.value)
+            let c = Int(t.ctx)
+            if Int(token) >= perCtx[c].count {
+                perCtx[c].append(
+                    contentsOf: repeatElement(0, count: Int(token) + 1 - perCtx[c].count))
+            }
+            perCtx[c][Int(token)] += 1
+        }
+    }
+    return perCtx
+}
+
+// @_optimize(none): the Swift 6.4 beta optimizer's LoopInvariantCodeMotion
+// pass crashes (signal 5) on this function's pairwise merge loop at -O. The
+// loop is O(clusters² ≤ 48²) — optimization is irrelevant here.
+@_optimize(none)
+private func greedyCluster(
+    perCtx: [[Int]], numContexts: Int, maxClusters: Int
+) -> (map: [UInt8], clusters: [[Int]]) {
+    // Start: one cluster per context (empty contexts merge free — they cost
+    // nothing and any mapping is valid).
+    var clusters: [[Int]] = perCtx
+    var map = (0..<numContexts).map { $0 }
+    // The serialized cost of an extra histogram (code description + uint
+    // config); crude but only steers when gains are marginal anyway.
+    let perHistogramOverhead = 60.0
+    while clusters.count > 1 {
+        var bestI = -1
+        var bestJ = -1
+        var bestCost = Double.infinity
+        for i in 0..<clusters.count {
+            for j in (i + 1)..<clusters.count {
+                let cost =
+                    clusterEntropyBits(clusterMerged(clusters[i], clusters[j]))
+                    - clusterEntropyBits(clusters[i]) - clusterEntropyBits(clusters[j])
+                if cost < bestCost {
+                    bestCost = cost
+                    bestI = i
+                    bestJ = j
                 }
-                histogram[Int(token)] += 1
             }
         }
-        spec = PrefixCodeSpec(histogram: histogram)
+        if clusters.count <= maxClusters && bestCost > perHistogramOverhead { break }
+        clusters[bestI] = clusterMerged(clusters[bestI], clusters[bestJ])
+        clusters.remove(at: bestJ)
+        for c in 0..<numContexts {
+            if map[c] == bestJ { map[c] = bestI }
+            if map[c] > bestJ { map[c] -= 1 }
+        }
+    }
+    return (map.map { UInt8($0) }, clusters)
+}
+
+/// Per-context token histograms clustered down to at most `maxClusters`
+/// histograms (the simple context-map form caps bits-per-entry at 3, i.e. 8
+/// histograms). Greedy pairwise merging by entropy cost: merge while over the
+/// cap, then keep merging while a merge costs less than the ~bits saved by
+/// serializing one fewer histogram.
+struct ClusteredHistograms {
+    let numContexts: Int
+    let contextMap: [UInt8]  // context -> cluster, every cluster index used
+    let histograms: [[Int]]  // per-cluster token histograms
+
+    init(numContexts: Int, streams: [[EncToken]], maxClusters: Int = 8) {
+        self.numContexts = numContexts
+        let perCtx = accumulatePerContext(numContexts: numContexts, streams: streams)
+        let (map, clusters) = greedyCluster(
+            perCtx: perCtx, numContexts: numContexts, maxClusters: maxClusters)
+        contextMap = map
+        histograms = clusters
+    }
+
+    /// Writes the context-map field (dual of `decodeContextMap`, simple form).
+    /// Only valid for ≤ 8 histograms (bits_per_entry ≤ 3).
+    func writeContextMap(_ w: BitWriter) {
+        w.writeBool(true)  // is_simple
+        let bits = histograms.count > 1 ? ceilLog2Nonzero(UInt32(histograms.count)) : 0
+        w.write(UInt64(bits), 2)
+        if bits > 0 {
+            for entry in contextMap { w.write(UInt64(entry), bits) }
+        }
+    }
+}
+
+/// Prefix-code entropy encoder for one entropy header: clustered per-context
+/// histograms, the header dual of `decodeHistograms` (prefix path), and token
+/// stream writing.
+struct PrefixEntropyEncoder {
+    let clustered: ClusteredHistograms
+    let specs: [PrefixCodeSpec]
+
+    /// `streams` are every token run that will be coded under this header.
+    init(numContexts: Int, streams: [[EncToken]]) {
+        clustered = ClusteredHistograms(numContexts: numContexts, streams: streams)
+        specs = clustered.histograms.map { PrefixCodeSpec(histogram: $0) }
     }
 
     /// Writes the entropy header (mirrors `decodeHistograms`).
     func writeHeader(_ w: BitWriter) {
         w.writeBool(false)  // lz77 enabled
-        if numContexts > 1 {
-            w.writeBool(true)  // context map: is_simple
-            w.write(0, 2)  // 0 bits/entry: every context -> histogram 0
-        }
+        if clustered.numContexts > 1 { clustered.writeContextMap(w) }
         w.writeBool(true)  // use_prefix_code
-        // Hybrid-uint config: split_exponent=4 (4 bits for log_alpha_size 15),
-        // msb=2 (3 bits), lsb=0 (2 bits).
-        w.write(4, 4)
-        w.write(2, 3)
-        w.write(0, 2)
-        writeVarLenUint16(w, spec.alphabetSize - 1)
-        spec.writeDescription(w)
-    }
-
-    @inline(__always)
-    func writeValue(_ w: BitWriter, _ value: UInt32) {
-        let (token, nbits, bits) = Self.uintConfig.encode(value)
-        spec.writeSymbol(w, Int(token))
-        if nbits > 0 { w.write(UInt64(bits), Int(nbits)) }
+        for _ in specs {
+            // Hybrid-uint config per histogram: split_exponent=4 (4 bits for
+            // log_alpha_size 15), msb=2 (3 bits), lsb=0 (2 bits).
+            w.write(4, 4)
+            w.write(2, 3)
+            w.write(0, 2)
+        }
+        // All alphabet sizes first, then all code descriptions
+        // (decodeANSCodes order).
+        for spec in specs { writeVarLenUint16(w, spec.alphabetSize - 1) }
+        for spec in specs { spec.writeDescription(w) }
     }
 
     func encodeStream(_ w: BitWriter, _ tokens: [EncToken]) {
-        for t in tokens { writeValue(w, t.value) }
+        for t in tokens {
+            let spec = specs[Int(clustered.contextMap[Int(t.ctx)])]
+            let (token, nbits, bits) = encUintConfig.encode(t.value)
+            spec.writeSymbol(w, Int(token))
+            if nbits > 0 { w.write(UInt64(bits), Int(nbits)) }
+        }
     }
 }
 

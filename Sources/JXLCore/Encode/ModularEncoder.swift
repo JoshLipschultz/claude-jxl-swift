@@ -77,14 +77,39 @@ enum ModularEncoder {
             bitsPerSample: UInt32(image.bitsPerSample), grayscale: gray)
         writeFrameHeader(w)
 
+        // Learn the MA tree on a subsample of the (RCT-space) pixels, using
+        // group-local rects so training statistics match what tokenization
+        // will actually see at group borders.
+        var training = TreeTrainingSet()
+        let totalSamples = image.width * image.height * channels.count
+        let stride = max(1, totalSamples / 400_000)
+        for g in 0..<dim.numGroups {
+            let x0 = (g % dim.xsizeGroups) * dim.groupDim
+            let y0 = (g / dim.xsizeGroups) * dim.groupDim
+            let gw = min(dim.groupDim, image.width - x0)
+            let gh = min(dim.groupDim, image.height - y0)
+            for (c, plane) in channels.enumerated() {
+                training.collect(
+                    plane: plane, width: image.width, x0: x0, y0: y0, gw: gw, gh: gh,
+                    chan: c, stride: stride)
+            }
+        }
+        let tree = learnTree(training)
+
         if dim.numGroups == 1 {
             // Coalesced: one section carrying tree, histograms, and the global
-            // stream with every channel.
-            let groupTokens = tokenizeGroup(
-                channels, width: image.width, x0: 0, y0: 0, gw: image.width, gh: image.height)
-            let residual = makeEncoder(backend, numContexts: 1, streams: [groupTokens])
+            // stream with every channel (stream id 0).
+            var groupTokens: [EncToken] = []
+            for (c, plane) in channels.enumerated() {
+                tokenizeChannelWithTree(
+                    into: &groupTokens, plane: plane, width: image.width,
+                    x0: 0, y0: 0, gw: image.width, gh: image.height,
+                    chan: c, streamID: 0, tree: tree)
+            }
+            let residual = makeEncoder(
+                backend, numContexts: treeNumLeaves(tree), streams: [groupTokens])
             let s = BitWriter()
-            writeLfGlobalModular(s, residual: residual, useRCT: useRCT)
+            writeLfGlobalModular(s, tree: tree, residual: residual, useRCT: useRCT)
             residual.encodeStream(s, groupTokens)
             let section = s.finalize()
             w.writeBool(false)  // TOC: no permutation
@@ -97,23 +122,32 @@ enum ModularEncoder {
 
         // Multi-group: per-group token streams (prediction restarts at group
         // boundaries — the decoder decodes each group into a group-local
-        // sub-image), one shared histogram written in LfGlobal.
+        // sub-image), one shared histogram written in LfGlobal. Property 1
+        // (stream id) must match the decoder's ModularStreamId::ModularAC.
         var groupTokens: [[EncToken]] = []
         for g in 0..<dim.numGroups {
             let x0 = (g % dim.xsizeGroups) * dim.groupDim
             let y0 = (g / dim.xsizeGroups) * dim.groupDim
             let gw = min(dim.groupDim, image.width - x0)
             let gh = min(dim.groupDim, image.height - y0)
-            groupTokens.append(
-                tokenizeGroup(channels, width: image.width, x0: x0, y0: y0, gw: gw, gh: gh))
+            let streamID = 1 + 3 * dim.numDCGroups + 17 + g
+            var tokens: [EncToken] = []
+            for (c, plane) in channels.enumerated() {
+                tokenizeChannelWithTree(
+                    into: &tokens, plane: plane, width: image.width,
+                    x0: x0, y0: y0, gw: gw, gh: gh,
+                    chan: c, streamID: streamID, tree: tree)
+            }
+            groupTokens.append(tokens)
         }
-        let residual = makeEncoder(backend, numContexts: 1, streams: groupTokens)
+        let residual = makeEncoder(
+            backend, numContexts: treeNumLeaves(tree), streams: groupTokens)
 
         // Section 0 (LfGlobal): tree + shared histograms + the global stream's
         // GroupHeader. With one group dimension > group_dim, every color
         // channel is per-group, so the global stream carries no channel data.
         let s0 = BitWriter()
-        writeLfGlobalModular(s0, residual: residual, useRCT: useRCT)
+        writeLfGlobalModular(s0, tree: tree, residual: residual, useRCT: useRCT)
         var sections: [[UInt8]] = [s0.finalize()]
         // DC-group sections carry only squeeze channels with shift >= 3 — none
         // here, and the decoder reads nothing from them. Same for HfGlobal.
@@ -205,17 +239,21 @@ enum ModularEncoder {
         w.writeU64(0)  // frame-header extensions
     }
 
-    /// LfGlobal's modular pieces: default dc-quant, the global single-leaf
-    /// gradient tree, the shared residual entropy header (decodeModularChannels
-    /// reads tree + histograms together, before any group stream), then the
-    /// global stream's GroupHeader carrying the transforms.
+    /// LfGlobal's modular pieces: default dc-quant, the global (learned) MA
+    /// tree, the shared residual entropy header (decodeModularChannels reads
+    /// tree + histograms together, before any group stream), then the global
+    /// stream's GroupHeader carrying the transforms.
     private static func writeLfGlobalModular(
-        _ w: BitWriter, residual: any TokenEntropyEncoder, useRCT: Bool
+        _ w: BitWriter, tree: [MATreeNode], residual: any TokenEntropyEncoder, useRCT: Bool
     ) {
         // (flags = 0: no patches/splines/noise payloads)
         w.writeBool(true)  // dc-quant factors: default
         w.writeBool(true)  // has_tree: global tree follows
-        writeSingleLeafGradientTree(w)
+        let tokens = treeTokens(tree)
+        let enc = PrefixEntropyEncoder(numContexts: 6, streams: [tokens])  // kNumTreeContexts
+        enc.writeHeader(w)
+        enc.encodeStream(w, tokens)
+        // (prefix path: no ANS final state)
         residual.writeHeader(w)
         // Global modular stream: GroupHeader (with the RCT transform), then —
         // multi-group — nothing (all channels are per-group), or — coalesced —
@@ -237,48 +275,6 @@ enum ModularEncoder {
         w.writeU32(
             UInt32(size), .bits(10), .bits(14, offset: 1024),
             .bits(22, offset: 17408), .bits(30, offset: 4_211_712))
-    }
-
-    /// Residual tokens for one group rect across every channel, in decode
-    /// order, using the decoder's exact gradient prediction and group-local
-    /// border semantics (`decodeChannel` on the group sub-image).
-    private static func tokenizeGroup(
-        _ channels: [[Int32]], width: Int, x0: Int, y0: Int, gw: Int, gh: Int
-    ) -> [EncToken] {
-        var tokens: [EncToken] = []
-        tokens.reserveCapacity(gw * gh * channels.count)
-        for plane in channels {
-            plane.withUnsafeBufferPointer { px in
-                for y in 0..<gh {
-                    let row = (y0 + y) * width + x0
-                    let prev = row - width
-                    for x in 0..<gw {
-                        let left = x > 0 ? Int(px[row + x - 1]) : (y > 0 ? Int(px[prev + x]) : 0)
-                        let top = y > 0 ? Int(px[prev + x]) : left
-                        let topleft = (x > 0 && y > 0) ? Int(px[prev + x - 1]) : left
-                        let guess = predictOne(
-                            5, left: left, top: top, toptop: 0, topleft: topleft,
-                            topright: 0, leftleft: 0, toprightright: 0, wpPred: 0)
-                        let packed = packSigned(Int(px[row + x]) - guess)
-                        tokens.append(EncToken(ctx: 0, value: packed))
-                    }
-                }
-            }
-        }
-        return tokens
-    }
-
-    /// The global MA tree: one leaf, Gradient predictor, offset 0,
-    /// multiplier 1 — every sample lands in one context and prediction is
-    /// W+N−NW (`predictOne` case 5). Tree tokens: property=0 (leaf),
-    /// predictor=5, offset=0, mul_log=0, mul_bits=0, in tree contexts all
-    /// mapped to one histogram.
-    private static func writeSingleLeafGradientTree(_ w: BitWriter) {
-        let tokens = [0, 5, 0, 0, 0].map { EncToken(ctx: 0, value: UInt32($0)) }
-        let enc = PrefixEntropyEncoder(numContexts: 6, streams: [tokens])  // kNumTreeContexts
-        enc.writeHeader(w)
-        enc.encodeStream(w, tokens)
-        // (prefix path: no ANS final state)
     }
 
 }

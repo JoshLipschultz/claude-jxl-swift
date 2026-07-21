@@ -143,42 +143,22 @@ private func writeLogCountSymbol(_ w: BitWriter, _ symbol: Int) {
 
 // MARK: - ANS stream encoding
 
-/// Full entropy encoder on the ANS back-end: one shared histogram over every
-/// stream's tokens (all contexts → cluster 0, as in the prefix writer), the
-/// header dual of `decodeHistograms`, and per-section reverse-order stream
-/// encoding. Each section (group stream) is a fresh ANS state — the decoder
-/// constructs one `ANSSymbolReader` per section against the shared code.
-struct ANSEntropyEncoder {
-    static let uintConfig = HybridUintConfig(splitExponent: 4, msbInToken: 2, lsbInToken: 0)
-
-    let numContexts: Int
+/// One cluster's ANS coding tables: normalized counts plus the inverted alias
+/// table ((symbol, offset-within-frequency) → slot, the inverse of
+/// `aliasLookup`).
+private struct ANSClusterCode {
     let counts: [Int32]
-    let logAlphaSize: Int
-    /// (symbol, offset-within-frequency) → table slot; inverse of aliasLookup.
-    private let slots: [[UInt16]]
+    let slots: [[UInt16]]
 
-    init(numContexts: Int, streams: [[EncToken]]) {
-        self.numContexts = numContexts
-        var histogram: [Int] = [0]
-        for stream in streams {
-            for t in stream {
-                let (token, _, _) = Self.uintConfig.encode(t.value)
-                if Int(token) >= histogram.count {
-                    histogram.append(
-                        contentsOf: repeatElement(0, count: Int(token) + 1 - histogram.count))
-                }
-                histogram[Int(token)] += 1
-            }
-        }
-        if histogram.reduce(0, +) == 0 { histogram[0] = 1 }  // headers need a valid code
-        var normalized = normalizeANSCounts(histogram)
+    init(histogram: [Int], logAlphaSize: Int) {
+        var h = histogram
+        if h.reduce(0, +) == 0 { h = [1] }  // headers need a valid code
+        var normalized = normalizeANSCounts(h)
         while let last = normalized.last, last == 0, normalized.count > 1 {
             normalized.removeLast()
         }
         counts = normalized
-        logAlphaSize = max(5, ceilLog2Nonzero(UInt32(counts.count)))
 
-        // Build the decoder's alias table, then invert it to slot indices.
         let tableSize = 1 << logAlphaSize
         var table = [AliasEntry](repeating: AliasEntry(), count: tableSize)
         initAliasTable(distribution: counts, logAlphaSize: logAlphaSize, into: &table, base: 0)
@@ -195,22 +175,47 @@ struct ANSEntropyEncoder {
         }
         slots = s
     }
+}
+
+/// Full entropy encoder on the ANS back-end: clustered per-context histograms
+/// (shared `ClusteredHistograms` machinery), the header dual of
+/// `decodeHistograms`, and per-section reverse-order stream encoding. Each
+/// section (group stream) is a fresh ANS state — the decoder constructs one
+/// `ANSSymbolReader` per section against the shared code.
+struct ANSEntropyEncoder {
+    let clustered: ClusteredHistograms
+    let logAlphaSize: Int
+    private let codes: [ANSClusterCode]
+
+    init(numContexts: Int, streams: [[EncToken]]) {
+        clustered = ClusteredHistograms(numContexts: numContexts, streams: streams)
+        // log_alpha_size is shared across clusters (read once by the decoder);
+        // it must cover the largest cluster's trimmed alphabet.
+        var maxAlphabet = 1
+        for h in clustered.histograms {
+            var last = 0
+            for (s, c) in h.enumerated() where c > 0 { last = s }
+            maxAlphabet = max(maxAlphabet, last + 1)
+        }
+        let las = max(5, ceilLog2Nonzero(UInt32(maxAlphabet)))
+        logAlphaSize = las
+        codes = clustered.histograms.map { ANSClusterCode(histogram: $0, logAlphaSize: las) }
+    }
 
     /// Writes the entropy header (mirrors `decodeHistograms`, ANS path).
     func writeHeader(_ w: BitWriter) {
         w.writeBool(false)  // lz77 enabled
-        if numContexts > 1 {
-            w.writeBool(true)  // context map: is_simple
-            w.write(0, 2)  // 0 bits/entry: every context -> histogram 0
-        }
+        if clustered.numContexts > 1 { clustered.writeContextMap(w) }
         w.writeBool(false)  // use_prefix_code = false: ANS
         w.write(UInt64(logAlphaSize - 5), 2)
-        // Hybrid-uint config: split_exponent=4 in ceil_log2(logAlphaSize+1)
-        // bits, msb=2 in 3 bits, lsb=0 in 2 bits.
-        w.write(4, ceilLog2Nonzero(UInt32(logAlphaSize + 1)))
-        w.write(2, 3)
-        w.write(0, 2)
-        writeANSHistogram(w, counts: counts)
+        for _ in codes {
+            // Hybrid-uint config per histogram: split_exponent=4 in
+            // ceil_log2(logAlphaSize+1) bits, msb=2 in 3 bits, lsb=0 in 2 bits.
+            w.write(4, ceilLog2Nonzero(UInt32(logAlphaSize + 1)))
+            w.write(2, 3)
+            w.write(0, 2)
+        }
+        for code in codes { writeANSHistogram(w, counts: code.counts) }
     }
 
     /// Encodes one section's tokens: reverse rANS pass to compute the final
@@ -220,25 +225,29 @@ struct ANSEntropyEncoder {
     func encodeStream(_ w: BitWriter, _ tokens: [EncToken]) {
         let n = tokens.count
         var symbols = [UInt32](repeating: 0, count: n)
+        var cluster = [UInt8](repeating: 0, count: n)
         var extraBits = [(UInt32, UInt32)](repeating: (0, 0), count: n)
         for (i, t) in tokens.enumerated() {
-            let (token, nbits, bits) = Self.uintConfig.encode(t.value)
+            let (token, nbits, bits) = encUintConfig.encode(t.value)
             symbols[i] = token
+            cluster[i] = clustered.contextMap[Int(t.ctx)]
             extraBits[i] = (nbits, bits)
         }
         var chunk = [UInt16?](repeating: nil, count: n)
         var state: UInt32 = ansSignature << 16
         var i = n - 1
         while i >= 0 {
+            let code = codes[Int(cluster[i])]
             let sym = Int(symbols[i])
-            let f = UInt32(counts[sym])
+            let f = UInt32(code.counts[sym])
             // 64-bit compare: f == 4096 (single-symbol code) makes f << 20
             // overflow UInt32; the emit threshold is then 2^32 = never.
             if UInt64(state) >= UInt64(f) << 20 {
                 chunk[i] = UInt16(truncatingIfNeeded: state)
                 state >>= 16
             }
-            state = ((state / f) << UInt32(ansLogTabSize)) | UInt32(slots[sym][Int(state % f)])
+            state =
+                ((state / f) << UInt32(ansLogTabSize)) | UInt32(code.slots[sym][Int(state % f)])
             i -= 1
         }
         w.write(UInt64(state), 32)

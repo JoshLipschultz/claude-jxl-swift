@@ -425,8 +425,8 @@ struct TestRunner {
                 bitsPerSample: bits, isFloat: false, planes: planes)
         }
         let goldens: [(w: Int, h: Int, ch: Int, bits: Int, mode: Int, size: Int)] = [
-            (96, 64, 3, 8, 0, 2506), (96, 64, 3, 8, 1, 19795), (256, 256, 3, 8, 1, 175869),
-            (300, 200, 3, 8, 1, 201584), (512, 512, 1, 16, 2, 79), (100, 600, 1, 8, 0, 9009),
+            (96, 64, 3, 8, 0, 625), (96, 64, 3, 8, 1, 15739), (256, 256, 3, 8, 1, 121522),
+            (300, 200, 3, 8, 1, 187529), (512, 512, 1, 16, 2, 78), (100, 600, 1, 8, 0, 726),
         ]
         for g in goldens {
             let img = makeImage(w: g.w, h: g.h, channels: g.ch, bits: g.bits, mode: g.mode)
