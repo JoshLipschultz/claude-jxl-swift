@@ -85,7 +85,11 @@ struct TreeTrainingSet {
                             p, left: n.left, top: n.top, toptop: n.toptop,
                             topleft: n.topleft, topright: n.topright, leftleft: n.leftleft,
                             toprightright: n.toprightright, wpPred: 0)
-                        let (token, _, _) = encUintConfig.encode(encPackSigned(v - guess))
+                        // Residuals wrap to Int32 before packing (mod-2^32
+                        // congruence is what the decoder reconstructs; matters
+                        // for full-range float32 bit patterns).
+                        let diff = Int32(truncatingIfNeeded: v - guess)
+                        let (token, _, _) = encUintConfig.encode(encPackSigned(Int(diff)))
                         tokens.append(UInt8(truncatingIfNeeded: token))
                     }
                     count += 1
@@ -443,8 +447,14 @@ func tokenizeChannelWithTree(
                             leaf.predictor, left: n.left, top: n.top, toptop: n.toptop,
                             topleft: n.topleft, topright: n.topright, leftleft: n.leftleft,
                             toprightright: n.toprightright, wpPred: 0)
-                    let d = Int(px[row + x]) - guess
-                    tokens.append(EncToken(ctx: UInt32(leaf.lchild), value: encPackSigned(d)))
+                    // Truncate to Int32 BEFORE packing: the decoder computes
+                    // Int32(truncatingIfNeeded: guess + unpackSigned(v)), so
+                    // mod-2^32 congruence is the round-trip invariant.
+                    // Full-range samples (float32 bit patterns) produce raw
+                    // differences beyond ±2^31 where the untruncated pack
+                    // breaks it (E3's find, ported to the tree tokenizer).
+                    let d = Int32(truncatingIfNeeded: Int(px[row + x]) - guess)
+                    tokens.append(EncToken(ctx: UInt32(leaf.lchild), value: encPackSigned(Int(d))))
                 }
             }
         }

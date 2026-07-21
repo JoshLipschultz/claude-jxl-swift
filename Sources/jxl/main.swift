@@ -34,7 +34,8 @@ func usage() -> Never {
                                            Decode image (lossless or lossy) to PNM;
                                            "dither" = blue-noise dither 8-bit output
                                            (djxl 0.12 default)
-          jxl encode <in.pnm> <out.jxl>    Encode a binary PGM/PPM losslessly
+          jxl encode <in> <out.jxl>        Encode losslessly: PGM/PPM (int),
+                                           PAM P7 (gray/RGB + alpha), PFM (float32)
           jxl icc    <file.jxl> [out.icc]  Extract the embedded ICC profile
           jxl vardct <file.jxl>            Preflight VarDCT global metadata
           jxl vardct-dc <file.jxl> [dump]  Decode VarDCT XYB DC image (lossy)
@@ -322,16 +323,35 @@ do {
 
     case "encode":
         guard args.count >= 4 else { usage() }
-        guard let image = parsePNM(bytes) else {
-            fail("error: \(path) is not a binary PGM (P5) or PPM (P6) file")
+        // Dispatch on magic bytes: P5/P6 (PNM), P7 (PAM, alpha), PF/Pf (PFM,
+        // float32).
+        let image: JXLDecodedImage
+        if bytes.count >= 2 && bytes[0] == UInt8(ascii: "P") && bytes[1] == UInt8(ascii: "7") {
+            guard let img = parsePAM(bytes) else {
+                fail("error: \(path) is not a supported PAM (GRAYSCALE_ALPHA/RGB_ALPHA)")
+            }
+            image = img
+        } else if bytes.count >= 2 && bytes[0] == UInt8(ascii: "P")
+            && (bytes[1] == UInt8(ascii: "F") || bytes[1] == UInt8(ascii: "f"))
+        {
+            guard let img = parsePFMInput(bytes) else {
+                fail("error: \(path) is not a supported PFM (little-endian float32)")
+            }
+            image = img
+        } else if let img = parsePNM(bytes) {
+            image = img
+        } else {
+            fail("error: \(path) is not a binary PGM/PPM/PAM/PFM file")
         }
         let jxl = try JXL.encodeLossless(image: image)
         try Data(jxl).write(to: URL(fileURLWithPath: args[3]))
-        let raw = image.width * image.height * image.colorChannels
-            * (image.bitsPerSample > 8 ? 2 : 1)
+        let raw = image.width * image.height * (image.colorChannels + image.extraChannels)
+            * (image.isFloat ? 4 : (image.bitsPerSample > 8 ? 2 : 1))
+        let kind = image.isFloat ? "float32" : "\(image.bitsPerSample)-bit"
+        let space = image.colorChannels == 1 ? "gray" : "RGB"
+        let alpha = image.extraChannels > 0 ? "+alpha" : ""
         print(
-            "encoded \(image.width) x \(image.height) \(image.bitsPerSample)-bit "
-                + "\(image.colorChannels == 1 ? "gray" : "RGB") -> \(args[3]) "
+            "encoded \(image.width) x \(image.height) \(kind) \(space)\(alpha) -> \(args[3]) "
                 + "(\(jxl.count) bytes, raw \(raw))")
 
     default:
@@ -401,6 +421,112 @@ func parsePNM(_ bytes: [UInt8]) -> JXLDecodedImage? {
     return JXLDecodedImage(
         width: width, height: height, colorChannels: channels, extraChannels: 0,
         bitsPerSample: bits, isFloat: false, planes: planes)
+}
+
+/// Parses a binary PAM (P7) with TUPLTYPE GRAYSCALE_ALPHA or RGB_ALPHA into
+/// encoder input planes (color channels + one alpha extra channel) — the dual
+/// of `encodePAM`. Maxval up to 65535 (big-endian 16-bit above 255).
+func parsePAM(_ bytes: [UInt8]) -> JXLDecodedImage? {
+    guard bytes.count > 3, bytes[0] == UInt8(ascii: "P"), bytes[1] == UInt8(ascii: "7")
+    else { return nil }
+    var pos = 2
+    var width = 0, height = 0, depth = 0, maxval = 0
+    var tuple = ""
+    // Header: newline-separated "TOKEN value" lines (# comments allowed)
+    // until ENDHDR.
+    while pos < bytes.count {
+        var end = pos
+        while end < bytes.count && bytes[end] != UInt8(ascii: "\n") { end += 1 }
+        guard end < bytes.count else { return nil }
+        let line = String(decoding: bytes[pos..<end], as: UTF8.self)
+            .trimmingCharacters(in: .whitespaces)
+        pos = end + 1
+        if line.isEmpty || line.hasPrefix("#") { continue }
+        let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+        guard let key = parts.first else { continue }
+        switch key {
+        case "ENDHDR":
+            guard width >= 1, height >= 1, maxval >= 1, maxval <= 65535,
+                (depth == 2 && tuple == "GRAYSCALE_ALPHA")
+                    || (depth == 4 && tuple == "RGB_ALPHA")
+            else { return nil }
+            let colorChannels = depth - 1
+            let twoBytes = maxval > 255
+            let bytesPerSample = twoBytes ? 2 : 1
+            guard bytes.count - pos >= width * height * depth * bytesPerSample
+            else { return nil }
+            var bits = 1
+            while (1 << bits) - 1 < maxval { bits += 1 }
+            var planes = [[Int32]](
+                repeating: [Int32](repeating: 0, count: width * height), count: depth)
+            for i in 0..<(width * height) {
+                for c in 0..<depth {
+                    if twoBytes {
+                        planes[c][i] = Int32(bytes[pos]) << 8 | Int32(bytes[pos + 1])
+                        pos += 2
+                    } else {
+                        planes[c][i] = Int32(bytes[pos])
+                        pos += 1
+                    }
+                }
+            }
+            return JXLDecodedImage(
+                width: width, height: height, colorChannels: colorChannels,
+                extraChannels: 1, bitsPerSample: bits, isFloat: false, planes: planes)
+        case "WIDTH": width = parts.count > 1 ? Int(parts[1]) ?? 0 : 0
+        case "HEIGHT": height = parts.count > 1 ? Int(parts[1]) ?? 0 : 0
+        case "DEPTH": depth = parts.count > 1 ? Int(parts[1]) ?? 0 : 0
+        case "MAXVAL": maxval = parts.count > 1 ? Int(parts[1]) ?? 0 : 0
+        case "TUPLTYPE": tuple = parts.count > 1 ? String(parts[1]) : ""
+        default: return nil
+        }
+    }
+    return nil
+}
+
+/// Parses a binary PFM (`PF` RGB / `Pf` grayscale, negative scale =
+/// little-endian, rows bottom-to-top) into float32 encoder input planes
+/// (IEEE-754 bit patterns as Int32) — the dual of `encodePFM`.
+func parsePFMInput(_ bytes: [UInt8]) -> JXLDecodedImage? {
+    guard bytes.count > 3, bytes[0] == UInt8(ascii: "P"),
+        bytes[1] == UInt8(ascii: "F") || bytes[1] == UInt8(ascii: "f")
+    else { return nil }
+    let channels = bytes[1] == UInt8(ascii: "F") ? 3 : 1
+    var pos = 2
+    // Three whitespace-separated tokens: width, height, scale.
+    func readToken() -> String? {
+        while pos < bytes.count,
+            bytes[pos] == 0x20 || bytes[pos] == 0x09 || bytes[pos] == 0x0A || bytes[pos] == 0x0D
+        { pos += 1 }
+        let start = pos
+        while pos < bytes.count,
+            !(bytes[pos] == 0x20 || bytes[pos] == 0x09 || bytes[pos] == 0x0A
+                || bytes[pos] == 0x0D)
+        { pos += 1 }
+        return pos > start ? String(decoding: bytes[start..<pos], as: UTF8.self) : nil
+    }
+    guard let wTok = readToken(), let hTok = readToken(), let sTok = readToken(),
+        let width = Int(wTok), let height = Int(hTok), let scale = Double(sTok),
+        width >= 1, height >= 1, scale < 0  // little-endian only
+    else { return nil }
+    pos += 1  // single whitespace byte after the scale line
+    guard bytes.count - pos >= width * height * channels * 4 else { return nil }
+    var planes = [[Int32]](
+        repeating: [Int32](repeating: 0, count: width * height), count: channels)
+    for y in stride(from: height - 1, through: 0, by: -1) {  // bottom-up
+        for x in 0..<width {
+            for c in 0..<channels {
+                let v =
+                    UInt32(bytes[pos]) | UInt32(bytes[pos + 1]) << 8
+                    | UInt32(bytes[pos + 2]) << 16 | UInt32(bytes[pos + 3]) << 24
+                planes[c][y * width + x] = Int32(bitPattern: v)
+                pos += 4
+            }
+        }
+    }
+    return JXLDecodedImage(
+        width: width, height: height, colorChannels: channels, extraChannels: 0,
+        bitsPerSample: 32, isFloat: true, planes: planes)
 }
 
 /// Encodes a decoded image as a binary PNM: P5 (grayscale) or P6 (RGB), 8- or

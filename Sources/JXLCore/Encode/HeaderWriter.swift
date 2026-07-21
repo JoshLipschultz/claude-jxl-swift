@@ -28,21 +28,64 @@ enum HeaderWriter {
 
     /// ImageMetadata (§D.3) for the encoder subset. `grayscale` selects a
     /// full ColorEncoding write (gray D65 sRGB-transfer); RGB uses the
-    /// all-default sRGB encoding.
+    /// all-default sRGB encoding. `exponentBits > 0` selects floating-point
+    /// samples (binary32 = 32/8). `alphaChannels` alpha extra channels share
+    /// the color bit depth (dim_shift 0, unassociated, unnamed).
     static func writeImageMetadata(
-        _ w: BitWriter, bitsPerSample: UInt32, grayscale: Bool
+        _ w: BitWriter, bitsPerSample: UInt32, grayscale: Bool,
+        exponentBits: UInt32 = 0, alphaChannels: Int = 0
     ) {
         w.writeBool(false)  // all_default (false: we need xyb_encoded=0)
         w.writeBool(false)  // extra_fields (no orientation/preview/animation)
-        // BitDepth: integer samples.
-        w.writeBool(false)  // floating_point_sample
-        w.writeU32(bitsPerSample, .value(8), .value(10), .value(12), .bits(6, offset: 1))
-        w.writeBool(true)  // modular_16bit_buffers (default; decoder ignores)
-        w.writeU32(0, .value(0), .value(1), .bits(4, offset: 2), .bits(12, offset: 1))  // num_extra
+        writeBitDepth(w, bitsPerSample: bitsPerSample, exponentBits: exponentBits)
+        // modular_16bit_buffers: false whenever samples can exceed int16
+        // buffers (float32 bit patterns span the full int32 range — libjxl
+        // trusts this flag and would decode through 16-bit buffers).
+        w.writeBool(exponentBits == 0)
+        w.writeU32(
+            UInt32(alphaChannels), .value(0), .value(1), .bits(4, offset: 2),
+            .bits(12, offset: 1))  // num_extra_channels
+        for _ in 0..<alphaChannels {
+            writeExtraChannelInfo(w, bitsPerSample: bitsPerSample, exponentBits: exponentBits)
+        }
         w.writeBool(false)  // xyb_encoded: native-space samples (lossless)
         writeColorEncoding(w, grayscale: grayscale)
         // (no tone_mapping: only present when extra_fields)
         w.writeU64(0)  // extensions
+    }
+
+    /// BitDepth bundle — dual of `ImageMetadataFields.readBitDepth`.
+    private static func writeBitDepth(
+        _ w: BitWriter, bitsPerSample: UInt32, exponentBits: UInt32
+    ) {
+        if exponentBits == 0 {
+            w.writeBool(false)  // floating_point_sample
+            w.writeU32(bitsPerSample, .value(8), .value(10), .value(12), .bits(6, offset: 1))
+        } else {
+            w.writeBool(true)  // floating_point_sample
+            w.writeU32(bitsPerSample, .value(32), .value(16), .value(24), .bits(6, offset: 1))
+            w.write(UInt64(exponentBits - 1), 4)  // exp_bits − 1
+        }
+    }
+
+    /// One alpha ExtraChannelInfo — dual of
+    /// `ImageMetadataFields.readExtraChannelInfo`. 8-bit integer alpha is
+    /// exactly the bundle's all-default shape (one bit); anything else is
+    /// written explicitly: type Alpha, the color bit depth, dim_shift 0,
+    /// empty name, alpha_associated=false.
+    private static func writeExtraChannelInfo(
+        _ w: BitWriter, bitsPerSample: UInt32, exponentBits: UInt32
+    ) {
+        if bitsPerSample == 8 && exponentBits == 0 {
+            w.writeBool(true)  // all_default (= 8-bit unassociated alpha)
+            return
+        }
+        w.writeBool(false)  // all_default
+        w.writeEnum(0)  // type: kAlpha
+        writeBitDepth(w, bitsPerSample: bitsPerSample, exponentBits: exponentBits)
+        w.writeU32(0, .value(0), .value(3), .value(4), .bits(3, offset: 1))  // dim_shift
+        w.writeU32(0, .value(0), .bits(4), .bits(5, offset: 16), .bits(10, offset: 48))  // name len
+        w.writeBool(false)  // alpha_associated
     }
 
     /// ColorEncoding (§D.3.5): all-default (= sRGB) for RGB; explicit
@@ -72,12 +115,14 @@ enum HeaderWriter {
     /// `JumpToByteBoundary` before frames).
     static func writeCodestreamHeaders(
         _ w: BitWriter, width: UInt32, height: UInt32, bitsPerSample: UInt32,
-        grayscale: Bool
+        grayscale: Bool, exponentBits: UInt32 = 0, alphaChannels: Int = 0
     ) {
         w.write(0xFF, 8)
         w.write(0x0A, 8)
         writeSizeHeader(w, width: width, height: height)
-        writeImageMetadata(w, bitsPerSample: bitsPerSample, grayscale: grayscale)
+        writeImageMetadata(
+            w, bitsPerSample: bitsPerSample, grayscale: grayscale,
+            exponentBits: exponentBits, alphaChannels: alphaChannels)
         writeCustomTransformData(w)
         w.alignToByte()
     }

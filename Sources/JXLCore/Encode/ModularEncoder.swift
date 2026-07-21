@@ -34,35 +34,60 @@ enum ModularEncoder {
         case ans
     }
 
-    /// Encodes `image` as a bare-codestream lossless JXL (E2 subset: integer
-    /// samples up to 16 bits, 1 or 3 color channels, no extra channels).
+    /// Encodes `image` as a bare-codestream lossless JXL (E3 subset: integer
+    /// samples up to 16 bits or binary32 floats, 1 or 3 color channels, any
+    /// number of same-size alpha extra channels).
     static func encodeLossless(
         _ image: JXLDecodedImage, backend: EntropyBackend = .ans
     ) throws -> [UInt8] {
         let gray = image.colorChannels == 1
         guard image.colorChannels == 1 || image.colorChannels == 3 else {
-            throw JXLEncodeError(reason: "E1 encodes 1 or 3 color channels")
+            throw JXLEncodeError(reason: "E3 encodes 1 or 3 color channels")
         }
-        guard image.extraChannels == 0 else {
-            throw JXLEncodeError(reason: "E1 does not encode extra channels")
+        guard image.extraChannels >= 0,
+            image.planes.count == image.colorChannels + image.extraChannels
+        else {
+            throw JXLEncodeError(reason: "plane count must be colorChannels + extraChannels")
         }
-        guard !image.isFloat, image.bitsPerSample >= 1, image.bitsPerSample <= 16 else {
-            throw JXLEncodeError(reason: "E1 encodes integer samples up to 16 bits")
+        if image.isFloat {
+            // binary32 only: the decoder's float path (and libjxl's
+            // int_to_float at bits==32) is a bit-pattern identity, so modular
+            // samples ARE the IEEE-754 bit patterns. Smaller float depths
+            // need a real mantissa/exponent re-pack the decoder doesn't
+            // model — rejected, not approximated.
+            guard image.bitsPerSample == 32 else {
+                throw JXLEncodeError(reason: "float encode supports binary32 (32-bit) only")
+            }
+        } else {
+            guard image.bitsPerSample >= 1, image.bitsPerSample <= 16 else {
+                throw JXLEncodeError(reason: "E3 encodes integer samples up to 16 bits")
+            }
         }
         guard image.width >= 1, image.height >= 1 else {
             throw JXLEncodeError(reason: "empty image")
         }
-        let maxVal = (1 << image.bitsPerSample) - 1
-        for p in 0..<image.colorChannels {
-            for v in image.planes[p] where v < 0 || v > Int32(maxVal) {
-                throw JXLEncodeError(reason: "sample \(v) out of range for \(image.bitsPerSample)-bit")
+        let planeSize = image.width * image.height
+        guard image.planes.allSatisfy({ $0.count == planeSize }) else {
+            throw JXLEncodeError(reason: "plane size must be width * height")
+        }
+        if !image.isFloat {
+            let maxVal = (1 << image.bitsPerSample) - 1
+            for p in 0..<image.planes.count {
+                for v in image.planes[p] where v < 0 || v > Int32(maxVal) {
+                    throw JXLEncodeError(
+                        reason: "sample \(v) out of range for \(image.bitsPerSample)-bit")
+                }
             }
         }
+        // (float samples are arbitrary bit patterns; every pattern —
+        // including NaN/Inf — round-trips exactly through the identity path.)
 
         // Channel planes in coded (RCT) space. YCoCg (rct_type 6) turns
         // correlated RGB into a luma + two difference channels; lossless and
-        // exactly inverted by the decoder's invRCT.
-        var channels = (0..<image.colorChannels).map { image.planes[$0] }
+        // exactly inverted by the decoder's invRCT. RCT applies to the color
+        // channels only; extra channels are appended untransformed, in the
+        // decoder's channel order (color first, then extras).
+        var channels = image.planes
         let useRCT = image.colorChannels == 3
         if useRCT { forwardYCoCg(&channels) }
 
@@ -74,8 +99,9 @@ enum ModularEncoder {
         let w = BitWriter()
         HeaderWriter.writeCodestreamHeaders(
             w, width: UInt32(image.width), height: UInt32(image.height),
-            bitsPerSample: UInt32(image.bitsPerSample), grayscale: gray)
-        writeFrameHeader(w)
+            bitsPerSample: UInt32(image.bitsPerSample), grayscale: gray,
+            exponentBits: image.isFloat ? 8 : 0, alphaChannels: image.extraChannels)
+        writeFrameHeader(w, numExtraChannels: image.extraChannels)
 
         // Learn the MA tree on a subsample of the (RCT-space) pixels, using
         // group-local rects so training statistics match what tokenization
@@ -195,16 +221,22 @@ enum ModularEncoder {
             p1.withUnsafeMutableBufferPointer { c1 in
                 p2.withUnsafeMutableBufferPointer { c2 in
                     for i in 0..<n {
-                        let r = Int(c0[i])
-                        let g = Int(c1[i])
-                        let b = Int(c2[i])
-                        let co = r - b
-                        let tmp = b + (co >> 1)
-                        let cg = g - tmp
-                        let y = tmp + (cg >> 1)
-                        c0[i] = Int32(truncatingIfNeeded: y)
-                        c1[i] = Int32(truncatingIfNeeded: co)
-                        c2[i] = Int32(truncatingIfNeeded: cg)
+                        // Every step wraps to Int32 BEFORE the next shift:
+                        // `>> 1` is not congruence-preserving mod 2^32, so
+                        // the decoder's invRCT (which shifts the *stored*
+                        // Int32 values) only inverts a forward built from the
+                        // same wrapped intermediates. Full-range samples
+                        // (float32 bit patterns) reach the wrapping cases.
+                        let r = c0[i]
+                        let g = c1[i]
+                        let b = c2[i]
+                        let co = r &- b
+                        let tmp = b &+ (co >> 1)
+                        let cg = g &- tmp
+                        let y = tmp &+ (cg >> 1)
+                        c0[i] = y
+                        c1[i] = co
+                        c2[i] = cg
                     }
                 }
             }
@@ -217,17 +249,23 @@ enum ModularEncoder {
     /// FrameHeader for the E1 shape: regular, modular, no flags, no color
     /// transform, no upsampling, single pass, full-canvas, last frame, no
     /// name, no restoration filters.
-    private static func writeFrameHeader(_ w: BitWriter) {
+    private static func writeFrameHeader(_ w: BitWriter, numExtraChannels: Int = 0) {
         w.writeBool(false)  // all_default
         w.write(0, 2)  // frame_type: regular (U32 Val selector)
         w.writeBool(true)  // encoding: modular
         w.writeU64(0)  // flags
         w.writeBool(false)  // color transform: none (xyb_encoded is false)
         w.write(0, 2)  // upsampling = 1 (U32 Val selector)
+        for _ in 0..<numExtraChannels {
+            w.write(0, 2)  // ec_upsampling = 1 (U32 Val selector)
+        }
         w.write(1, 2)  // group_size_shift = 1 (256px groups, the default)
         w.write(0, 2)  // num_passes = 1 (U32 Val selector)
         w.writeBool(false)  // custom_size_or_origin
         w.write(0, 2)  // blending mode: replace (U32 Val selector)
+        for _ in 0..<numExtraChannels {
+            w.write(0, 2)  // ec blending mode: replace (U32 Val selector)
+        }
         w.writeBool(true)  // is_last
         // (is_last -> no save_as_reference; not referenced -> no save_before)
         w.write(0, 2)  // name length = 0 (U32 Val selector)
@@ -280,8 +318,10 @@ enum ModularEncoder {
 }
 
 extension JXL {
-    /// Encodes pixel planes as a lossless bare-codestream JXL (E1 subset:
-    /// integer samples up to 16 bits, 1 or 3 channels, any dimensions).
+    /// Encodes pixel planes as a lossless bare-codestream JXL (E3 subset:
+    /// integer samples up to 16 bits or binary32 floats — planes carrying
+    /// IEEE-754 bit patterns as Int32 — 1 or 3 color channels plus any number
+    /// of same-size alpha extra channels, any dimensions).
     /// Round-trips byte-exactly under this decoder and djxl.
     public static func encodeLossless(image: JXLDecodedImage) throws -> [UInt8] {
         try ModularEncoder.encodeLossless(image)

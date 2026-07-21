@@ -388,8 +388,84 @@ struct TestRunner {
             }
         }
         eq(failures, 0, "encoder round-trip byte-exact (\(shapes.count) shapes x 2 backends)")
+
+        // E3 shapes: alpha extra channels and binary32 floats. Float planes
+        // carry IEEE-754 bit patterns as Int32 (identity through the modular
+        // stream); contents cover negatives, ±0.0, subnormals, and extremes —
+        // NaN/Inf excluded to mirror the committed float fixtures.
+        func makeFloatPlane(_ n: Int, seed: Int) -> [Int32] {
+            var p = [Int32](repeating: 0, count: n)
+            let specials: [Float] = [
+                0.0, -0.0, .leastNonzeroMagnitude, -.leastNonzeroMagnitude,
+                .leastNormalMagnitude, -.leastNormalMagnitude,
+                .greatestFiniteMagnitude, -.greatestFiniteMagnitude, 1.0, -1.0,
+            ]
+            for i in 0..<n {
+                if (i + seed) % 17 == 0 {
+                    p[i] = Int32(bitPattern: specials[(i + seed) % specials.count].bitPattern)
+                } else {
+                    // Random bit pattern with exponent LSB cleared: exponent
+                    // is never 0xFF, so no NaN/Inf; sign, subnormals, and
+                    // full-range magnitudes all occur.
+                    p[i] = Int32(bitPattern: UInt32(truncatingIfNeeded: rnd()) & 0xFF7F_FFFF)
+                }
+            }
+            return p
+        }
+        // (w, h, colorCh, alphaCh, bits, isFloat, mode)
+        let e3Shapes: [(Int, Int, Int, Int, Int, Bool, Int)] = [
+            (64, 48, 3, 1, 8, false, 0),  // RGB+alpha 8-bit
+            (33, 70, 1, 1, 8, false, 1),  // gray+alpha 8-bit noise
+            (40, 30, 3, 1, 16, false, 1),  // 16-bit RGB+alpha
+            (25, 25, 3, 2, 8, false, 0),  // two alpha channels
+            (64, 64, 3, 0, 32, true, 0),  // float32 RGB
+            (48, 32, 1, 0, 32, true, 0),  // float32 gray
+            (32, 32, 3, 1, 32, true, 0),  // float32 RGB+alpha
+            (300, 130, 3, 1, 8, false, 1),  // multi-group alpha
+            (270, 258, 1, 0, 32, true, 0),  // multi-group float
+        ]
+        var e3Failures = 0
+        for (w, h, ch, extra, bits, isFloat, mode) in e3Shapes {
+            var planes: [[Int32]] = []
+            for c in 0..<(ch + extra) {
+                if isFloat {
+                    planes.append(makeFloatPlane(w * h, seed: c * 31))
+                } else {
+                    planes.append(makeImage(w: w, h: h, channels: 1, bits: bits, mode: mode)
+                        .planes[0])
+                }
+            }
+            let img = JXLDecodedImage(
+                width: w, height: h, colorChannels: ch, extraChannels: extra,
+                bitsPerSample: bits, isFloat: isFloat, planes: planes)
+            for backend in [ModularEncoder.EntropyBackend.ans, .prefix] {
+                do {
+                    let jxl = try ModularEncoder.encodeLossless(img, backend: backend)
+                    let dec = try JXL.decodeImage(from: jxl)
+                    guard dec.width == w, dec.height == h, dec.colorChannels == ch,
+                        dec.extraChannels == extra, dec.isFloat == isFloat,
+                        dec.bitsPerSample == bits
+                    else {
+                        check(false, "e3 shape \(w)x\(h)/\(ch)+\(extra)/\(bits) \(backend) header")
+                        e3Failures += 1
+                        continue
+                    }
+                    for c in 0..<(ch + extra) where dec.planes[c] != img.planes[c] {
+                        check(false, "e3 shape \(w)x\(h)/\(ch)+\(extra)/\(bits) \(backend) plane \(c)")
+                        e3Failures += 1
+                        break
+                    }
+                } catch {
+                    check(false, "e3 encode \(w)x\(h)/\(ch)+\(extra)/\(bits) \(backend): \(error)")
+                    e3Failures += 1
+                }
+            }
+        }
+        eq(e3Failures, 0, "E3 round-trip byte-exact (\(e3Shapes.count) shapes x 2 backends)")
         FileHandle.standardError.write(
             Data("  [encoder-e2] encode->decode byte-exact round-trips (ANS + prefix)\n".utf8))
+        FileHandle.standardError.write(
+            Data("  [encoder-e3] alpha + float32 round-trips (ANS + prefix)\n".utf8))
     }
 
     /// Encoder size + determinism goldens: encoding these deterministic images
@@ -433,6 +509,45 @@ struct TestRunner {
             let size = (try? JXL.encodeLossless(image: img).count) ?? -1
             eq(size, g.size, "encoded size golden \(g.w)x\(g.h)/\(g.ch)ch/\(g.bits)bit mode \(g.mode)")
         }
+        // E3 goldens: alpha and float32 shapes (deterministic contents; the
+        // LCG state continues from the integer goldens above).
+        func floatPlane(_ n: Int, seed: Int) -> [Int32] {
+            var p = [Int32](repeating: 0, count: n)
+            for i in 0..<n {
+                if (i + seed) % 13 == 0 {
+                    p[i] = Int32(bitPattern: Float(-0.0).bitPattern)
+                } else {
+                    p[i] = Int32(
+                        bitPattern: (Float(i % 100) * 0.01 - 0.5 + Float(seed) * 0.125)
+                            .bitPattern)
+                }
+            }
+            return p
+        }
+        let alphaImg = JXLDecodedImage(
+            width: 96, height: 64, colorChannels: 3, extraChannels: 1, bitsPerSample: 8,
+            isFloat: false,
+            planes: (0..<4).map { c in
+                makeImage(w: 96, h: 64, channels: 1, bits: 8, mode: c == 3 ? 2 : 0).planes[0]
+            })
+        let floatImg = JXLDecodedImage(
+            width: 64, height: 64, colorChannels: 3, extraChannels: 0, bitsPerSample: 32,
+            isFloat: true, planes: (0..<3).map { floatPlane(64 * 64, seed: $0) })
+        let floatNoiseImg = JXLDecodedImage(
+            width: 48, height: 32, colorChannels: 1, extraChannels: 0, bitsPerSample: 32,
+            isFloat: true,
+            planes: [(0..<(48 * 32)).map { _ in
+                Int32(bitPattern: UInt32(truncatingIfNeeded: rnd()) & 0xFF7F_FFFF)
+            }])
+        let e3Goldens: [(name: String, img: JXLDecodedImage, size: Int)] = [
+            ("96x64 RGB+alpha gradient", alphaImg, 174),
+            ("64x64 float32 RGB smooth", floatImg, 36030),
+            ("48x32 float32 gray noise", floatNoiseImg, 6260),
+        ]
+        for g in e3Goldens {
+            let size = (try? JXL.encodeLossless(image: g.img).count) ?? -1
+            eq(size, g.size, "encoded size golden \(g.name)")
+        }
         FileHandle.standardError.write(
             Data("  [encoder-size] deterministic size goldens hold\n".utf8))
     }
@@ -463,6 +578,35 @@ struct TestRunner {
             }
         }
         eq(failures, 0, "header write->readInfo identity (\(cases.count) shapes)")
+        // E3 metadata: float32 bit depth and alpha extra channels survive the
+        // write->readInfo round trip (BitDepth float path + ExtraChannelInfo).
+        let e3Cases: [(bits: UInt32, exp: UInt32, gray: Bool, alpha: Int)] = [
+            (32, 8, false, 0), (32, 8, true, 0), (32, 8, false, 1),
+            (8, 0, false, 1), (16, 0, false, 1), (8, 0, true, 2),
+        ]
+        var e3Failures = 0
+        for c in e3Cases {
+            let w = BitWriter()
+            HeaderWriter.writeCodestreamHeaders(
+                w, width: 10, height: 10, bitsPerSample: c.bits, grayscale: c.gray,
+                exponentBits: c.exp, alphaChannels: c.alpha)
+            guard let info = try? JXL.readInfo(from: w.finalize()) else {
+                e3Failures += 1
+                continue
+            }
+            let depthOK =
+                info.bitDepth.bitsPerSample == c.bits
+                && info.bitDepth.exponentBitsPerSample == c.exp
+            let colorOK = (info.colorSpace == .grayscale) == c.gray
+            let countOK = info.extraChannelCount == c.alpha && info.hasAlpha == (c.alpha > 0)
+            // (per-EC bit depth / dim_shift are exercised end-to-end by the
+            // E3 round-trip tests, which decode through the full EC path)
+            let ecOK = !info.alphaPremultiplied
+            if !(depthOK && colorOK && countOK && ecOK) {
+                e3Failures += 1
+            }
+        }
+        eq(e3Failures, 0, "header write->readInfo identity, float/alpha (\(e3Cases.count) shapes)")
         FileHandle.standardError.write(
             Data("  [header-writer] size/metadata/transform-data duals verified\n".utf8))
     }
