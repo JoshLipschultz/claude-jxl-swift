@@ -1,10 +1,11 @@
-# JXL — a pure-Swift JPEG XL decoder
+# JXL — a pure-Swift JPEG XL codec
 
 A from-scratch implementation of a [JPEG XL](https://jpeg.org/jpegxl/)
-(ISO/IEC 18181) decoder in Swift: a dependency-free core library
-(`JXLCore`), a CoreGraphics bridge (`JXLKit`), a command-line tool (`jxl`),
-a macOS viewer app, and a Quick Look extension. libjxl is not linked —
-it serves only as the test oracle (`cjxl`/`djxl` compare runs).
+(ISO/IEC 18181) decoder — and a growing lossless encoder — in Swift: a
+dependency-free core library (`JXLCore`), a CoreGraphics bridge (`JXLKit`),
+a command-line tool (`jxl`), a macOS viewer app, and a Quick Look extension.
+libjxl is not linked — it serves only as the test oracle (`cjxl`/`djxl`
+compare runs).
 
 > **Status: feature-complete for real-world files.** Both coding modes decode
 > end to end — **Modular** (lossless and lossy, byte-exact vs `djxl` including

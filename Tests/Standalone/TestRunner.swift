@@ -366,27 +366,30 @@ struct TestRunner {
         var failures = 0
         for (w, h, ch, bits, mode) in shapes {
             let img = makeImage(w: w, h: h, channels: ch, bits: bits, mode: mode)
-            do {
-                let jxl = try JXL.encodeLossless(image: img)
-                let dec = try JXL.decodeImage(from: jxl)
-                guard dec.width == w, dec.height == h, dec.colorChannels == ch,
-                    dec.bitsPerSample == bits
-                else {
+            // Both entropy back-ends: ANS (E2, the default) and prefix (E1).
+            for backend in [ModularEncoder.EntropyBackend.ans, .prefix] {
+                do {
+                    let jxl = try ModularEncoder.encodeLossless(img, backend: backend)
+                    let dec = try JXL.decodeImage(from: jxl)
+                    guard dec.width == w, dec.height == h, dec.colorChannels == ch,
+                        dec.bitsPerSample == bits
+                    else {
+                        failures += 1
+                        continue
+                    }
+                    for c in 0..<ch where dec.planes[c] != img.planes[c] {
+                        failures += 1
+                        break
+                    }
+                } catch {
+                    check(false, "encode \(w)x\(h)/\(ch)ch/\(bits)bit mode \(mode) \(backend): \(error)")
                     failures += 1
-                    continue
                 }
-                for c in 0..<ch where dec.planes[c] != img.planes[c] {
-                    failures += 1
-                    break
-                }
-            } catch {
-                check(false, "encode \(w)x\(h)/\(ch)ch/\(bits)bit mode \(mode): \(error)")
-                failures += 1
             }
         }
-        eq(failures, 0, "encoder round-trip byte-exact (\(shapes.count) shapes)")
+        eq(failures, 0, "encoder round-trip byte-exact (\(shapes.count) shapes x 2 backends)")
         FileHandle.standardError.write(
-            Data("  [encoder-e1] encode->decode byte-exact round-trips\n".utf8))
+            Data("  [encoder-e2] encode->decode byte-exact round-trips (ANS + prefix)\n".utf8))
     }
 
     /// Encoder size + determinism goldens: encoding these deterministic images
@@ -422,8 +425,8 @@ struct TestRunner {
                 bitsPerSample: bits, isFloat: false, planes: planes)
         }
         let goldens: [(w: Int, h: Int, ch: Int, bits: Int, mode: Int, size: Int)] = [
-            (96, 64, 3, 8, 0, 3290), (96, 64, 3, 8, 1, 19818), (256, 256, 3, 8, 1, 176813),
-            (300, 200, 3, 8, 1, 202251), (512, 512, 1, 16, 2, 32817), (100, 600, 1, 8, 0, 11415),
+            (96, 64, 3, 8, 0, 2506), (96, 64, 3, 8, 1, 19795), (256, 256, 3, 8, 1, 175869),
+            (300, 200, 3, 8, 1, 201584), (512, 512, 1, 16, 2, 79), (100, 600, 1, 8, 0, 9009),
         ]
         for g in goldens {
             let img = makeImage(w: g.w, h: g.h, channels: g.ch, bits: g.bits, mode: g.mode)

@@ -176,16 +176,26 @@ every milestone lands with djxl round-trip proof, never just self-consistency.
 
 ## 6. Milestones
 
-- **E0 — skeleton**: BitWriter (+ exhaustive unit tests against BitReader:
-  write→read identity for random field sequences), SizeHeader/ImageMetadata
-  writers, bare-codestream + jxlc container assembly. Deliverable: a file
-  with valid headers djxl parses (`djxl --info`-equivalent succeeds).
-- **E1 — minimum honest encoder**: 8-bit RGB/gray lossless, single + multi
-  group, fixed MA tree (gradient predictor, small fixed context set), prefix
-  codes, forward RCT. Deliverable: full corpus round-trips under both
-  decoders; sizes recorded (expect ~1.3-1.6× cjxl -e2 — honesty over vanity).
-- **E2 — real entropy**: rANS with histogram building + context clustering,
-  LZ77 emission for runs. Deliverable: sizes within ~15% of cjxl -e2.
+- **E0 — skeleton** ✅ (2026-07-20): BitWriter (+ exhaustive unit tests
+  against BitReader: write→read identity for random field sequences),
+  SizeHeader/ImageMetadata writers, bare-codestream assembly. The round-trip
+  test caught a latent *decoder* bug (subnormal F16 headers).
+- **E1 — minimum honest encoder** ✅ (2026-07-20): 8/16-bit RGB/gray
+  lossless, single + multi group, single-leaf gradient tree, real canonical
+  prefix codes (package-merge; both simple and complex serialization forms),
+  forward YCoCg RCT, `jxl encode` CLI, size-golden gate. djxl byte-exact.
+  Sizes landed *better* than planned: RGB natural fixtures already beat
+  cjxl -e2 (prediction + real Huffman is most of e2's game).
+- **E2 — real entropy** ✅ (2026-07-20): rANS (reverse-order stream writer,
+  alias-table slot inversion, exact-precision histogram serialization at
+  shift=13), selectable back-end (ANS default, prefix kept exercised).
+  Gate met: 6MP photo within ~5% of cjxl -e2, small RGB fixtures at parity
+  or better; the exception is 16-bit smooth synthetic content (~3×), which
+  is a *modeling* gap (single context, no WP) owned by E4. Deferred from the
+  original E2 scope, with reasons recorded: context clustering (pointless at
+  one context — becomes real work when E4 grows the tree) and LZ77 emission
+  (its natural wins — constant/synthetic regions — already cost ~nothing via
+  the single-symbol ANS path; revisit with E4's graphics corpus).
 - **E3 — full sample support**: 16-bit, float32 (the bit-exact float path the
   decoder already models), alpha/extra channels, grayscale fast path.
 - **E4 — compression quality**: learned MA trees (the big one), palette

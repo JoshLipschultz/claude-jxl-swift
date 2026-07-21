@@ -27,9 +27,18 @@ private func packSigned(_ d: Int) -> UInt32 {
 // MARK: - Frame + stream assembly
 
 enum ModularEncoder {
-    /// Encodes `image` as a bare-codestream lossless JXL (E1 subset: integer
+    /// Residual entropy back-end. ANS (E2) is the default; prefix codes (E1)
+    /// stay selectable so both duals remain exercised by the suite.
+    enum EntropyBackend {
+        case prefix
+        case ans
+    }
+
+    /// Encodes `image` as a bare-codestream lossless JXL (E2 subset: integer
     /// samples up to 16 bits, 1 or 3 color channels, no extra channels).
-    static func encodeLossless(_ image: JXLDecodedImage) throws -> [UInt8] {
+    static func encodeLossless(
+        _ image: JXLDecodedImage, backend: EntropyBackend = .ans
+    ) throws -> [UInt8] {
         let gray = image.colorChannels == 1
         guard image.colorChannels == 1 || image.colorChannels == 3 else {
             throw JXLEncodeError(reason: "E1 encodes 1 or 3 color channels")
@@ -73,10 +82,10 @@ enum ModularEncoder {
             // stream with every channel.
             let groupTokens = tokenizeGroup(
                 channels, width: image.width, x0: 0, y0: 0, gw: image.width, gh: image.height)
-            let residual = PrefixEntropyEncoder(numContexts: 1, streams: [groupTokens])
+            let residual = makeEncoder(backend, numContexts: 1, streams: [groupTokens])
             let s = BitWriter()
             writeLfGlobalModular(s, residual: residual, useRCT: useRCT)
-            residual.writeStream(s, groupTokens)
+            residual.encodeStream(s, groupTokens)
             let section = s.finalize()
             w.writeBool(false)  // TOC: no permutation
             w.alignToByte()
@@ -98,7 +107,7 @@ enum ModularEncoder {
             groupTokens.append(
                 tokenizeGroup(channels, width: image.width, x0: x0, y0: y0, gw: gw, gh: gh))
         }
-        let residual = PrefixEntropyEncoder(numContexts: 1, streams: groupTokens)
+        let residual = makeEncoder(backend, numContexts: 1, streams: groupTokens)
 
         // Section 0 (LfGlobal): tree + shared histograms + the global stream's
         // GroupHeader. With one group dimension > group_dim, every color
@@ -115,7 +124,7 @@ enum ModularEncoder {
             s.writeBool(true)  // use_global_tree
             s.writeBool(true)  // wp_header: all_default
             s.write(0, 2)  // nb_transforms = 0
-            residual.writeStream(s, groupTokens[g])
+            residual.encodeStream(s, groupTokens[g])
             sections.append(s.finalize())
         }
 
@@ -125,6 +134,15 @@ enum ModularEncoder {
         w.alignToByte()
         for section in sections { w.append(bytes: section) }
         return w.finalize()
+    }
+
+    private static func makeEncoder(
+        _ backend: EntropyBackend, numContexts: Int, streams: [[EncToken]]
+    ) -> any TokenEntropyEncoder {
+        switch backend {
+        case .prefix: return PrefixEntropyEncoder(numContexts: numContexts, streams: streams)
+        case .ans: return ANSEntropyEncoder(numContexts: numContexts, streams: streams)
+        }
     }
 
     /// In-place forward YCoCg (rct_type 6, identity permutation): the exact
@@ -192,7 +210,7 @@ enum ModularEncoder {
     /// reads tree + histograms together, before any group stream), then the
     /// global stream's GroupHeader carrying the transforms.
     private static func writeLfGlobalModular(
-        _ w: BitWriter, residual: PrefixEntropyEncoder, useRCT: Bool
+        _ w: BitWriter, residual: any TokenEntropyEncoder, useRCT: Bool
     ) {
         // (flags = 0: no patches/splines/noise payloads)
         w.writeBool(true)  // dc-quant factors: default
@@ -259,7 +277,7 @@ enum ModularEncoder {
         let tokens = [0, 5, 0, 0, 0].map { EncToken(ctx: 0, value: UInt32($0)) }
         let enc = PrefixEntropyEncoder(numContexts: 6, streams: [tokens])  // kNumTreeContexts
         enc.writeHeader(w)
-        enc.writeStream(w, tokens)
+        enc.encodeStream(w, tokens)
         // (prefix path: no ANS final state)
     }
 

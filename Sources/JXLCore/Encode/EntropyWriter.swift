@@ -346,10 +346,20 @@ struct PrefixEntropyEncoder {
         if nbits > 0 { w.write(UInt64(bits), Int(nbits)) }
     }
 
-    func writeStream(_ w: BitWriter, _ tokens: [EncToken]) {
+    func encodeStream(_ w: BitWriter, _ tokens: [EncToken]) {
         for t in tokens { writeValue(w, t.value) }
     }
 }
+
+/// The two entropy back-ends behind one writing interface: headers are
+/// written once (LfGlobal), streams once per section.
+protocol TokenEntropyEncoder {
+    func writeHeader(_ w: BitWriter)
+    func encodeStream(_ w: BitWriter, _ tokens: [EncToken])
+}
+
+extension PrefixEntropyEncoder: TokenEntropyEncoder {}
+extension ANSEntropyEncoder: TokenEntropyEncoder {}
 
 func writeVarLenUint16(_ w: BitWriter, _ v: Int) {
     if v == 0 {
