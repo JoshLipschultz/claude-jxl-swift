@@ -208,9 +208,14 @@ every milestone lands with djxl round-trip proof, never just self-consistency.
   (cost = token entropy + raw extra bits), multi-histogram entropy
   (clustering ≤8 + context maps). **The 6MP bench photo now beats
   cjxl -e3** (10.05 vs 10.91 MB) — the "within ~10% of -e3" gate is
-  already exceeded on photos. E4b tail: WP predictor (state-carrying, the
-  16-bit smooth-content gap: still 2.6× cjxl there), palette detection,
-  squeeze for responsive mode, effort levels.
+  already exceeded on photos. E4b (✅ 2026-07-21): WP predictor as a leaf
+  candidate + property 15 (full-res state pass during training since the
+  error window carries in scan order; wpClamp fast-track mirrored) and
+  per-leaf multipliers (residual GCDs — the 16-bit smooth gap was scaled
+  ramps, w40 1595 → 729 B vs cjxl 603; two-pass tokenization because
+  multipliers change fast-track kernel selection, with a divisibility
+  fallback). E4c tail: palette detection, squeeze for responsive mode,
+  effort levels, encode-speed knobs.
 - **E5 (undecided) — baseline lossy**: XYB forward, fixed DCT8, uniform
   quant, quality knob; explicitly "valid, not competitive."
 - **E6 (undecided) — jbrd**: JPEG recompression, byte-exact reconstruction.

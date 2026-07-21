@@ -120,23 +120,59 @@ enum ModularEncoder {
                     chan: c, stride: stride)
             }
         }
-        let tree = learnTree(training)
+        var tree = learnTree(training)
 
-        if dim.numGroups == 1 {
-            // Coalesced: one section carrying tree, histograms, and the global
-            // stream with every channel (stream id 0).
-            var groupTokens: [EncToken] = []
-            for (c, plane) in channels.enumerated() {
-                tokenizeChannelWithTree(
-                    into: &groupTokens, plane: plane, width: image.width,
-                    x0: 0, y0: 0, gw: image.width, gh: image.height,
-                    chan: c, streamID: 0, tree: tree)
+        // One rect per coded stream: the whole image (stream id 0) when
+        // coalesced, else per-group rects whose stream ids must match the
+        // decoder's ModularStreamId::ModularAC (property 1 splits see them).
+        let coalesced = dim.numGroups == 1
+        var rects: [(x0: Int, y0: Int, gw: Int, gh: Int, streamID: Int)] = []
+        if coalesced {
+            rects.append((0, 0, image.width, image.height, 0))
+        } else {
+            for g in 0..<dim.numGroups {
+                let x0 = (g % dim.xsizeGroups) * dim.groupDim
+                let y0 = (g / dim.xsizeGroups) * dim.groupDim
+                rects.append(
+                    (x0, y0, min(dim.groupDim, image.width - x0),
+                     min(dim.groupDim, image.height - y0),
+                     1 + 3 * dim.numDCGroups + 17 + g))
             }
+        }
+        func buildStreams(_ t: [MATreeNode]) -> [[EncToken]] {
+            rects.map { r in
+                var tokens: [EncToken] = []
+                for (c, plane) in channels.enumerated() {
+                    tokenizeChannelWithTree(
+                        into: &tokens, plane: plane, width: image.width,
+                        x0: r.x0, y0: r.y0, gw: r.gw, gh: r.gh,
+                        chan: c, streamID: r.streamID, tree: t)
+                }
+                return tokens
+            }
+        }
+        var groupTokens = buildStreams(tree)
+
+        // Leaf multipliers: when a leaf's residuals share a factor, divide
+        // them (pass 2 re-tokenizes under the multiplier tree so fast-track
+        // kernel selection stays symmetric with the decoder; divisibility is
+        // re-checked because that reselection can reroute pixels).
+        if let multTree = treeWithLeafMultipliers(tree, streams: groupTokens) {
+            let retokenized = buildStreams(multTree)
+            if let divided = divideByLeafMultipliers(multTree, streams: retokenized) {
+                tree = multTree
+                groupTokens = divided
+            }
+        }
+
+        if coalesced {
+            // Coalesced: one section carrying tree, histograms, and the global
+            // stream with every channel.
             let residual = makeEncoder(
-                backend, numContexts: treeNumLeaves(tree), streams: [groupTokens])
+                backend, numContexts: treeNumLeaves(tree), streams: groupTokens)
             let s = BitWriter()
             writeLfGlobalModular(s, tree: tree, residual: residual, useRCT: useRCT)
-            residual.encodeStream(s, groupTokens)
+            residual.encodeStream(s, groupTokens[0])
             let section = s.finalize()
             w.writeBool(false)  // TOC: no permutation
             w.alignToByte()
@@ -146,26 +182,6 @@ enum ModularEncoder {
             return w.finalize()
         }
 
-        // Multi-group: per-group token streams (prediction restarts at group
-        // boundaries — the decoder decodes each group into a group-local
-        // sub-image), one shared histogram written in LfGlobal. Property 1
-        // (stream id) must match the decoder's ModularStreamId::ModularAC.
-        var groupTokens: [[EncToken]] = []
-        for g in 0..<dim.numGroups {
-            let x0 = (g % dim.xsizeGroups) * dim.groupDim
-            let y0 = (g / dim.xsizeGroups) * dim.groupDim
-            let gw = min(dim.groupDim, image.width - x0)
-            let gh = min(dim.groupDim, image.height - y0)
-            let streamID = 1 + 3 * dim.numDCGroups + 17 + g
-            var tokens: [EncToken] = []
-            for (c, plane) in channels.enumerated() {
-                tokenizeChannelWithTree(
-                    into: &tokens, plane: plane, width: image.width,
-                    x0: x0, y0: y0, gw: gw, gh: gh,
-                    chan: c, streamID: streamID, tree: tree)
-            }
-            groupTokens.append(tokens)
-        }
         let residual = makeEncoder(
             backend, numContexts: treeNumLeaves(tree), streams: groupTokens)
 

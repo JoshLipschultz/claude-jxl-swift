@@ -501,8 +501,8 @@ struct TestRunner {
                 bitsPerSample: bits, isFloat: false, planes: planes)
         }
         let goldens: [(w: Int, h: Int, ch: Int, bits: Int, mode: Int, size: Int)] = [
-            (96, 64, 3, 8, 0, 625), (96, 64, 3, 8, 1, 15739), (256, 256, 3, 8, 1, 121522),
-            (300, 200, 3, 8, 1, 187529), (512, 512, 1, 16, 2, 78), (100, 600, 1, 8, 0, 726),
+            (96, 64, 3, 8, 0, 601), (96, 64, 3, 8, 1, 15739), (256, 256, 3, 8, 1, 92685),
+            (300, 200, 3, 8, 1, 187529), (512, 512, 1, 16, 2, 74), (100, 600, 1, 8, 0, 455),
         ]
         for g in goldens {
             let img = makeImage(w: g.w, h: g.h, channels: g.ch, bits: g.bits, mode: g.mode)
@@ -540,8 +540,8 @@ struct TestRunner {
                 Int32(bitPattern: UInt32(truncatingIfNeeded: rnd()) & 0xFF7F_FFFF)
             }])
         let e3Goldens: [(name: String, img: JXLDecodedImage, size: Int)] = [
-            ("96x64 RGB+alpha gradient", alphaImg, 174),
-            ("64x64 float32 RGB smooth", floatImg, 36030),
+            ("96x64 RGB+alpha gradient", alphaImg, 178),
+            ("64x64 float32 RGB smooth", floatImg, 35951),
             ("48x32 float32 gray noise", floatNoiseImg, 6260),
         ]
         for g in e3Goldens {

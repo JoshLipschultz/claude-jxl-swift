@@ -14,16 +14,18 @@
 
 import Foundation
 
-/// Candidate predictors: every stateless predictOne case (6 = Weighted needs
-/// WP state and is deliberately excluded at this milestone).
-private let kCandidatePredictors: [Int] = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13]
+/// Candidate predictors: every predictOne case. 6 (Weighted) is listed LAST:
+/// leaf selection keeps the first predictor on cost ties, so WP — which
+/// forces the decoder to run the expensive error-window state machine — only
+/// wins when strictly better.
+private let kCandidatePredictors: [Int] = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 6]
 
-/// Candidate split properties: 0 = channel, 2..14 = position + neighborhood.
-/// 1 (stream/group id) and 15 (WP) are excluded; >= 16 (reference channels)
-/// are not collected.
-private let kCandidateProperties: [Int] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+/// Candidate split properties: 0 = channel, 2..14 = position + neighborhood,
+/// 15 = WP error property. 1 (stream/group id) is excluded; >= 16 (reference
+/// channels) are not collected.
+private let kCandidateProperties: [Int] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 
-private let kNumProps = 15
+private let kNumProps = 16
 private let kMaxLeaves = 48
 private let kMinLeafSamples = 256
 /// Bits a split must save to be worth its serialization + histogram overhead.
@@ -39,14 +41,19 @@ struct TreeTrainingSet {
     var count = 0
 
     /// Collects samples from one channel rect (group-local coordinates, like
-    /// the decoder's per-group sub-images). `stride` subsamples pixels.
+    /// the decoder's per-group sub-images). `stride` subsamples which pixels
+    /// are RECORDED — the WP state machine runs over every pixel regardless
+    /// (its error window carries across the whole rect in scan order).
     /// Collection uses the generic (wrapping) property arithmetic — the
-    /// fast-track clamp variant only exists once a tree is chosen, and only
-    /// affects cost estimates here, never correctness.
+    /// fast-track clamp variants only exist once a tree is chosen, and only
+    /// affect cost estimates here, never correctness.
     mutating func collect(
         plane: [Int32], width: Int, x0: Int, y0: Int, gw: Int, gh: Int,
         chan: Int, stride: Int
     ) {
+        let wp = WPState(header: WPHeader(), xsize: gw, ysize: gh)
+        let wpProp = UnsafeMutablePointer<Int32>.allocate(capacity: 1)
+        defer { wpProp.deallocate() }
         plane.withUnsafeBufferPointer { px in
             var i = 0
             for y in 0..<gh {
@@ -54,9 +61,15 @@ struct TreeTrainingSet {
                 let prev = row - width
                 for x in 0..<gw {
                     defer { i += 1 }
-                    if i % stride != 0 { continue }
                     let n = neighborhoodAt(
                         px, row: row, prev: prev, width: width, x: x, y: y, gw: gw)
+                    let v = Int(px[row + x])
+                    let wpPred = wp.predict(
+                        x: x, y: y, xsize: gw, N: n.top, W: n.left, NE: n.topright,
+                        NW: n.topleft, NN: n.toptop, computeProperties: true,
+                        properties: wpProp, offset: 0)
+                    defer { wp.updateErrors(v, x: x, y: y, xsize: gw) }
+                    if i % stride != 0 { continue }
                     // Previous pixel's props[9] (0 at row start), generic wrap.
                     var prop9prev: Int32 = 0
                     if x > 0 {
@@ -79,12 +92,12 @@ struct TreeTrainingSet {
                     props.append(Int32(truncatingIfNeeded: n.top - n.topright))
                     props.append(Int32(truncatingIfNeeded: n.top - n.toptop))
                     props.append(Int32(truncatingIfNeeded: n.left - n.leftleft))
-                    let v = Int(px[row + x])
+                    props.append(wpProp[0])
                     for p in kCandidatePredictors {
                         let guess = predictOne(
                             p, left: n.left, top: n.top, toptop: n.toptop,
                             topleft: n.topleft, topright: n.topright, leftleft: n.leftleft,
-                            toprightright: n.toprightright, wpPred: 0)
+                            toprightright: n.toprightright, wpPred: wpPred)
                         // Residuals wrap to Int32 before packing (mod-2^32
                         // congruence is what the decoder reconstructs; matters
                         // for full-range float32 bit patterns).
@@ -375,8 +388,10 @@ func treeTokens(_ tree: [MATreeNode]) -> [EncToken] {
             tokens.append(EncToken(ctx: 1, value: 0))  // kPropertyContext: leaf
             tokens.append(EncToken(ctx: 2, value: UInt32(node.predictor)))
             tokens.append(EncToken(ctx: 3, value: encPackSigned(Int(node.predictorOffset))))
-            tokens.append(EncToken(ctx: 4, value: 0))  // mul_log
-            tokens.append(EncToken(ctx: 5, value: 0))  // mul_bits
+            // multiplier = (mul_bits + 1) << mul_log (decodeMATree).
+            let mulLog = UInt32(node.multiplier.trailingZeroBitCount)
+            tokens.append(EncToken(ctx: 4, value: mulLog))
+            tokens.append(EncToken(ctx: 5, value: (node.multiplier >> mulLog) - 1))
         } else {
             tokens.append(EncToken(ctx: 1, value: UInt32(node.property + 1)))
             tokens.append(EncToken(ctx: 0, value: encPackSigned(Int(node.splitVal))))
@@ -387,6 +402,65 @@ func treeTokens(_ tree: [MATreeNode]) -> [EncToken] {
 
 /// Leaf count == residual raw-context count ((tree.count + 1) / 2).
 func treeNumLeaves(_ tree: [MATreeNode]) -> Int { (tree.count + 1) / 2 }
+
+// MARK: - Leaf multipliers
+
+/// Per-leaf residual GCDs over every stream's tokens. When a leaf's residuals
+/// share a common factor g > 1 (e.g. 16-bit content that is a scaled ramp —
+/// every sample a multiple of 100), the leaf multiplier divides them: the
+/// decoder computes unpackSigned(v) * multiplier + guess, so the coded values
+/// shrink by log2(g) bits each. Returns nil when no leaf benefits.
+func treeWithLeafMultipliers(
+    _ tree: [MATreeNode], streams: [[EncToken]]
+) -> [MATreeNode]? {
+    var gcds = [Int64](repeating: 0, count: treeNumLeaves(tree))
+    for stream in streams {
+        for t in stream {
+            var d = unpackSigned(t.value)
+            if d < 0 { d = -d }
+            let c = Int(t.ctx)
+            var a = gcds[c]
+            var b = d
+            while b != 0 {
+                (a, b) = (b, a % b)
+            }
+            gcds[c] = a
+        }
+    }
+    // Multiplier fits the serialization guards for any g < 2^31; all-zero
+    // leaves (gcd 0) stay at 1.
+    guard gcds.contains(where: { $0 > 1 && $0 < (1 << 31) }) else { return nil }
+    var out = tree
+    for i in out.indices where out[i].isLeaf {
+        let g = gcds[out[i].lchild]
+        if g > 1 && g < (1 << 31) { out[i].multiplier = UInt32(g) }
+    }
+    return out
+}
+
+/// Divides every token's residual by its leaf's multiplier. Returns nil if
+/// any residual is not divisible — possible when the multiplier tree routes a
+/// pixel to a different leaf than the gcd pass did (the clamp fast-tracks
+/// require multiplier-1 leaves, so adding multipliers can change kernels);
+/// callers then fall back to the multiplier-free tree.
+func divideByLeafMultipliers(
+    _ tree: [MATreeNode], streams: [[EncToken]]
+) -> [[EncToken]]? {
+    var mults = [Int64](repeating: 1, count: treeNumLeaves(tree))
+    for node in tree where node.isLeaf { mults[node.lchild] = Int64(node.multiplier) }
+    var out = streams
+    for s in out.indices {
+        for i in out[s].indices {
+            let m = mults[Int(out[s][i].ctx)]
+            if m == 1 { continue }
+            let d = unpackSigned(out[s][i].value)
+            if d % m != 0 { return nil }
+            let q = d / m
+            out[s][i].value = encPackSigned(Int(q))
+        }
+    }
+    return out
+}
 
 // MARK: - Tree-walking tokenization (decodeChannel's dual)
 
@@ -404,7 +478,16 @@ func tokenizeChannelWithTree(
 ) {
     let fastTrack = channelFastTrack(
         tree: tree, chan: chan, groupID: streamID, usesLZ77: false, width: gw)
-    var props = [Int32](repeating: 0, count: kNumProps + 1)  // slot 15 unused (no WP)
+    // WP runs only when the tree can observe it — the decoder's
+    // TreeToLookupTable use_wp gate; running it otherwise would be wasted
+    // work AND props[15] must stay 0 to match.
+    let treeUsesWP = tree.contains { node in
+        node.property == -1 ? node.predictor == 6 : node.property == 15
+    }
+    let wpState = treeUsesWP ? WPState(header: WPHeader(), xsize: gw, ysize: gh) : nil
+    let props = UnsafeMutablePointer<Int32>.allocate(capacity: kNumProps)
+    defer { props.deallocate() }
+    props.initialize(repeating: 0, count: kNumProps)
     props[0] = Int32(truncatingIfNeeded: chan)
     props[1] = Int32(truncatingIfNeeded: streamID)
     plane.withUnsafeBufferPointer { px in
@@ -435,6 +518,19 @@ func tokenizeChannelWithTree(
                     props[13] = Int32(truncatingIfNeeded: n.top - n.toptop)
                     props[14] = Int32(truncatingIfNeeded: n.left - n.leftleft)
 
+                    var wpPred = wpState?.predict(
+                        x: x, y: y, xsize: gw, N: n.top, W: n.left, NE: n.topright,
+                        NW: n.topleft, NN: n.toptop, computeProperties: true,
+                        properties: props, offset: 15) ?? 0
+                    if fastTrack == .wpClamp {
+                        // The decoder's WP fast track truncates the prediction
+                        // to int32 and clamps the WP property to LUT range.
+                        wpPred = Int(Int32(truncatingIfNeeded: wpPred))
+                        props[15] = min(
+                            max(props[15], Int32(-kEncPropRangeFast)),
+                            Int32(kEncPropRangeFast - 1))
+                    }
+
                     var pos = 0
                     while treeP[pos].property != -1 {
                         let node = treeP[pos]
@@ -446,7 +542,7 @@ func tokenizeChannelWithTree(
                         + predictOne(
                             leaf.predictor, left: n.left, top: n.top, toptop: n.toptop,
                             topleft: n.topleft, topright: n.topright, leftleft: n.leftleft,
-                            toprightright: n.toprightright, wpPred: 0)
+                            toprightright: n.toprightright, wpPred: wpPred)
                     // Truncate to Int32 BEFORE packing: the decoder computes
                     // Int32(truncatingIfNeeded: guess + unpackSigned(v)), so
                     // mod-2^32 congruence is the round-trip invariant.
@@ -455,6 +551,7 @@ func tokenizeChannelWithTree(
                     // breaks it (E3's find, ported to the tree tokenizer).
                     let d = Int32(truncatingIfNeeded: Int(px[row + x]) - guess)
                     tokens.append(EncToken(ctx: UInt32(leaf.lchild), value: encPackSigned(Int(d))))
+                    wpState?.updateErrors(Int(px[row + x]), x: x, y: y, xsize: gw)
                 }
             }
         }
