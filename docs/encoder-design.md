@@ -196,11 +196,21 @@ every milestone lands with djxl round-trip proof, never just self-consistency.
   one context — becomes real work when E4 grows the tree) and LZ77 emission
   (its natural wins — constant/synthetic regions — already cost ~nothing via
   the single-symbol ANS path; revisit with E4's graphics corpus).
-- **E3 — full sample support**: 16-bit, float32 (the bit-exact float path the
-  decoder already models), alpha/extra channels, grayscale fast path.
-- **E4 — compression quality**: learned MA trees (the big one), palette
-  detection, WP predictor selection, squeeze for responsive mode, effort
-  levels 1-7. Deliverable: within ~10% of cjxl -e3 on the corpus.
+- **E3 — full sample support** ✅ (2026-07-20, subagent in a jj workspace):
+  float32 (identity bit-pattern path incl. NaN/Inf/subnormals; float16
+  rejected — the decoder doesn't model the re-pack), alpha/extra channels
+  (dim_shift 0, same-size), PAM/PFM CLI input. Found two wrap-semantics
+  fixes full-range samples force: residuals truncate to Int32 BEFORE
+  packSigned (mod-2^32 congruence is the round-trip invariant) and
+  forwardYCoCg wraps every intermediate. All djxl byte-exact.
+- **E4 — compression quality** (in progress; E4a ✅ 2026-07-21): learned MA
+  trees over properties 0-14 with per-leaf stateless-predictor selection
+  (cost = token entropy + raw extra bits), multi-histogram entropy
+  (clustering ≤8 + context maps). **The 6MP bench photo now beats
+  cjxl -e3** (10.05 vs 10.91 MB) — the "within ~10% of -e3" gate is
+  already exceeded on photos. E4b tail: WP predictor (state-carrying, the
+  16-bit smooth-content gap: still 2.6× cjxl there), palette detection,
+  squeeze for responsive mode, effort levels.
 - **E5 (undecided) — baseline lossy**: XYB forward, fixed DCT8, uniform
   quant, quality knob; explicitly "valid, not competitive."
 - **E6 (undecided) — jbrd**: JPEG recompression, byte-exact reconstruction.
