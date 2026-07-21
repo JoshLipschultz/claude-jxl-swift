@@ -34,6 +34,7 @@ func usage() -> Never {
                                            Decode image (lossless or lossy) to PNM;
                                            "dither" = blue-noise dither 8-bit output
                                            (djxl 0.12 default)
+          jxl encode <in.pnm> <out.jxl>    Encode a binary PGM/PPM losslessly
           jxl icc    <file.jxl> [out.icc]  Extract the embedded ICC profile
           jxl vardct <file.jxl>            Preflight VarDCT global metadata
           jxl vardct-dc <file.jxl> [dump]  Decode VarDCT XYB DC image (lossy)
@@ -319,11 +320,87 @@ do {
             print("  wrote DC dump -> \(args[3])")
         }
 
+    case "encode":
+        guard args.count >= 4 else { usage() }
+        guard let image = parsePNM(bytes) else {
+            fail("error: \(path) is not a binary PGM (P5) or PPM (P6) file")
+        }
+        let jxl = try JXL.encodeLossless(image: image)
+        try Data(jxl).write(to: URL(fileURLWithPath: args[3]))
+        let raw = image.width * image.height * image.colorChannels
+            * (image.bitsPerSample > 8 ? 2 : 1)
+        print(
+            "encoded \(image.width) x \(image.height) \(image.bitsPerSample)-bit "
+                + "\(image.colorChannels == 1 ? "gray" : "RGB") -> \(args[3]) "
+                + "(\(jxl.count) bytes, raw \(raw))")
+
     default:
         usage()
     }
 } catch {
     fail("error: \(error)")
+}
+
+/// Parses a binary PGM (P5) or PPM (P6) into encoder input planes. Maxval up
+/// to 65535 (values > 255 are big-endian 16-bit per PNM); bit depth is the
+/// smallest that covers maxval.
+func parsePNM(_ bytes: [UInt8]) -> JXLDecodedImage? {
+    var pos = 0
+    func skipSpaceAndComments() {
+        while pos < bytes.count {
+            let b = bytes[pos]
+            if b == UInt8(ascii: "#") {
+                while pos < bytes.count && bytes[pos] != UInt8(ascii: "\n") { pos += 1 }
+            } else if b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D {
+                pos += 1
+            } else {
+                break
+            }
+        }
+    }
+    func readInt() -> Int? {
+        skipSpaceAndComments()
+        var v = 0
+        var any = false
+        while pos < bytes.count, bytes[pos] >= UInt8(ascii: "0"), bytes[pos] <= UInt8(ascii: "9") {
+            v = v * 10 + Int(bytes[pos] - UInt8(ascii: "0"))
+            if v > 1 << 30 { return nil }
+            pos += 1
+            any = true
+        }
+        return any ? v : nil
+    }
+    guard bytes.count > 2, bytes[0] == UInt8(ascii: "P"),
+        bytes[1] == UInt8(ascii: "5") || bytes[1] == UInt8(ascii: "6")
+    else { return nil }
+    let channels = bytes[1] == UInt8(ascii: "5") ? 1 : 3
+    pos = 2
+    guard let width = readInt(), let height = readInt(), let maxval = readInt(),
+        width >= 1, height >= 1, maxval >= 1, maxval <= 65535
+    else { return nil }
+    pos += 1  // single whitespace byte after maxval
+    let twoBytes = maxval > 255
+    let bytesPerSample = twoBytes ? 2 : 1
+    guard bytes.count - pos >= width * height * channels * bytesPerSample else { return nil }
+    var bits = 1
+    while (1 << bits) - 1 < maxval { bits += 1 }
+    var planes = [[Int32]](repeating: [Int32](repeating: 0, count: width * height), count: channels)
+    for i in 0..<(width * height) {
+        for c in 0..<channels {
+            let v: Int32
+            if twoBytes {
+                v = Int32(bytes[pos]) << 8 | Int32(bytes[pos + 1])  // PNM is big-endian
+                pos += 2
+            } else {
+                v = Int32(bytes[pos])
+                pos += 1
+            }
+            planes[c][i] = v
+        }
+    }
+    return JXLDecodedImage(
+        width: width, height: height, colorChannels: channels, extraChannels: 0,
+        bitsPerSample: bits, isFloat: false, planes: planes)
 }
 
 /// Encodes a decoded image as a binary PNM: P5 (grayscale) or P6 (RGB), 8- or

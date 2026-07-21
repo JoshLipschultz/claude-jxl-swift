@@ -1,118 +1,22 @@
 // ModularEncoder.swift
 //
-// E1 of docs/encoder-design.md: the minimum honest lossless encoder — a
-// single-group (coalesced) native-space Modular frame with a single-leaf
-// gradient MA tree and *flat* prefix codes (power-of-two alphabet, all code
-// lengths equal). Every stream this file writes is read back by the decoder's
-// own parsers; validity against the spec is proven by djxl round-trips
-// in-suite. Compression comes purely from prediction at this stage — real
-// entropy coding is the next milestone, and sizes are recorded honestly.
+// E1 of docs/encoder-design.md: the honest lossless encoder — native-space
+// Modular frames with a single-leaf gradient MA tree and real canonical
+// prefix codes (EntropyWriter.swift), forward YCoCg RCT for color images, and
+// multi-group encoding for arbitrary dimensions. Every stream this file
+// writes is read back by the decoder's own parsers; validity against the spec
+// is proven by djxl round-trips in-suite.
 //
 // The load-bearing rule (see the design doc): prediction uses the *decoder's*
-// `predictOne` with the decoder's exact border semantics, so encode/decode
-// prediction divergence is structurally impossible.
+// `predictOne` with the decoder's exact border semantics (group-local at
+// group boundaries), so encode/decode prediction divergence is structurally
+// impossible.
 
 import Foundation
 
 public struct JXLEncodeError: Error, CustomStringConvertible, Sendable {
     public let reason: String
     public var description: String { reason }
-}
-
-// MARK: - Flat prefix-code entropy writer
-
-/// Writes entropy-coded symbol streams the decoder's `decodeHistograms` +
-/// prefix path accepts, using one shared *flat* histogram: alphabet padded to
-/// 2^k, every symbol coded in exactly k bits. The flat shape needs no
-/// code-length data at all: the code-length code declares a single symbol k
-/// (`numCodes == 1`), whose 0-bit reads fill every length, and Kraft sums
-/// exactly. Hybrid-uint config is the default (4, 2, 0).
-struct FlatPrefixWriter {
-    static let config = HybridUintConfig(splitExponent: 4, msbInToken: 2, lsbInToken: 0)
-
-    let k: Int  // log2(alphabet size), >= 1
-
-    /// The k for the smallest power-of-two alphabet covering `maxToken`.
-    init(maxToken: UInt32) {
-        var kk = 1
-        while (1 << kk) <= Int(maxToken) { kk += 1 }
-        k = kk
-    }
-
-    /// Writes the full entropy header for `numContexts` contexts, all mapped
-    /// to this single flat histogram (mirrors `decodeHistograms`).
-    func writeHeader(_ w: BitWriter, numContexts: Int) {
-        w.writeBool(false)  // lz77 enabled
-        if numContexts > 1 {
-            // Simple context map, 0 bits/entry: every context -> histogram 0.
-            w.writeBool(true)  // is_simple
-            w.write(0, 2)  // bits per entry
-        }
-        w.writeBool(true)  // use_prefix_code
-        // Hybrid-uint config (log_alpha_size = 15 for prefix codes):
-        // split_exponent=4 in ceil_log2(16)=4 bits, msb=2 in ceil_log2(5)=3,
-        // lsb=0 in ceil_log2(3)=2.
-        w.write(4, 4)
-        w.write(2, 3)
-        w.write(0, 2)
-        // Alphabet size (VarLenUint16 of size-1), then the prefix code.
-        writeVarLenUint16(w, (1 << k) - 1)
-        writeFlatPrefixCode(w)
-    }
-
-    /// The complex-form prefix code declaring a flat 2^k alphabet.
-    private func writeFlatPrefixCode(_ w: BitWriter) {
-        w.write(0, 2)  // simple_or_skip = 0 (complex, start at order index 0)
-        // Code-length-code lengths in kCodeLengthCodeOrder =
-        // [1,2,3,4,0,5,17,6,16,7,8,9,10,11,12,13,14,15]: only symbol k gets
-        // length 1; everything else 0. Static CL patterns (LSB-first):
-        // len 0 -> (0,2), 1 -> (7,4), 2 -> (3,3), 3 -> (2,2), 4 -> (1,2),
-        // 5 -> (15,4).
-        let order = [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-        for idx in order {
-            if idx == k {
-                w.write(7, 4)  // length 1
-            } else {
-                w.write(0, 2)  // length 0
-            }
-        }
-        // Per-symbol lengths: the single-symbol CL code reads 0 bits per
-        // symbol, so nothing is written — all 2^k symbols get length k and
-        // Kraft closes exactly.
-    }
-
-    /// Writes one hybrid-uint value: flat-code symbol (bit-reversed k bits)
-    /// plus the config's extra bits.
-    @inline(__always)
-    func writeValue(_ w: BitWriter, _ value: UInt32) {
-        let (token, nbits, bits) = Self.config.encode(value)
-        // Canonical flat code: symbol s reads as the k bits of s in MSB-first
-        // canonical order; the LSB-first stream stores the bit-reversed key.
-        var rev: UInt64 = 0
-        var s = UInt64(token)
-        for _ in 0..<k {
-            rev = (rev << 1) | (s & 1)
-            s >>= 1
-        }
-        w.write(rev, k)
-        if nbits > 0 { w.write(UInt64(bits), Int(nbits)) }
-    }
-
-    /// Max token for `value` under the shared config (for alphabet sizing).
-    static func token(for value: UInt32) -> UInt32 {
-        config.encode(value).token
-    }
-}
-
-private func writeVarLenUint16(_ w: BitWriter, _ v: Int) {
-    if v == 0 {
-        w.writeBool(false)
-        return
-    }
-    w.writeBool(true)
-    let n = 31 - Int(UInt32(v).leadingZeroBitCount)  // floor(log2(v))
-    w.write(UInt64(n), 4)
-    if n > 0 { w.write(UInt64(v) & ((1 << UInt64(n)) - 1), n) }
 }
 
 @inline(__always)
@@ -124,8 +28,7 @@ private func packSigned(_ d: Int) -> UInt32 {
 
 enum ModularEncoder {
     /// Encodes `image` as a bare-codestream lossless JXL (E1 subset: integer
-    /// 8/16-bit samples, 1 or 3 color channels, no extra channels, single
-    /// group — width and height ≤ 256).
+    /// samples up to 16 bits, 1 or 3 color channels, no extra channels).
     static func encodeLossless(_ image: JXLDecodedImage) throws -> [UInt8] {
         let gray = image.colorChannels == 1
         guard image.colorChannels == 1 || image.colorChannels == 3 else {
@@ -137,9 +40,8 @@ enum ModularEncoder {
         guard !image.isFloat, image.bitsPerSample >= 1, image.bitsPerSample <= 16 else {
             throw JXLEncodeError(reason: "E1 encodes integer samples up to 16 bits")
         }
-        guard image.width >= 1, image.height >= 1, image.width <= 256, image.height <= 256
-        else {
-            throw JXLEncodeError(reason: "E1 encodes single-group images (≤256×256)")
+        guard image.width >= 1, image.height >= 1 else {
+            throw JXLEncodeError(reason: "empty image")
         }
         let maxVal = (1 << image.bitsPerSample) - 1
         for p in 0..<image.colorChannels {
@@ -148,23 +50,116 @@ enum ModularEncoder {
             }
         }
 
+        // Channel planes in coded (RCT) space. YCoCg (rct_type 6) turns
+        // correlated RGB into a luma + two difference channels; lossless and
+        // exactly inverted by the decoder's invRCT.
+        var channels = (0..<image.colorChannels).map { image.planes[$0] }
+        let useRCT = image.colorChannels == 3
+        if useRCT { forwardYCoCg(&channels) }
+
+        var dim = FrameDimensions()
+        dim.set(
+            xsize: image.width, ysize: image.height, groupSizeShift: 1,
+            maxHShift: 0, maxVShift: 0, modular: true, upsampling: 1)
+
         let w = BitWriter()
         HeaderWriter.writeCodestreamHeaders(
             w, width: UInt32(image.width), height: UInt32(image.height),
             bitsPerSample: UInt32(image.bitsPerSample), grayscale: gray)
         writeFrameHeader(w)
 
-        let section = encodeGlobalSection(image)
+        if dim.numGroups == 1 {
+            // Coalesced: one section carrying tree, histograms, and the global
+            // stream with every channel.
+            let groupTokens = tokenizeGroup(
+                channels, width: image.width, x0: 0, y0: 0, gw: image.width, gh: image.height)
+            let residual = PrefixEntropyEncoder(numContexts: 1, streams: [groupTokens])
+            let s = BitWriter()
+            writeLfGlobalModular(s, residual: residual, useRCT: useRCT)
+            residual.writeStream(s, groupTokens)
+            let section = s.finalize()
+            w.writeBool(false)  // TOC: no permutation
+            w.alignToByte()
+            writeTocSize(w, section.count)
+            w.alignToByte()
+            w.append(bytes: section)
+            return w.finalize()
+        }
 
-        // TOC: 1 entry (coalesced), no permutation.
-        w.writeBool(false)
+        // Multi-group: per-group token streams (prediction restarts at group
+        // boundaries — the decoder decodes each group into a group-local
+        // sub-image), one shared histogram written in LfGlobal.
+        var groupTokens: [[EncToken]] = []
+        for g in 0..<dim.numGroups {
+            let x0 = (g % dim.xsizeGroups) * dim.groupDim
+            let y0 = (g / dim.xsizeGroups) * dim.groupDim
+            let gw = min(dim.groupDim, image.width - x0)
+            let gh = min(dim.groupDim, image.height - y0)
+            groupTokens.append(
+                tokenizeGroup(channels, width: image.width, x0: x0, y0: y0, gw: gw, gh: gh))
+        }
+        let residual = PrefixEntropyEncoder(numContexts: 1, streams: groupTokens)
+
+        // Section 0 (LfGlobal): tree + shared histograms + the global stream's
+        // GroupHeader. With one group dimension > group_dim, every color
+        // channel is per-group, so the global stream carries no channel data.
+        let s0 = BitWriter()
+        writeLfGlobalModular(s0, residual: residual, useRCT: useRCT)
+        var sections: [[UInt8]] = [s0.finalize()]
+        // DC-group sections carry only squeeze channels with shift >= 3 — none
+        // here, and the decoder reads nothing from them. Same for HfGlobal.
+        for _ in 0..<dim.numDCGroups { sections.append([]) }
+        sections.append([])  // HfGlobal
+        for g in 0..<dim.numGroups {
+            let s = BitWriter()
+            s.writeBool(true)  // use_global_tree
+            s.writeBool(true)  // wp_header: all_default
+            s.write(0, 2)  // nb_transforms = 0
+            residual.writeStream(s, groupTokens[g])
+            sections.append(s.finalize())
+        }
+
+        w.writeBool(false)  // TOC: no permutation
         w.alignToByte()
-        w.writeU32(
-            UInt32(section.count), .bits(10), .bits(14, offset: 1024),
-            .bits(22, offset: 17408), .bits(30, offset: 4_211_712))
+        for section in sections { writeTocSize(w, section.count) }
         w.alignToByte()
-        w.append(bytes: section)
+        for section in sections { w.append(bytes: section) }
         return w.finalize()
+    }
+
+    /// In-place forward YCoCg (rct_type 6, identity permutation): the exact
+    /// inverse of the decoder's invRCT custom == 6 branch.
+    private static func forwardYCoCg(_ channels: inout [[Int32]]) {
+        // Detach the three planes so the nested mutable pointer scopes don't
+        // overlap on `channels` (exclusivity); swaps avoid COW copies.
+        var p0: [Int32] = []
+        var p1: [Int32] = []
+        var p2: [Int32] = []
+        swap(&p0, &channels[0])
+        swap(&p1, &channels[1])
+        swap(&p2, &channels[2])
+        let n = p0.count
+        p0.withUnsafeMutableBufferPointer { c0 in
+            p1.withUnsafeMutableBufferPointer { c1 in
+                p2.withUnsafeMutableBufferPointer { c2 in
+                    for i in 0..<n {
+                        let r = Int(c0[i])
+                        let g = Int(c1[i])
+                        let b = Int(c2[i])
+                        let co = r - b
+                        let tmp = b + (co >> 1)
+                        let cg = g - tmp
+                        let y = tmp + (cg >> 1)
+                        c0[i] = Int32(truncatingIfNeeded: y)
+                        c1[i] = Int32(truncatingIfNeeded: co)
+                        c2[i] = Int32(truncatingIfNeeded: cg)
+                    }
+                }
+            }
+        }
+        swap(&p0, &channels[0])
+        swap(&p1, &channels[1])
+        swap(&p2, &channels[2])
     }
 
     /// FrameHeader for the E1 shape: regular, modular, no flags, no color
@@ -192,46 +187,54 @@ enum ModularEncoder {
         w.writeU64(0)  // frame-header extensions
     }
 
-    /// The coalesced section-0 payload: LfGlobal's modular pieces (default
-    /// dc-quant, global single-leaf gradient tree) followed by the global
-    /// modular stream carrying every channel.
-    private static func encodeGlobalSection(_ image: JXLDecodedImage) -> [UInt8] {
-        let w = BitWriter()
+    /// LfGlobal's modular pieces: default dc-quant, the global single-leaf
+    /// gradient tree, the shared residual entropy header (decodeModularChannels
+    /// reads tree + histograms together, before any group stream), then the
+    /// global stream's GroupHeader carrying the transforms.
+    private static func writeLfGlobalModular(
+        _ w: BitWriter, residual: PrefixEntropyEncoder, useRCT: Bool
+    ) {
         // (flags = 0: no patches/splines/noise payloads)
         w.writeBool(true)  // dc-quant factors: default
         w.writeBool(true)  // has_tree: global tree follows
         writeSingleLeafGradientTree(w)
-        // The residual entropy header follows the tree immediately
-        // (decodeModularChannels reads tree + histograms together, BEFORE the
-        // group stream), so tokenize first to size the alphabet.
-        let (tokens, maxToken) = tokenizeChannels(image)
-        let writer = FlatPrefixWriter(maxToken: maxToken)
-        writer.writeHeader(w, numContexts: 1)  // single-leaf tree -> 1 context
-        // Global modular stream: GroupHeader, then the channel symbols coded
-        // with the header above.
+        residual.writeHeader(w)
+        // Global modular stream: GroupHeader (with the RCT transform), then —
+        // multi-group — nothing (all channels are per-group), or — coalesced —
+        // the caller appends every channel's tokens.
         w.writeBool(true)  // use_global_tree
         w.writeBool(true)  // wp_header: all_default
-        w.write(0, 2)  // nb_transforms = 0 (U32 Val selector)
-        for v in tokens { writer.writeValue(w, v) }
-        return w.finalize()
+        if useRCT {
+            w.writeU32(1, .value(0), .value(1), .bits(4, offset: 2), .bits(8, offset: 18))
+            w.writeU32(0, .value(0), .value(1), .value(2), .value(3))  // id: RCT
+            w.writeU32(0, .bits(3), .bits(6, offset: 8), .bits(10, offset: 72), .bits(13, offset: 1096))
+            w.writeU32(6, .value(6), .bits(2), .bits(4, offset: 2), .bits(6, offset: 10))  // YCoCg
+        } else {
+            w.writeU32(0, .value(0), .value(1), .bits(4, offset: 2), .bits(8, offset: 18))
+        }
     }
 
-    /// Residual tokens for every channel in decode order, using the decoder's
-    /// exact gradient prediction and border semantics (`decodeChannel`).
-    private static func tokenizeChannels(_ image: JXLDecodedImage)
-        -> (tokens: [UInt32], maxToken: UInt32)
-    {
-        let width = image.width
-        let height = image.height
-        var tokens: [UInt32] = []
-        tokens.reserveCapacity(width * height * image.colorChannels)
-        var maxToken: UInt32 = 0
-        for c in 0..<image.colorChannels {
-            image.planes[c].withUnsafeBufferPointer { px in
-                for y in 0..<height {
-                    let row = y * width
+    /// TOC entry size (toc.cc U32 distribution).
+    private static func writeTocSize(_ w: BitWriter, _ size: Int) {
+        w.writeU32(
+            UInt32(size), .bits(10), .bits(14, offset: 1024),
+            .bits(22, offset: 17408), .bits(30, offset: 4_211_712))
+    }
+
+    /// Residual tokens for one group rect across every channel, in decode
+    /// order, using the decoder's exact gradient prediction and group-local
+    /// border semantics (`decodeChannel` on the group sub-image).
+    private static func tokenizeGroup(
+        _ channels: [[Int32]], width: Int, x0: Int, y0: Int, gw: Int, gh: Int
+    ) -> [EncToken] {
+        var tokens: [EncToken] = []
+        tokens.reserveCapacity(gw * gh * channels.count)
+        for plane in channels {
+            plane.withUnsafeBufferPointer { px in
+                for y in 0..<gh {
+                    let row = (y0 + y) * width + x0
                     let prev = row - width
-                    for x in 0..<width {
+                    for x in 0..<gw {
                         let left = x > 0 ? Int(px[row + x - 1]) : (y > 0 ? Int(px[prev + x]) : 0)
                         let top = y > 0 ? Int(px[prev + x]) : left
                         let topleft = (x > 0 && y > 0) ? Int(px[prev + x - 1]) : left
@@ -239,29 +242,24 @@ enum ModularEncoder {
                             5, left: left, top: top, toptop: 0, topleft: topleft,
                             topright: 0, leftleft: 0, toprightright: 0, wpPred: 0)
                         let packed = packSigned(Int(px[row + x]) - guess)
-                        let t = FlatPrefixWriter.token(for: packed)
-                        if t > maxToken { maxToken = t }
-                        tokens.append(packed)
+                        tokens.append(EncToken(ctx: 0, value: packed))
                     }
                 }
             }
         }
-        return (tokens, maxToken)
+        return tokens
     }
 
     /// The global MA tree: one leaf, Gradient predictor, offset 0,
     /// multiplier 1 — every sample lands in one context and prediction is
     /// W+N−NW (`predictOne` case 5). Tree tokens: property=0 (leaf),
-    /// predictor=5, offset=0, mul_log=0, mul_bits=0, in tree contexts 1/2/3/
-    /// 4/5, all mapped to one flat histogram.
+    /// predictor=5, offset=0, mul_log=0, mul_bits=0, in tree contexts all
+    /// mapped to one histogram.
     private static func writeSingleLeafGradientTree(_ w: BitWriter) {
-        let writer = FlatPrefixWriter(maxToken: FlatPrefixWriter.token(for: 5))
-        writer.writeHeader(w, numContexts: 6)  // kNumTreeContexts
-        writer.writeValue(w, 0)  // property + 1 = 0 -> leaf
-        writer.writeValue(w, 5)  // predictor: Gradient
-        writer.writeValue(w, 0)  // packed predictor offset
-        writer.writeValue(w, 0)  // multiplier log
-        writer.writeValue(w, 0)  // multiplier bits
+        let tokens = [0, 5, 0, 0, 0].map { EncToken(ctx: 0, value: UInt32($0)) }
+        let enc = PrefixEntropyEncoder(numContexts: 6, streams: [tokens])  // kNumTreeContexts
+        enc.writeHeader(w)
+        enc.writeStream(w, tokens)
         // (prefix path: no ANS final state)
     }
 
@@ -269,8 +267,8 @@ enum ModularEncoder {
 
 extension JXL {
     /// Encodes pixel planes as a lossless bare-codestream JXL (E1 subset:
-    /// integer 8/16-bit samples, 1 or 3 channels, ≤256×256). Round-trips
-    /// byte-exactly under this decoder and djxl.
+    /// integer samples up to 16 bits, 1 or 3 channels, any dimensions).
+    /// Round-trips byte-exactly under this decoder and djxl.
     public static func encodeLossless(image: JXLDecodedImage) throws -> [UInt8] {
         try ModularEncoder.encodeLossless(image)
     }

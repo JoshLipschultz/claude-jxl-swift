@@ -90,6 +90,7 @@ struct TestRunner {
         bitWriterRoundTrip()
         headerWriterRoundTrip()
         encoderRoundTrip()
+        encoderSizeGate()
         orientationBaking()
         deltaPalette()
         iccOutput()
@@ -356,6 +357,11 @@ struct TestRunner {
             (1, 1, 3, 8, 0), (8, 8, 3, 8, 1), (96, 64, 3, 8, 0), (96, 64, 3, 8, 1),
             (256, 256, 3, 8, 1), (65, 33, 1, 8, 0), (40, 30, 3, 16, 1),
             (17, 90, 1, 16, 3), (128, 5, 3, 8, 2),
+            // Multi-group shapes: group-boundary crossings in each dimension,
+            // both channel counts, both depths, ragged edges.
+            (257, 256, 3, 8, 0), (300, 200, 3, 8, 1), (100, 600, 1, 8, 0),
+            (513, 300, 3, 8, 0), (260, 259, 3, 16, 1), (1, 1000, 1, 8, 3),
+            (777, 3, 3, 8, 1), (512, 512, 1, 16, 2),
         ]
         var failures = 0
         for (w, h, ch, bits, mode) in shapes {
@@ -381,6 +387,51 @@ struct TestRunner {
         eq(failures, 0, "encoder round-trip byte-exact (\(shapes.count) shapes)")
         FileHandle.standardError.write(
             Data("  [encoder-e1] encode->decode byte-exact round-trips\n".utf8))
+    }
+
+    /// Encoder size + determinism goldens: encoding these deterministic images
+    /// must produce exactly these byte counts. A size increase is a
+    /// compression regression; ANY change means the bitstream changed and the
+    /// djxl oracle sweep must be re-run before updating the constants.
+    /// (Current honest baselines: 96x64 gradient 3290 B vs cjxl -e2 7056 B;
+    /// noise shapes are near/above raw because gradient prediction widens
+    /// incompressible residuals — predictor selection is E4.)
+    static func encoderSizeGate() {
+        var state: UInt64 = 0x1234_5678_9ABC_DEF0
+        func rnd() -> UInt64 {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            return state >> 16
+        }
+        func makeImage(w: Int, h: Int, channels: Int, bits: Int, mode: Int) -> JXLDecodedImage {
+            let maxV = Int32((1 << bits) - 1)
+            var planes: [[Int32]] = []
+            for c in 0..<channels {
+                var p = [Int32](repeating: 0, count: w * h)
+                for i in 0..<(w * h) {
+                    switch mode {
+                    case 0: p[i] = Int32((i + c * 37) % (Int(maxV) + 1))
+                    case 1: p[i] = Int32(truncatingIfNeeded: Int64(rnd())) & maxV
+                    case 2: p[i] = maxV / 2
+                    default: p[i] = (i % 2 == 0) ? 0 : maxV
+                    }
+                }
+                planes.append(p)
+            }
+            return JXLDecodedImage(
+                width: w, height: h, colorChannels: channels, extraChannels: 0,
+                bitsPerSample: bits, isFloat: false, planes: planes)
+        }
+        let goldens: [(w: Int, h: Int, ch: Int, bits: Int, mode: Int, size: Int)] = [
+            (96, 64, 3, 8, 0, 3290), (96, 64, 3, 8, 1, 19818), (256, 256, 3, 8, 1, 176813),
+            (300, 200, 3, 8, 1, 202251), (512, 512, 1, 16, 2, 32817), (100, 600, 1, 8, 0, 11415),
+        ]
+        for g in goldens {
+            let img = makeImage(w: g.w, h: g.h, channels: g.ch, bits: g.bits, mode: g.mode)
+            let size = (try? JXL.encodeLossless(image: img).count) ?? -1
+            eq(size, g.size, "encoded size golden \(g.w)x\(g.h)/\(g.ch)ch/\(g.bits)bit mode \(g.mode)")
+        }
+        FileHandle.standardError.write(
+            Data("  [encoder-size] deterministic size goldens hold\n".utf8))
     }
 
     /// Header writers → the decoder's own parsers: dimensions, bit depth, and
