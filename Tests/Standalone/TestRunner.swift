@@ -366,10 +366,14 @@ struct TestRunner {
         var failures = 0
         for (w, h, ch, bits, mode) in shapes {
             let img = makeImage(w: w, h: h, channels: ch, bits: bits, mode: mode)
-            // Both entropy back-ends: ANS (E2, the default) and prefix (E1).
-            for backend in [ModularEncoder.EntropyBackend.ans, .prefix] {
+            // Both entropy back-ends (ANS default + prefix) at effort 2, plus
+            // the effort-1 fast path (fixed tree, no palette/WP/multipliers).
+            for (backend, effort) in [
+                (ModularEncoder.EntropyBackend.ans, 2), (.prefix, 2), (.ans, 1),
+            ] {
                 do {
-                    let jxl = try ModularEncoder.encodeLossless(img, backend: backend)
+                    let jxl = try ModularEncoder.encodeLossless(
+                        img, backend: backend, effort: effort)
                     let dec = try JXL.decodeImage(from: jxl)
                     guard dec.width == w, dec.height == h, dec.colorChannels == ch,
                         dec.bitsPerSample == bits
@@ -382,12 +386,14 @@ struct TestRunner {
                         break
                     }
                 } catch {
-                    check(false, "encode \(w)x\(h)/\(ch)ch/\(bits)bit mode \(mode) \(backend): \(error)")
+                    check(
+                        false,
+                        "encode \(w)x\(h)/\(ch)ch/\(bits)bit mode \(mode) \(backend) e\(effort): \(error)")
                     failures += 1
                 }
             }
         }
-        eq(failures, 0, "encoder round-trip byte-exact (\(shapes.count) shapes x 2 backends)")
+        eq(failures, 0, "encoder round-trip byte-exact (\(shapes.count) shapes x 3 configs)")
 
         // E3 shapes: alpha extra channels and binary32 floats. Float planes
         // carry IEEE-754 bit patterns as Int32 (identity through the modular
@@ -501,7 +507,7 @@ struct TestRunner {
                 bitsPerSample: bits, isFloat: false, planes: planes)
         }
         let goldens: [(w: Int, h: Int, ch: Int, bits: Int, mode: Int, size: Int)] = [
-            (96, 64, 3, 8, 0, 601), (96, 64, 3, 8, 1, 15739), (256, 256, 3, 8, 1, 92685),
+            (96, 64, 3, 8, 0, 180), (96, 64, 3, 8, 1, 15739), (256, 256, 3, 8, 1, 92685),
             (300, 200, 3, 8, 1, 187529), (512, 512, 1, 16, 2, 74), (100, 600, 1, 8, 0, 455),
         ]
         for g in goldens {

@@ -214,8 +214,17 @@ every milestone lands with djxl round-trip proof, never just self-consistency.
   per-leaf multipliers (residual GCDs — the 16-bit smooth gap was scaled
   ramps, w40 1595 → 729 B vs cjxl 603; two-pass tokenization because
   multipliers change fast-track kernel selection, with a divisibility
-  fallback). E4c tail: palette detection, squeeze for responsive mode,
-  effort levels, encode-speed knobs.
+  fallback). E4c (✅ 2026-07-21): global palette (≤256 colors, abort-early
+  detection, encode-both-ways when eligible since RCT occasionally wins on
+  small images — a 40-color test image lands 10× smaller than cjxl -e2's
+  34.9 KB), effort levels (e1 fast = fixed gradient tree + RCT, 6MP 0.31 s
+  wall; e2 default = everything, 1.31 s), and parallel encoding
+  (training/tokenization/section entropy across groups via concurrentPerform
+  under the decoder's no-refcounts rules; channel planes copied once into
+  raw buffers). Remaining for feature-complete: **squeeze** (responsive
+  mode) — the last un-shipped lossless feature; speed follow-ups: learning
+  and histogram clustering are still serial, cjxl -e2 wall is ~0.06 s
+  (SIMD C++) vs our 1.31 s.
 - **E5 (undecided) — baseline lossy**: XYB forward, fixed DCT8, uniform
   quant, quality knob; explicitly "valid, not competitive."
 - **E6 (undecided) — jbrd**: JPEG recompression, byte-exact reconstruction.

@@ -48,13 +48,13 @@ struct TreeTrainingSet {
     /// fast-track clamp variants only exist once a tree is chosen, and only
     /// affect cost estimates here, never correctness.
     mutating func collect(
-        plane: [Int32], width: Int, x0: Int, y0: Int, gw: Int, gh: Int,
+        plane px: UnsafeBufferPointer<Int32>, width: Int, x0: Int, y0: Int, gw: Int, gh: Int,
         chan: Int, stride: Int
     ) {
         let wp = WPState(header: WPHeader(), xsize: gw, ysize: gh)
         let wpProp = UnsafeMutablePointer<Int32>.allocate(capacity: 1)
         defer { wpProp.deallocate() }
-        plane.withUnsafeBufferPointer { px in
+        do {
             var i = 0
             for y in 0..<gh {
                 let row = (y0 + y) * width + x0
@@ -473,7 +473,7 @@ private let kEncPropRangeFast: Int64 = 512 << 4  // 8192
 /// kernel for this (tree, channel, stream) combination.
 func tokenizeChannelWithTree(
     into tokens: inout [EncToken],
-    plane: [Int32], width: Int, x0: Int, y0: Int, gw: Int, gh: Int,
+    plane px: UnsafeBufferPointer<Int32>, width: Int, x0: Int, y0: Int, gw: Int, gh: Int,
     chan: Int, streamID: Int, tree: [MATreeNode]
 ) {
     let fastTrack = channelFastTrack(
@@ -490,7 +490,7 @@ func tokenizeChannelWithTree(
     props.initialize(repeating: 0, count: kNumProps)
     props[0] = Int32(truncatingIfNeeded: chan)
     props[1] = Int32(truncatingIfNeeded: streamID)
-    plane.withUnsafeBufferPointer { px in
+    do {
         tree.withUnsafeBufferPointer { treeBuf in
             let treeP = treeBuf.baseAddress!
             for y in 0..<gh {

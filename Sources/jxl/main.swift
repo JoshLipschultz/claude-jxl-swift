@@ -34,8 +34,10 @@ func usage() -> Never {
                                            Decode image (lossless or lossy) to PNM;
                                            "dither" = blue-noise dither 8-bit output
                                            (djxl 0.12 default)
-          jxl encode <in> <out.jxl>        Encode losslessly: PGM/PPM (int),
-                                           PAM P7 (gray/RGB + alpha), PFM (float32)
+          jxl encode <in> <out.jxl> [e1|e2]
+                                           Encode losslessly: PGM/PPM (int),
+                                           PAM P7 (gray/RGB + alpha), PFM (float32);
+                                           e1 = fast, e2 = smaller (default)
           jxl icc    <file.jxl> [out.icc]  Extract the embedded ICC profile
           jxl vardct <file.jxl>            Preflight VarDCT global metadata
           jxl vardct-dc <file.jxl> [dump]  Decode VarDCT XYB DC image (lossy)
@@ -343,7 +345,15 @@ do {
         } else {
             fail("error: \(path) is not a binary PGM/PPM/PAM/PFM file")
         }
-        let jxl = try JXL.encodeLossless(image: image)
+        var effort = 2
+        if args.count >= 5 {
+            switch args[4] {
+            case "e1": effort = 1  // fast: fixed gradient tree, RCT only
+            case "e2": effort = 2  // default: learned trees, WP, palette, multipliers
+            default: usage()
+            }
+        }
+        let jxl = try JXL.encodeLossless(image: image, effort: effort)
         try Data(jxl).write(to: URL(fileURLWithPath: args[3]))
         let raw = image.width * image.height * (image.colorChannels + image.extraChannels)
             * (image.isFloat ? 4 : (image.bitsPerSample > 8 ? 2 : 1))
