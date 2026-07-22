@@ -91,6 +91,8 @@ struct TestRunner {
         headerWriterRoundTrip()
         encoderRoundTrip()
         encoderSizeGate()
+        squeezeEncoder()
+        paletteGroupChannelIndex()
         orientationBaking()
         deltaPalette()
         iccOutput()
@@ -556,6 +558,212 @@ struct TestRunner {
         }
         FileHandle.standardError.write(
             Data("  [encoder-size] deterministic size goldens hold\n".utf8))
+    }
+
+    /// Encoder squeeze (E4d): (a) the forward squeeze followed by the
+    /// DECODER'S OWN invSqueeze must be an exact identity on random channels
+    /// across odd/even shapes, with the forward channel layout matching the
+    /// decoder's metaSqueeze bookkeeping (dims + shifts) — the load-bearing
+    /// property, validated before any bitstream; (b) encode-with-squeeze →
+    /// our decoder round-trips byte-exactly across coalesced/multi-group/
+    /// multi-DC-group shapes, 1/3 channels, alpha, 8/16-bit, both entropy
+    /// back-ends and both efforts; (c) float samples are rejected (squeeze's
+    /// diff/2 is not congruence-preserving mod 2^32); (d) squeeze output is
+    /// deterministic with pinned sizes (djxl oracle sweep re-run before any
+    /// re-bless, as with the other size goldens).
+    static func squeezeEncoder() {
+        var state: UInt64 = 0x5EED_5EED_5EED_5EED
+        func rnd() -> UInt64 {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            return state >> 16
+        }
+
+        // (a) forward ∘ inverse identity + layout mirror.
+        let idShapes: [(w: Int, h: Int, n: Int)] = [
+            (1, 1, 1), (7, 1, 1), (1, 7, 1), (8, 8, 3), (9, 9, 3), (16, 1, 1),
+            (1, 16, 3), (64, 48, 3), (33, 70, 1), (65, 33, 3), (127, 2, 3),
+            (2, 127, 1), (257, 100, 1), (100, 257, 3), (300, 200, 3), (2100, 32, 1),
+        ]
+        var identityFailures = 0
+        for (idx, shape) in idShapes.enumerated() {
+            let (w, h, n) = shape
+            // Alternate sample ranges: post-RCT-like 17-bit and tiny (the
+            // tendency clamps behave differently near zero).
+            let range: Int64 = idx % 3 == 2 ? 4 : 131072
+            var original: [ModularChannel] = []
+            for _ in 0..<n {
+                var mc = ModularChannel(w: w, h: h)
+                for i in 0..<(w * h) {
+                    mc.pixels[i] = Int32(truncatingIfNeeded: Int64(rnd() % UInt64(2 * range)) - range)
+                }
+                original.append(mc)
+            }
+            let layout = ModularImage(w: w, h: h, bitdepth: 16, channelCount: n)
+            var params: [SqueezeParams] = []
+            guard (try? metaSqueeze(layout, params: &params)) != nil else {
+                check(false, "metaSqueeze resolves \(w)x\(h)x\(n)")
+                identityFailures += 1
+                continue
+            }
+            var fwd = original
+            forwardSqueeze(&fwd, params: params)
+            var layoutOK = fwd.count == layout.channels.count
+            if layoutOK {
+                for (a, b) in zip(fwd, layout.channels)
+                where a.w != b.w || a.h != b.h || a.hshift != b.hshift || a.vshift != b.vshift {
+                    layoutOK = false
+                }
+            }
+            guard layoutOK else {
+                check(false, "squeeze layout mirror \(w)x\(h)x\(n)")
+                identityFailures += 1
+                continue
+            }
+            let img = ModularImage(w: w, h: h, bitdepth: 16, channelCount: 0)
+            img.channels = fwd
+            guard (try? invSqueeze(img, params: params)) != nil, img.channels.count == n else {
+                check(false, "invSqueeze runs \(w)x\(h)x\(n)")
+                identityFailures += 1
+                continue
+            }
+            for (a, b) in zip(img.channels, original)
+            where a.w != b.w || a.h != b.h || a.pixels != b.pixels {
+                identityFailures += 1
+                break
+            }
+        }
+        eq(identityFailures, 0, "forward∘invSqueeze identity (\(idShapes.count) shapes)")
+
+        // (b) bitstream round-trips through our decoder.
+        func makeImage(w: Int, h: Int, channels: Int, extra: Int, bits: Int, mode: Int)
+            -> JXLDecodedImage
+        {
+            let maxV = Int32((1 << bits) - 1)
+            var planes: [[Int32]] = []
+            for c in 0..<(channels + extra) {
+                var p = [Int32](repeating: 0, count: w * h)
+                for i in 0..<(w * h) {
+                    switch mode {
+                    case 0: p[i] = Int32((i + c * 37) % (Int(maxV) + 1))  // gradient-ish
+                    default: p[i] = Int32(truncatingIfNeeded: Int64(rnd())) & maxV  // noise
+                    }
+                }
+                planes.append(p)
+            }
+            return JXLDecodedImage(
+                width: w, height: h, colorChannels: channels, extraChannels: extra,
+                bitsPerSample: bits, isFloat: false, planes: planes)
+        }
+        // Odd/even dims, 1/3 channels, alpha, 8/16-bit, multi-group (>256)
+        // and multi-DC-group (>2048 in one dimension, both orientations).
+        let rtShapes: [(w: Int, h: Int, ch: Int, extra: Int, bits: Int, mode: Int)] = [
+            (9, 7, 1, 0, 8, 0), (64, 48, 3, 0, 8, 1), (65, 33, 1, 0, 8, 0),
+            (96, 64, 3, 0, 16, 1), (257, 130, 3, 0, 8, 0), (300, 200, 3, 0, 16, 1),
+            (100, 600, 1, 0, 8, 0), (2100, 32, 1, 0, 8, 0), (31, 2100, 3, 0, 8, 1),
+            (300, 130, 3, 1, 8, 1),
+        ]
+        var rtFailures = 0
+        for (w, h, ch, extra, bits, mode) in rtShapes {
+            let img = makeImage(w: w, h: h, channels: ch, extra: extra, bits: bits, mode: mode)
+            var configs: [(ModularEncoder.EntropyBackend, Int)] = [(.ans, 2), (.prefix, 2)]
+            if (w == 257 && h == 130) || (w == 2100 && h == 32) { configs.append((.ans, 1)) }
+            for (backend, effort) in configs {
+                do {
+                    let jxl = try ModularEncoder.encodeLossless(
+                        img, backend: backend, effort: effort, squeeze: true)
+                    let dec = try JXL.decodeImage(from: jxl)
+                    guard dec.width == w, dec.height == h, dec.colorChannels == ch,
+                        dec.extraChannels == extra, dec.bitsPerSample == bits
+                    else {
+                        check(false, "squeeze rt header \(w)x\(h)/\(ch)+\(extra)/\(bits) \(backend) e\(effort)")
+                        rtFailures += 1
+                        continue
+                    }
+                    for c in 0..<(ch + extra) where dec.planes[c] != img.planes[c] {
+                        check(false, "squeeze rt plane \(c) \(w)x\(h)/\(ch)+\(extra)/\(bits) \(backend) e\(effort)")
+                        rtFailures += 1
+                        break
+                    }
+                } catch {
+                    check(false, "squeeze rt encode \(w)x\(h)/\(ch)+\(extra)/\(bits) \(backend) e\(effort): \(error)")
+                    rtFailures += 1
+                }
+            }
+        }
+        eq(rtFailures, 0, "squeeze round-trip byte-exact (\(rtShapes.count) shapes x backends)")
+
+        // (c) float + squeeze rejected.
+        let floatImg = JXLDecodedImage(
+            width: 8, height: 8, colorChannels: 1, extraChannels: 0, bitsPerSample: 32,
+            isFloat: true, planes: [[Int32](repeating: Int32(bitPattern: Float(0.5).bitPattern), count: 64)])
+        check(
+            (try? ModularEncoder.encodeLossless(floatImg, squeeze: true)) == nil,
+            "squeeze rejects float samples")
+
+        // (d) determinism + size goldens (same regime as encoderSizeGate:
+        // any change means the bitstream changed → djxl sweep before
+        // re-blessing). Contents are isolated from the shared LCG above.
+        let gradImg = makeImage(w: 100, h: 600, channels: 1, extra: 0, bits: 8, mode: 0)
+        state = 0xA5A5_5A5A_1234_4321
+        let noiseImg = makeImage(w: 96, h: 64, channels: 3, extra: 0, bits: 8, mode: 1)
+        let gradSq = (try? JXL.encodeLossless(image: gradImg, squeeze: true)) ?? []
+        eq(gradSq.count, 3668, "squeeze size golden 100x600 gradient")
+        eq((try? JXL.encodeLossless(image: noiseImg, squeeze: true))?.count ?? -1, 18341,
+            "squeeze size golden 96x64 noise")
+        eq((try? JXL.encodeLossless(image: gradImg, squeeze: true)) ?? [], gradSq,
+            "squeeze encode deterministic")
+        FileHandle.standardError.write(
+            Data("  [encoder-squeeze] forward identity + round-trips + goldens\n".utf8))
+    }
+
+    /// Regression (encoder-fuzzer seed 1011): palette + multi-group + extra
+    /// channels. The decoder renumbers channels LOCALLY in per-group
+    /// sub-streams (decodeModularGroupImage builds the group image from
+    /// beginC onward, so property 0 restarts at 0), while the encoder used
+    /// to pass full-image indices — any learned tree splitting on property 0
+    /// then routed pixels to different leaves on the two sides and desynced
+    /// the stream (finalState). A 2-value 16-bit gray plane forces palette
+    /// (meta channel ⇒ beginC = 1); 513 tall forces multiple groups; two
+    /// extra channels with contrasting content make a property-0 split
+    /// near-certain.
+    static func paletteGroupChannelIndex() {
+        var state: UInt64 = 0xFEED_FACE_CAFE_BEEF
+        func rnd() -> UInt64 {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            return state >> 16
+        }
+        let w = 135
+        let h = 513
+        var gray = [Int32](repeating: 0, count: w * h)
+        // 2-value noise: the palette index stream wins by an order of
+        // magnitude, so the public entry's palette-vs-direct race reliably
+        // keeps the palette encoding (the path under test).
+        for i in 0..<(w * h) { gray[i] = rnd() & 1 == 0 ? 100 : 40000 }
+        var extra1 = [Int32](repeating: 0, count: w * h)
+        for i in 0..<(w * h) { extra1[i] = Int32(i % 65536) }  // gradient
+        var extra2 = [Int32](repeating: 0, count: w * h)
+        for i in 0..<(w * h) { extra2[i] = Int32(truncatingIfNeeded: Int64(rnd())) & 0xFFFF }
+        let img = JXLDecodedImage(
+            width: w, height: h, colorChannels: 1, extraChannels: 2, bitsPerSample: 16,
+            isFloat: false, planes: [gray, extra1, extra2])
+        var failures = 0
+        for backend in [ModularEncoder.EntropyBackend.ans, .prefix] {
+            do {
+                let jxl = try ModularEncoder.encodeLossless(img, backend: backend, effort: 2)
+                let dec = try JXL.decodeImage(from: jxl)
+                for c in 0..<3 where dec.planes[c] != img.planes[c] {
+                    check(false, "palette multi-group chan index: plane \(c) (\(backend))")
+                    failures += 1
+                    break
+                }
+            } catch {
+                check(false, "palette multi-group chan index (\(backend)): \(error)")
+                failures += 1
+            }
+        }
+        eq(failures, 0, "palette + multi-group + extra channels round-trip (both backends)")
+        FileHandle.standardError.write(
+            Data("  [encoder-palette] group-local channel indices (fuzz regression)\n".utf8))
     }
 
     /// Header writers → the decoder's own parsers: dimensions, bit depth, and
