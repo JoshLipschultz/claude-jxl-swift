@@ -185,35 +185,52 @@ private struct ANSClusterCode {
 struct ANSEntropyEncoder {
     let clustered: ClusteredHistograms
     let logAlphaSize: Int
+    let configs: [HybridUintConfig]
+    let lz77: EncLZ77?
     private let codes: [ANSClusterCode]
 
-    init(numContexts: Int, streams: [[EncToken]]) {
-        clustered = ClusteredHistograms(numContexts: numContexts, streams: streams)
+    /// With `lz77`, `numContexts` INCLUDES the trailing distance context.
+    init(numContexts: Int, streams: [[EncToken]], lz77: EncLZ77? = nil) {
+        self.lz77 = lz77
+        clustered = ClusteredHistograms(
+            numContexts: numContexts, streams: streams, lz77: lz77)
+        // Per-cluster hybrid-uint configs (ANS alphabets cap at 256 tokens;
+        // with LZ77, literal tokens must additionally stay below min_symbol).
+        let chosen = chooseClusterConfigs(
+            stats: clustered.stats, tokenLimit: lz77.map { $0.minSymbol } ?? 256,
+            lengthHists: clustered.lengthHists,
+            cost: ansClusterCost)
+        configs = chosen.configs
         // log_alpha_size is shared across clusters (read once by the decoder);
-        // it must cover the largest cluster's trimmed alphabet.
+        // it must cover the largest cluster's trimmed alphabet AND every
+        // cluster's config: split_exponent must stay ≤ log_alpha_size, and a
+        // config with msb/lsb bits requires split < log_alpha_size (fields
+        // are implied 0 when split == log_alpha_size).
         var maxAlphabet = 1
-        for h in clustered.histograms {
+        for h in chosen.hists {
             var last = 0
             for (s, c) in h.enumerated() where c > 0 { last = s }
             maxAlphabet = max(maxAlphabet, last + 1)
         }
-        let las = max(5, ceilLog2Nonzero(UInt32(maxAlphabet)))
+        var las = max(5, ceilLog2Nonzero(UInt32(maxAlphabet)))
+        for cfg in configs {
+            let need =
+                cfg.msbInToken == 0 && cfg.lsbInToken == 0
+                ? Int(cfg.splitExponent) : Int(cfg.splitExponent) + 1
+            las = max(las, need)
+        }
         logAlphaSize = las
-        codes = clustered.histograms.map { ANSClusterCode(histogram: $0, logAlphaSize: las) }
+        codes = chosen.hists.map { ANSClusterCode(histogram: $0, logAlphaSize: las) }
     }
 
     /// Writes the entropy header (mirrors `decodeHistograms`, ANS path).
     func writeHeader(_ w: BitWriter) {
-        w.writeBool(false)  // lz77 enabled
+        writeLZ77Params(w, lz77)
         if clustered.numContexts > 1 { clustered.writeContextMap(w) }
         w.writeBool(false)  // use_prefix_code = false: ANS
         w.write(UInt64(logAlphaSize - 5), 2)
-        for _ in codes {
-            // Hybrid-uint config per histogram: split_exponent=4 in
-            // ceil_log2(logAlphaSize+1) bits, msb=2 in 3 bits, lsb=0 in 2 bits.
-            w.write(4, ceilLog2Nonzero(UInt32(logAlphaSize + 1)))
-            w.write(2, 3)
-            w.write(0, 2)
+        for cfg in configs {
+            writeUintConfig(w, cfg, logAlphaSize: logAlphaSize)
         }
         for code in codes { writeANSHistogram(w, counts: code.counts) }
     }
@@ -230,10 +247,10 @@ struct ANSEntropyEncoder {
     func encodeStream(_ w: BitWriter, _ tokens: [EncToken]) {
         let n = tokens.count
         let numClusters = codes.count
-        // Flattened tables: counts and slot bases strided 128 per cluster
-        // (hybrid-uint tokens stay < 128), slots 4096 per cluster (each
+        // Flattened tables: counts and slot bases strided 256 per cluster
+        // (ANS alphabets cap at 256 tokens), slots 4096 per cluster (each
         // (symbol, offset) pair owns one table slot).
-        let tabStride = 128
+        let tabStride = 256
         let countsFlat = UnsafeMutablePointer<UInt32>.allocate(capacity: numClusters * tabStride)
         let baseFlat = UnsafeMutablePointer<UInt32>.allocate(capacity: numClusters * tabStride)
         let slotsFlat = UnsafeMutablePointer<UInt16>.allocate(capacity: numClusters * ansTabSize)
@@ -277,9 +294,20 @@ struct ANSEntropyEncoder {
         tokens.withUnsafeBufferPointer { buf in
             for i in 0..<n {
                 let t = buf[i]
-                let (token, nbits, bits) = encUintConfig.encode(t.value)
+                let c = ctxMap[Int(t.ctx & ~kEncLZLengthFlag)]
+                let token: UInt32
+                let nbits: UInt32
+                let bits: UInt32
+                if t.ctx & kEncLZLengthFlag != 0 {
+                    let e = lz77!.lengthConfig.encode(t.value)
+                    token = e.token + UInt32(lz77!.minSymbol)
+                    nbits = e.nbits
+                    bits = e.bits
+                } else {
+                    (token, nbits, bits) = configs[Int(c)].encode(t.value)
+                }
                 symbols[i] = token
-                cluster[i] = ctxMap[Int(t.ctx)]
+                cluster[i] = c
                 exNBits[i] = nbits
                 exBits[i] = bits
                 chunk[i] = UInt32.max

@@ -80,18 +80,26 @@ enum ModularEncoder {
             image, backend: backend, effort: effort, allowPalette: true, squeeze: false)
         if candidate.usedPalette {
             // Palette-eligible images (≤256 colors) are cheap to encode; the
-            // RCT + multiplier path occasionally wins on small ones, so take
-            // the actual smaller file rather than trusting the heuristic.
+            // RCT + multiplier path occasionally wins on small ones, and the
+            // better palette ordering depends on the content (correlated
+            // shades favor the NN chain, unrelated colors the lexicographic
+            // sort) — so race the actual encodings and keep the smallest.
+            var best = candidate.bytes
+            let nn = try encodeLossless(
+                image, backend: backend, effort: effort, allowPalette: true, squeeze: false,
+                paletteOrder: .nnChain)
+            if nn.bytes.count < best.count { best = nn.bytes }
             let direct = try encodeLossless(
                 image, backend: backend, effort: effort, allowPalette: false, squeeze: false)
-            if direct.bytes.count < candidate.bytes.count { return direct.bytes }
+            if direct.bytes.count < best.count { best = direct.bytes }
+            return best
         }
         return candidate.bytes
     }
 
     private static func encodeLossless(
         _ image: JXLDecodedImage, backend: EntropyBackend, effort: Int, allowPalette: Bool,
-        squeeze: Bool
+        squeeze: Bool, paletteOrder: PaletteOrder = .lexicographic
     ) throws -> (bytes: [UInt8], usedPalette: Bool) {
         let gray = image.colorChannels == 1
         guard image.colorChannels == 1 || image.colorChannels == 3 else {
@@ -200,7 +208,8 @@ enum ModularEncoder {
             let (palette, index, nbColors) = detectPalette(
                 planes: image.planes, colorChannels: image.colorChannels,
                 width: image.width, height: image.height,
-                worthIt: image.colorChannels > 1 || image.bitsPerSample > 8)
+                worthIt: image.colorChannels > 1 || image.bitsPerSample > 8,
+                order: paletteOrder)
         {
             channels.append(EncChannel(plane: palette, w: nbColors, h: image.colorChannels))
             channels.append(EncChannel(plane: index, w: image.width, h: image.height))
@@ -367,7 +376,7 @@ enum ModularEncoder {
 
         // ---- Tokenization (parallel across streams; each plan writes its
         // own slot).
-        func buildStreams(_ t: [MATreeNode]) -> [[EncToken]] {
+        func buildStreams(_ t: [MATreeNode], usesLZ77: Bool = false) -> [[EncToken]] {
             var result = [[EncToken]?](repeating: nil, count: plans.count)
             result.withUnsafeMutableBufferPointer { out in
                 nonisolated(unsafe) let outP = out
@@ -382,7 +391,8 @@ enum ModularEncoder {
                             into: &tokens, plane: UnsafeBufferPointer(bufs[p.buf]),
                             width: widths[p.buf],
                             x0: p.x0, y0: p.y0, gw: p.gw, gh: p.gh,
-                            chan: p.chan, streamID: plansL[s].streamID, tree: treeL)
+                            chan: p.chan, streamID: plansL[s].streamID, tree: treeL,
+                            usesLZ77: usesLZ77)
                     }
                     outP[s] = tokens
                 }
@@ -404,96 +414,187 @@ enum ModularEncoder {
             }
         }
 
-        // ---- Header + sections.
-        let w = BitWriter()
-        HeaderWriter.writeCodestreamHeaders(
-            w, width: UInt32(image.width), height: UInt32(image.height),
-            bitsPerSample: UInt32(image.bitsPerSample), grayscale: gray,
-            exponentBits: image.isFloat ? 8 : 0, alphaChannels: image.extraChannels)
-        writeFrameHeader(w, numExtraChannels: image.extraChannels)
-
-        let residual = makeEncoder(
-            backend, numContexts: treeNumLeaves(tree), streams: streams)
-
-        let s0 = BitWriter()
-        writeLfGlobalModular(s0, tree: tree, residual: residual, transforms: transforms)
-        // The decoder creates the global stream's symbol reader only when at
-        // least one channel decodes globally (numChans > 0 in modularDecode);
-        // an empty global plan must write NO stream data (an ANS state there
-        // would be unread waste).
-        if !plans[0].parts.isEmpty {
-            residual.encodeStream(s0, streams[0])
+        // ---- LZ77 trial (effort 2): when the token-value stream looks
+        // repetitive (graphics, screenshots, palette indexes, runs), match
+        // it greedily against each section's window and race the full LZ77
+        // encoding against the literal one. Photographic content fails the
+        // cheap gate and pays only a sampled hash pass.
+        var lzStreams: [[EncToken]]? = nil
+        var lzParams: EncLZ77? = nil
+        if effort >= 2, lz77WorthTrying(streams: streams, numContexts: treeNumLeaves(tree)) {
+            // The decoder's wpClamp fast track is disabled under LZ77; when
+            // any part's kernel selection would change, retokenize with the
+            // LZ77-aware selection so encode/decode arithmetic stays aligned
+            // (divisibility is re-checked; failure skips the trial).
+            var base: [[EncToken]]? = streams
+            let kernelChanges = plans.contains { plan in
+                plan.parts.contains { p in
+                    channelFastTrack(
+                        tree: tree, chan: p.chan, groupID: plan.streamID,
+                        usesLZ77: false, width: p.gw)
+                        != channelFastTrack(
+                            tree: tree, chan: p.chan, groupID: plan.streamID,
+                            usesLZ77: true, width: p.gw)
+                }
+            }
+            if kernelChanges {
+                base = divideByLeafMultipliers(
+                    tree, streams: buildStreams(tree, usesLZ77: true))
+            }
+            if let base {
+                let numLeaves = treeNumLeaves(tree)
+                let distCtx = UInt32(numLeaves)
+                let avg = lz77AvgBitsPerContext(numContexts: numLeaves, streams: base)
+                var results = [(out: [EncToken], lengthValues: [UInt32], matchedTokens: Int)?](
+                    repeating: nil, count: plans.count)
+                results.withUnsafeMutableBufferPointer { out in
+                    nonisolated(unsafe) let outP = out
+                    nonisolated(unsafe) let plansL = plans
+                    nonisolated(unsafe) let baseL = base
+                    nonisolated(unsafe) let avgL = avg
+                    DispatchQueue.concurrentPerform(iterations: plansL.count) { s in
+                        // The decoder's special-distance multiplier for a
+                        // section is the widest channel it decodes.
+                        let mult = plansL[s].parts.reduce(0) { max($0, $1.gw) }
+                        outP[s] = lz77MatchStream(
+                            baseL[s], distanceMultiplier: mult, avgBits: avgL,
+                            minLength: 3, distCtx: distCtx)
+                    }
+                }
+                var matchedTotal = 0
+                var allLengths: [UInt32] = []
+                var outStreams: [[EncToken]] = []
+                for r in results {
+                    let r = r!
+                    matchedTotal += r.matchedTokens
+                    allLengths.append(contentsOf: r.lengthValues)
+                    outStreams.append(r.out)
+                }
+                if matchedTotal >= 64 {
+                    lzStreams = outStreams
+                    lzParams = EncLZ77(
+                        minSymbol: 224, minLength: 3,
+                        lengthConfig: chooseLengthConfig(allLengths))
+                }
+            }
         }
 
-        if coalesced {
-            let section = s0.finalize()
+        // ---- Header + sections (assembled per entropy variant; the LZ77
+        // race keeps whichever full bitstream is smaller).
+        func assemble(_ residual: any TokenEntropyEncoder, _ streamsF: [[EncToken]]) -> [UInt8] {
+            let w = BitWriter()
+            HeaderWriter.writeCodestreamHeaders(
+                w, width: UInt32(image.width), height: UInt32(image.height),
+                bitsPerSample: UInt32(image.bitsPerSample), grayscale: gray,
+                exponentBits: image.isFloat ? 8 : 0, alphaChannels: image.extraChannels)
+            writeFrameHeader(w, numExtraChannels: image.extraChannels)
+
+            let s0 = BitWriter()
+            writeLfGlobalModular(s0, tree: tree, residual: residual, transforms: transforms)
+            // The decoder creates the global stream's symbol reader only when
+            // at least one channel decodes globally (numChans > 0 in
+            // modularDecode); an empty global plan must write NO stream data
+            // (an ANS state there would be unread waste).
+            if !plans[0].parts.isEmpty {
+                residual.encodeStream(s0, streamsF[0])
+            }
+
+            if coalesced {
+                let section = s0.finalize()
+                w.writeBool(false)  // TOC: no permutation
+                w.alignToByte()
+                writeTocSize(w, section.count)
+                w.alignToByte()
+                w.append(bytes: section)
+                return w.finalize()
+            }
+
+            var sections: [[UInt8]?] = [s0.finalize()]
+            // DC-group sections carry only squeeze channels with min shift
+            // >= 3 (streamID = 1 + numDCGroups + dcg, tile = groupDim*8).
+            // Each non-empty one is a full modular sub-stream with its own
+            // GroupHeader, like an AC group; when no channel intersects, the
+            // decoder never opens the section and it must stay zero bytes.
+            for dcg in 0..<dim.numDCGroups {
+                if squeeze, !plans[1 + dcg].parts.isEmpty {
+                    let s = BitWriter()
+                    s.writeBool(true)  // use_global_tree
+                    s.writeBool(true)  // wp_header: all_default
+                    s.write(0, 2)  // nb_transforms = 0
+                    residual.encodeStream(s, streamsF[1 + dcg])
+                    sections.append(s.finalize())
+                } else {
+                    sections.append([])
+                }
+            }
+            sections.append([])  // HfGlobal
+            let groupBase = sections.count
+            // AC plans follow the global (+ DC, in squeeze mode) plans.
+            let acBase = squeeze ? 1 + dim.numDCGroups : 1
+            sections.append(contentsOf: [[UInt8]?](repeating: nil, count: dim.numGroups))
+            sections.withUnsafeMutableBufferPointer { out in
+                nonisolated(unsafe) let outP = out
+                nonisolated(unsafe) let res = residual
+                nonisolated(unsafe) let streamsL = streamsF
+                nonisolated(unsafe) let plansL = plans
+                DispatchQueue.concurrentPerform(iterations: dim.numGroups) { g in
+                    // A group none of whose channels intersect writes nothing
+                    // — decodeModularGroupImage returns before reading a bit.
+                    if plansL[acBase + g].parts.isEmpty {
+                        outP[groupBase + g] = []
+                        return
+                    }
+                    let s = BitWriter()
+                    s.writeBool(true)  // use_global_tree
+                    s.writeBool(true)  // wp_header: all_default
+                    s.write(0, 2)  // nb_transforms = 0
+                    res.encodeStream(s, streamsL[acBase + g])
+                    outP[groupBase + g] = s.finalize()
+                }
+            }
+
             w.writeBool(false)  // TOC: no permutation
             w.alignToByte()
-            writeTocSize(w, section.count)
+            for section in sections { writeTocSize(w, section!.count) }
             w.alignToByte()
-            w.append(bytes: section)
-            return (w.finalize(), paletteApplied)
+            for section in sections { w.append(bytes: section!) }
+            return w.finalize()
         }
 
-        var sections: [[UInt8]?] = [s0.finalize()]
-        // DC-group sections carry only squeeze channels with min shift >= 3
-        // (streamID = 1 + numDCGroups + dcg, tile = groupDim*8). Each
-        // non-empty one is a full modular sub-stream with its own
-        // GroupHeader, like an AC group; when no channel intersects, the
-        // decoder never opens the section and it must stay zero bytes.
-        for dcg in 0..<dim.numDCGroups {
-            if squeeze, !plans[1 + dcg].parts.isEmpty {
-                let s = BitWriter()
-                s.writeBool(true)  // use_global_tree
-                s.writeBool(true)  // wp_header: all_default
-                s.write(0, 2)  // nb_transforms = 0
-                residual.encodeStream(s, streams[1 + dcg])
-                sections.append(s.finalize())
-            } else {
-                sections.append([])
-            }
+        var bytes = assemble(
+            makeEncoder(backend, numContexts: treeNumLeaves(tree), streams: streams),
+            streams)
+        if let lzS = lzStreams, let lzP = lzParams {
+            let lzBytes = assemble(
+                makeEncoder(
+                    backend, numContexts: treeNumLeaves(tree) + 1, streams: lzS,
+                    lz77: lzP),
+                lzS)
+            if lzBytes.count < bytes.count { bytes = lzBytes }
         }
-        sections.append([])  // HfGlobal
-        let groupBase = sections.count
-        // AC plans follow the global (+ DC, in squeeze mode) plans.
-        let acBase = squeeze ? 1 + dim.numDCGroups : 1
-        sections.append(contentsOf: [[UInt8]?](repeating: nil, count: dim.numGroups))
-        sections.withUnsafeMutableBufferPointer { out in
-            nonisolated(unsafe) let outP = out
-            nonisolated(unsafe) let res = residual
-            nonisolated(unsafe) let streamsL = streams
-            nonisolated(unsafe) let plansL = plans
-            DispatchQueue.concurrentPerform(iterations: dim.numGroups) { g in
-                // A group none of whose channels intersect writes nothing —
-                // decodeModularGroupImage returns before reading a bit.
-                if plansL[acBase + g].parts.isEmpty {
-                    outP[groupBase + g] = []
-                    return
-                }
-                let s = BitWriter()
-                s.writeBool(true)  // use_global_tree
-                s.writeBool(true)  // wp_header: all_default
-                s.write(0, 2)  // nb_transforms = 0
-                res.encodeStream(s, streamsL[acBase + g])
-                outP[groupBase + g] = s.finalize()
-            }
-        }
-
-        w.writeBool(false)  // TOC: no permutation
-        w.alignToByte()
-        for section in sections { writeTocSize(w, section!.count) }
-        w.alignToByte()
-        for section in sections { w.append(bytes: section!) }
-        return (w.finalize(), paletteApplied)
+        return (bytes, paletteApplied)
     }
 
     private static func makeEncoder(
-        _ backend: EntropyBackend, numContexts: Int, streams: [[EncToken]]
+        _ backend: EntropyBackend, numContexts: Int, streams: [[EncToken]],
+        lz77: EncLZ77? = nil
     ) -> any TokenEntropyEncoder {
         switch backend {
-        case .prefix: return PrefixEntropyEncoder(numContexts: numContexts, streams: streams)
-        case .ans: return ANSEntropyEncoder(numContexts: numContexts, streams: streams)
+        case .prefix:
+            return PrefixEntropyEncoder(numContexts: numContexts, streams: streams, lz77: lz77)
+        case .ans:
+            return ANSEntropyEncoder(numContexts: numContexts, streams: streams, lz77: lz77)
         }
+    }
+
+    /// Palette entry ordering. Lexicographic wins on unrelated colors;
+    /// the nearest-neighbor chain wins when the palette holds correlated
+    /// shades (antialiased text, quantized ramps) — the index residuals
+    /// shrink because adjacent shades get adjacent indices. The public entry
+    /// races both (palette images are cheap to encode).
+    enum PaletteOrder {
+        case lexicographic
+        case nnChain
     }
 
     /// Detects a global palette: at most 256 distinct colors across the color
@@ -503,7 +604,8 @@ enum ModularEncoder {
     /// appears. `worthIt` gates cases where an index stream cannot beat the
     /// samples themselves (single-channel 8-bit).
     private static func detectPalette(
-        planes: [[Int32]], colorChannels: Int, width: Int, height: Int, worthIt: Bool
+        planes: [[Int32]], colorChannels: Int, width: Int, height: Int, worthIt: Bool,
+        order: PaletteOrder
     ) -> (palette: [Int32], index: [Int32], nbColors: Int)? {
         guard worthIt else { return nil }
         let n = width * height
@@ -521,12 +623,38 @@ enum ModularEncoder {
         }
         let nbColors = seen.count
         guard nbColors * 2 <= n else { return nil }
-        // Lexicographic order (any order decodes; sorted compresses the
-        // palette channel itself well).
-        let colors = seen.sorted { a, b in
+        // Any order decodes; ordering only steers compression.
+        var colors = seen.sorted { a, b in
             if a.x != b.x { return a.x < b.x }
             if a.y != b.y { return a.y < b.y }
             return a.z < b.z
+        }
+        if order == .nnChain {
+            // Greedy nearest-neighbor chain: start from the lexicographically
+            // smallest color, repeatedly append the unused color closest in
+            // L1 RGB distance (deterministic: strict-less wins, so the first
+            // in sorted order is kept on ties).
+            var chained: [SIMD4<Int32>] = []
+            chained.reserveCapacity(nbColors)
+            var remaining = colors
+            var cur = remaining.removeFirst()
+            chained.append(cur)
+            while !remaining.isEmpty {
+                var bestI = 0
+                var bestD = Int.max
+                for (i, c) in remaining.enumerated() {
+                    let d =
+                        abs(Int(c.x) - Int(cur.x)) + abs(Int(c.y) - Int(cur.y))
+                        + abs(Int(c.z) - Int(cur.z))
+                    if d < bestD {
+                        bestD = d
+                        bestI = i
+                    }
+                }
+                cur = remaining.remove(at: bestI)
+                chained.append(cur)
+            }
+            colors = chained
         }
         var lookup = [SIMD4<Int32>: Int32]()
         lookup.reserveCapacity(nbColors)

@@ -29,7 +29,11 @@ private let kNumProps = 16
 private let kMaxLeaves = 48
 private let kMinLeafSamples = 256
 /// Bits a split must save to be worth its serialization + histogram overhead.
+/// Reference split-gain threshold at the full 400k-sample training budget;
+/// learnTree scales it with the actual training-set size (subsampled sets see
+/// proportionally smaller absolute gains), floored at 64 bits.
 private let kSplitGainBits = 250.0
+private let kTrainingSampleTarget = 400_000
 
 // MARK: - Training sample collection
 
@@ -302,7 +306,7 @@ private func bucketizeSplitChunk(
 /// O(nb²) inner loop).
 private func sweepSplitProperty(
     prop: Int, sampleCount: Int, numPred: Int,
-    totalHist: UnsafePointer<UInt32>, baseCost: Double,
+    totalHist: UnsafePointer<UInt32>, baseCost: Double, gainThreshold: Double,
     nb: Int, numChunks: Int, scratch: SplitScratch
 ) -> (gain: Double, split: Int32, found: Bool) {
     let gridSize = (kMaxBoundaries + 1) * numPred * kNumTokenBins
@@ -321,7 +325,7 @@ private func sweepSplitProperty(
     let rightHist = scratch.rightHist
     leftHist.update(repeating: 0, count: histSize)
     var nLeft = 0
-    var bestGain = kSplitGainBits
+    var bestGain = gainThreshold
     var bestSplit: Int32 = 0
     var found = false
     for j in stride(from: nb - 1, through: 0, by: -1) {
@@ -357,18 +361,20 @@ private func sweepSplitProperty(
 private func evaluateSplitProperty(
     prop: Int, samples: UnsafePointer<Int32>, sampleCount: Int,
     propRow: UnsafePointer<Int32>, toks: UnsafePointer<UInt8>, numPred: Int,
-    totalHist: UnsafePointer<UInt32>, baseCost: Double, scratch: SplitScratch
+    totalHist: UnsafePointer<UInt32>, baseCost: Double, gainThreshold: Double,
+    scratch: SplitScratch
 ) -> (gain: Double, split: Int32, found: Bool) {
     let nb = splitBoundaries(
         prop: prop, samples: samples, sampleCount: sampleCount, propRow: propRow,
         scratch: scratch)
-    if nb == 0 { return (kSplitGainBits, 0, false) }
+    if nb == 0 { return (gainThreshold, 0, false) }
     bucketizeSplitChunk(
         prop: prop, samples: samples, from: 0, to: sampleCount, propRow: propRow,
         toks: toks, numPred: numPred, nb: nb, scratch: scratch, chunk: 0)
     return sweepSplitProperty(
         prop: prop, sampleCount: sampleCount, numPred: numPred, totalHist: totalHist,
-        baseCost: baseCost, nb: nb, numChunks: 1, scratch: scratch)
+        baseCost: baseCost, gainThreshold: gainThreshold, nb: nb, numChunks: 1,
+        scratch: scratch)
 }
 
 /// Learns a tree over the training set. Returns the tree in the DECODER'S
@@ -378,6 +384,8 @@ private func evaluateSplitProperty(
 func learnTree(_ training: TreeTrainingSet) -> [MATreeNode] {
     let root = BuildNode()
     let numPred = kCandidatePredictors.count
+    let gainThreshold = max(
+        64.0, kSplitGainBits * Double(training.count) / Double(kTrainingSampleTarget))
     if training.count >= kMinLeafSamples * 2 {
         var leaves = 1
         training.props.withUnsafeBufferPointer { propsBuf in
@@ -486,7 +494,7 @@ func learnTree(_ training: TreeTrainingSet) -> [MATreeNode] {
                     let (baseCost, bestPred) = leafCost(samples)
                     node.predictor = bestPred
                     if depth >= 10 || leaves >= kMaxLeaves
-                        || samples.count < 2 * kMinLeafSamples || baseCost < kSplitGainBits
+                        || samples.count < 2 * kMinLeafSamples || baseCost < gainThreshold
                     {
                         return
                     }
@@ -539,12 +547,13 @@ func learnTree(_ training: TreeTrainingSet) -> [MATreeNode] {
                             }
                             DispatchQueue.concurrentPerform(iterations: numProps) { i in
                                 if nbsP[i] == 0 {
-                                    resultsP[i] = (kSplitGainBits, 0, false)
+                                    resultsP[i] = (gainThreshold, 0, false)
                                     return
                                 }
                                 resultsP[i] = sweepSplitProperty(
                                     prop: candP[i], sampleCount: sampleCount, numPred: numPred,
                                     totalHist: totalP, baseCost: baseCost,
+                                    gainThreshold: gainThreshold,
                                     nb: nbsP[i], numChunks: numChunks, scratch: scrP[i])
                             }
                         } else if sampleCount >= 4096 {
@@ -565,7 +574,8 @@ func learnTree(_ training: TreeTrainingSet) -> [MATreeNode] {
                                     prop: candP[i], samples: sampP, sampleCount: sampleCount,
                                     propRow: propsTP + candP[i] * n, toks: toksP,
                                     numPred: numPred,
-                                    totalHist: totalP, baseCost: baseCost, scratch: scrP[i])
+                                    totalHist: totalP, baseCost: baseCost,
+                                    gainThreshold: gainThreshold, scratch: scrP[i])
                             }
                         } else {
                             for i in 0..<numProps {
@@ -575,12 +585,12 @@ func learnTree(_ training: TreeTrainingSet) -> [MATreeNode] {
                                     propRow: propsT + candProps[i] * n, toks: toks,
                                     numPred: numPred,
                                     totalHist: nodeHist, baseCost: baseCost,
-                                    scratch: scratchPtr[i])
+                                    gainThreshold: gainThreshold, scratch: scratchPtr[i])
                             }
                         }
                     }
 
-                    var bestGain = kSplitGainBits
+                    var bestGain = gainThreshold
                     var bestProp = -1
                     var bestSplit: Int32 = 0
                     for i in 0..<numProps {
@@ -768,7 +778,7 @@ private let kEncPropRangeFast: Int64 = 512 << 4  // 8192
 func tokenizeChannelWithTree(
     into tokens: inout [EncToken],
     plane px: UnsafeBufferPointer<Int32>, width: Int, x0: Int, y0: Int, gw: Int, gh: Int,
-    chan: Int, streamID: Int, tree: [MATreeNode]
+    chan: Int, streamID: Int, tree: [MATreeNode], usesLZ77: Bool = false
 ) {
     // Output slots are extended once and filled through a raw pointer — the
     // per-pixel `append` paid growth checks and exclusivity per token.
@@ -808,7 +818,7 @@ func tokenizeChannelWithTree(
         return
     }
     let fastTrack = channelFastTrack(
-        tree: tree, chan: chan, groupID: streamID, usesLZ77: false, width: gw)
+        tree: tree, chan: chan, groupID: streamID, usesLZ77: usesLZ77, width: gw)
     // WP runs only when the tree can observe it — the decoder's
     // TreeToLookupTable use_wp gate; running it otherwise would be wasted
     // work AND props[15] must stay 0 to match.

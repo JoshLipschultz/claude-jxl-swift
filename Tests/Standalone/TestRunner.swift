@@ -511,8 +511,8 @@ struct TestRunner {
                 bitsPerSample: bits, isFloat: false, planes: planes)
         }
         let goldens: [(w: Int, h: Int, ch: Int, bits: Int, mode: Int, size: Int)] = [
-            (96, 64, 3, 8, 0, 180), (96, 64, 3, 8, 1, 15739), (256, 256, 3, 8, 1, 92685),
-            (300, 200, 3, 8, 1, 187529), (512, 512, 1, 16, 2, 74), (100, 600, 1, 8, 0, 455),
+            (96, 64, 3, 8, 0, 172), (96, 64, 3, 8, 1, 14907), (256, 256, 3, 8, 1, 87761),
+            (300, 200, 3, 8, 1, 187054), (512, 512, 1, 16, 2, 73), (100, 600, 1, 8, 0, 384),
         ]
         for g in goldens {
             let img = makeImage(w: g.w, h: g.h, channels: g.ch, bits: g.bits, mode: g.mode)
@@ -550,9 +550,9 @@ struct TestRunner {
                 Int32(bitPattern: UInt32(truncatingIfNeeded: rnd()) & 0xFF7F_FFFF)
             }])
         let e3Goldens: [(name: String, img: JXLDecodedImage, size: Int)] = [
-            ("96x64 RGB+alpha gradient", alphaImg, 178),
-            ("64x64 float32 RGB smooth", floatImg, 35951),
-            ("48x32 float32 gray noise", floatNoiseImg, 6260),
+            ("96x64 RGB+alpha gradient", alphaImg, 169),
+            ("64x64 float32 RGB smooth", floatImg, 9684),
+            ("48x32 float32 gray noise", floatNoiseImg, 6196),
         ]
         for g in e3Goldens {
             let size = (try? JXL.encodeLossless(image: g.img).count) ?? -1
@@ -709,8 +709,8 @@ struct TestRunner {
         state = 0xA5A5_5A5A_1234_4321
         let noiseImg = makeImage(w: 96, h: 64, channels: 3, extra: 0, bits: 8, mode: 1)
         let gradSq = (try? JXL.encodeLossless(image: gradImg, squeeze: true)) ?? []
-        eq(gradSq.count, 3668, "squeeze size golden 100x600 gradient")
-        eq((try? JXL.encodeLossless(image: noiseImg, squeeze: true))?.count ?? -1, 18341,
+        eq(gradSq.count, 1661, "squeeze size golden 100x600 gradient")
+        eq((try? JXL.encodeLossless(image: noiseImg, squeeze: true))?.count ?? -1, 18161,
             "squeeze size golden 96x64 noise")
         eq((try? JXL.encodeLossless(image: gradImg, squeeze: true)) ?? [], gradSq,
             "squeeze encode deterministic")
