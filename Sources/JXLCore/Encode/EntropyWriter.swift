@@ -326,25 +326,71 @@ private func clusterMerged(_ a: [Int], _ b: [Int]) -> [Int] {
     return m
 }
 
+/// Hybrid-uint (4,2,0) tokens for any UInt32 stay < 128.
+private let kAccumBins = 128
+
 private func accumulatePerContext(numContexts: Int, streams: [[EncToken]]) -> [[Int]] {
+    // Flat 128-bin grids accumulated per stream in parallel, then merged in
+    // stream order. Counts are integer sums, so any accumulation grouping
+    // produces the same totals as the sequential walk; the final arrays are
+    // rebuilt with the exact lengths the sequential append-growth produced
+    // (max token seen + 1, min 1 — contexts with no tokens stay [0]).
+    let gridSize = numContexts * kAccumBins
+    let nStreams = streams.count
     var perCtx = [[Int]](repeating: [0], count: numContexts)
-    for stream in streams {
-        for t in stream {
-            let (token, _, _) = encUintConfig.encode(t.value)
-            let c = Int(t.ctx)
-            if Int(token) >= perCtx[c].count {
-                perCtx[c].append(
-                    contentsOf: repeatElement(0, count: Int(token) + 1 - perCtx[c].count))
+    if nStreams == 0 { return perCtx }
+    let grids = UnsafeMutablePointer<UInt32>.allocate(capacity: nStreams * gridSize)
+    grids.initialize(repeating: 0, count: nStreams * gridSize)
+    defer { grids.deallocate() }
+    do {
+        nonisolated(unsafe) let gridsP = grids
+        nonisolated(unsafe) let streamsL = streams
+        DispatchQueue.concurrentPerform(iterations: nStreams) { s in
+            let g = gridsP + s * gridSize
+            let stream = streamsL[s]
+            stream.withUnsafeBufferPointer { buf in
+                for t in buf {
+                    let (token, _, _) = encUintConfig.encode(t.value)
+                    g[Int(t.ctx) * kAccumBins + Int(token)] += 1
+                }
             }
-            perCtx[c][Int(token)] += 1
         }
+    }
+    // Merge into stream 0's grid (fixed order; integer adds).
+    for s in 1..<nStreams {
+        let src = grids + s * gridSize
+        for i in 0..<gridSize { grids[i] += src[i] }
+    }
+    for c in 0..<numContexts {
+        let g = grids + c * kAccumBins
+        var maxTok = -1
+        for t in 0..<kAccumBins where g[t] > 0 { maxTok = t }
+        if maxTok < 0 { continue }
+        var h = [Int](repeating: 0, count: maxTok + 1)
+        for t in 0...maxTok { h[t] = Int(g[t]) }
+        perCtx[c] = h
     }
     return perCtx
 }
 
+/// Merge cost of two clusters given their cached entropies. Identical doubles
+/// to the original inline recomputation: same merged contents, same
+/// left-associated `(Em − Ei) − Ej` expression.
+private func clusterPairCost(_ a: [Int], _ b: [Int], _ ea: Double, _ eb: Double) -> Double {
+    clusterEntropyBits(clusterMerged(a, b)) - ea - eb
+}
+
 // @_optimize(none): the Swift 6.4 beta optimizer's LoopInvariantCodeMotion
-// pass crashes (signal 5) on this function's pairwise merge loop at -O. The
-// loop is O(clusters² ≤ 48²) — optimization is irrelevant here.
+// pass crashes (signal 5) on this function's pairwise merge loop at -O. All
+// heavy math lives in the -O free functions above; with the pair costs cached
+// the driver's own work is O(clusters² ≤ 48²) double compares per merge —
+// optimization is irrelevant here.
+//
+// The cache is exact, not approximate: cluster entropies and pair costs are
+// pure functions of cluster contents, recomputed only when a cluster's
+// contents change, so every comparison sees the same doubles the original
+// recompute-everything loop saw, in the same (i asc, j asc, strict <) scan
+// order — index shifts from `remove(at:)` preserve relative pair order.
 @_optimize(none)
 private func greedyCluster(
     perCtx: [[Int]], numContexts: Int, maxClusters: Int
@@ -356,17 +402,24 @@ private func greedyCluster(
     // The serialized cost of an extra histogram (code description + uint
     // config); crude but only steers when gains are marginal anyway.
     let perHistogramOverhead = 60.0
+    var ent = [Double]()
+    for c in clusters { ent.append(clusterEntropyBits(c)) }
+    var cost = [[Double]]()
+    for i in 0..<clusters.count {
+        var row = [Double](repeating: 0, count: clusters.count)
+        for j in (i + 1)..<clusters.count {
+            row[j] = clusterPairCost(clusters[i], clusters[j], ent[i], ent[j])
+        }
+        cost.append(row)
+    }
     while clusters.count > 1 {
         var bestI = -1
         var bestJ = -1
         var bestCost = Double.infinity
         for i in 0..<clusters.count {
             for j in (i + 1)..<clusters.count {
-                let cost =
-                    clusterEntropyBits(clusterMerged(clusters[i], clusters[j]))
-                    - clusterEntropyBits(clusters[i]) - clusterEntropyBits(clusters[j])
-                if cost < bestCost {
-                    bestCost = cost
+                if cost[i][j] < bestCost {
+                    bestCost = cost[i][j]
                     bestI = i
                     bestJ = j
                 }
@@ -375,6 +428,15 @@ private func greedyCluster(
         if clusters.count <= maxClusters && bestCost > perHistogramOverhead { break }
         clusters[bestI] = clusterMerged(clusters[bestI], clusters[bestJ])
         clusters.remove(at: bestJ)
+        ent[bestI] = clusterEntropyBits(clusters[bestI])
+        ent.remove(at: bestJ)
+        cost.remove(at: bestJ)
+        for i in 0..<cost.count { cost[i].remove(at: bestJ) }
+        for k in 0..<clusters.count where k != bestI {
+            let lo = min(k, bestI)
+            let hi = max(k, bestI)
+            cost[lo][hi] = clusterPairCost(clusters[lo], clusters[hi], ent[lo], ent[hi])
+        }
         for c in 0..<numContexts {
             if map[c] == bestJ { map[c] = bestI }
             if map[c] > bestJ { map[c] -= 1 }

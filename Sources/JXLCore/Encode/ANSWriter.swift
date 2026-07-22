@@ -222,38 +222,90 @@ struct ANSEntropyEncoder {
     /// state and renorm-chunk schedule, then the forward serialization the
     /// decoder consumes (32-bit state, then per value: its renorm chunk if the
     /// decoder pulls one there, then its raw extra bits).
+    ///
+    /// Runs inside concurrentPerform workers (one per section), so the
+    /// per-token state is flat raw scratch and the cluster tables are
+    /// flattened up front — the old nested `codes[c].slots[sym][off]` walk
+    /// paid refcount traffic on shared array cachelines per token.
     func encodeStream(_ w: BitWriter, _ tokens: [EncToken]) {
         let n = tokens.count
-        var symbols = [UInt32](repeating: 0, count: n)
-        var cluster = [UInt8](repeating: 0, count: n)
-        var extraBits = [(UInt32, UInt32)](repeating: (0, 0), count: n)
-        for (i, t) in tokens.enumerated() {
-            let (token, nbits, bits) = encUintConfig.encode(t.value)
-            symbols[i] = token
-            cluster[i] = clustered.contextMap[Int(t.ctx)]
-            extraBits[i] = (nbits, bits)
+        let numClusters = codes.count
+        // Flattened tables: counts and slot bases strided 128 per cluster
+        // (hybrid-uint tokens stay < 128), slots 4096 per cluster (each
+        // (symbol, offset) pair owns one table slot).
+        let tabStride = 128
+        let countsFlat = UnsafeMutablePointer<UInt32>.allocate(capacity: numClusters * tabStride)
+        let baseFlat = UnsafeMutablePointer<UInt32>.allocate(capacity: numClusters * tabStride)
+        let slotsFlat = UnsafeMutablePointer<UInt16>.allocate(capacity: numClusters * ansTabSize)
+        let ctxMap = UnsafeMutablePointer<UInt8>.allocate(capacity: clustered.contextMap.count)
+        defer {
+            countsFlat.deallocate()
+            baseFlat.deallocate()
+            slotsFlat.deallocate()
+            ctxMap.deallocate()
         }
-        var chunk = [UInt16?](repeating: nil, count: n)
+        countsFlat.initialize(repeating: 0, count: numClusters * tabStride)
+        baseFlat.initialize(repeating: 0, count: numClusters * tabStride)
+        for (c, code) in codes.enumerated() {
+            var base: UInt32 = 0
+            for (sym, f) in code.counts.enumerated() {
+                countsFlat[c * tabStride + sym] = UInt32(f)
+                baseFlat[c * tabStride + sym] = base
+                let slots = code.slots[sym]
+                for (off, slot) in slots.enumerated() {
+                    slotsFlat[c * ansTabSize + Int(base) + off] = slot
+                }
+                base += UInt32(f)
+            }
+        }
+        for (i, m) in clustered.contextMap.enumerated() { ctxMap[i] = m }
+
+        // Per-token scratch: symbol, cluster, extra bits, renorm chunk
+        // (sentinel .max = none — chunk payloads are 16-bit).
+        let symbols = UnsafeMutablePointer<UInt32>.allocate(capacity: max(1, n))
+        let cluster = UnsafeMutablePointer<UInt8>.allocate(capacity: max(1, n))
+        let exNBits = UnsafeMutablePointer<UInt32>.allocate(capacity: max(1, n))
+        let exBits = UnsafeMutablePointer<UInt32>.allocate(capacity: max(1, n))
+        let chunk = UnsafeMutablePointer<UInt32>.allocate(capacity: max(1, n))
+        defer {
+            symbols.deallocate()
+            cluster.deallocate()
+            exNBits.deallocate()
+            exBits.deallocate()
+            chunk.deallocate()
+        }
+        tokens.withUnsafeBufferPointer { buf in
+            for i in 0..<n {
+                let t = buf[i]
+                let (token, nbits, bits) = encUintConfig.encode(t.value)
+                symbols[i] = token
+                cluster[i] = ctxMap[Int(t.ctx)]
+                exNBits[i] = nbits
+                exBits[i] = bits
+                chunk[i] = UInt32.max
+            }
+        }
         var state: UInt32 = ansSignature << 16
         var i = n - 1
         while i >= 0 {
-            let code = codes[Int(cluster[i])]
+            let c = Int(cluster[i])
             let sym = Int(symbols[i])
-            let f = UInt32(code.counts[sym])
+            let f = countsFlat[c * tabStride + sym]
             // 64-bit compare: f == 4096 (single-symbol code) makes f << 20
             // overflow UInt32; the emit threshold is then 2^32 = never.
             if UInt64(state) >= UInt64(f) << 20 {
-                chunk[i] = UInt16(truncatingIfNeeded: state)
+                chunk[i] = UInt32(UInt16(truncatingIfNeeded: state))
                 state >>= 16
             }
-            state =
-                ((state / f) << UInt32(ansLogTabSize)) | UInt32(code.slots[sym][Int(state % f)])
+            let slot = slotsFlat[c * ansTabSize + Int(baseFlat[c * tabStride + sym]) + Int(state % f)]
+            state = ((state / f) << UInt32(ansLogTabSize)) | UInt32(slot)
             i -= 1
         }
         w.write(UInt64(state), 32)
         for j in 0..<n {
-            if let c = chunk[j] { w.write(UInt64(c), 16) }
-            if extraBits[j].0 > 0 { w.write(UInt64(extraBits[j].1), Int(extraBits[j].0)) }
+            let c = chunk[j]
+            if c != UInt32.max { w.write(UInt64(c), 16) }
+            if exNBits[j] > 0 { w.write(UInt64(exBits[j]), Int(exNBits[j])) }
         }
     }
 }

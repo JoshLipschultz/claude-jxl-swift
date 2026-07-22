@@ -147,24 +147,228 @@ private func extraBitsForToken(_ t: Int) -> Double {
     t < 16 ? 0 : Double(2 + ((t - 16) >> 2))
 }
 
+/// Process-lifetime x*log2(x) table: entry c holds exactly
+/// `Double(c) * log2(Double(c))` — the same expression `entropyBits` would
+/// otherwise evaluate — so replacing the computation with a load is
+/// bit-identical. Raw pointer per the concurrentPerform rules (entropyBits
+/// runs inside the parallel property search).
+private let kXlogXSize = 1 << 16
+nonisolated(unsafe) private let kXlogX: UnsafePointer<Double> = {
+    let p = UnsafeMutablePointer<Double>.allocate(capacity: kXlogXSize)
+    p[0] = 0
+    for c in 1..<kXlogXSize { p[c] = Double(c) * log2(Double(c)) }
+    return UnsafePointer(p)
+}()
+
 /// True coded cost of a token histogram: Shannon entropy of the tokens PLUS
 /// the raw extra bits they carry. Entropy alone is blind to extra bits and
 /// mis-ranks predictors (e.g. Zero on a constant plane: entropy 0 but 11
 /// extra bits per pixel vs Gradient's genuinely free zero residual).
-private func entropyBits(_ hist: UnsafeMutablePointer<UInt32>, _ n: Int) -> Double {
+/// Accumulation order (bin-ascending, three separate accumulators) is the
+/// original sequential order — the table only replaces `c * log2(c)` with a
+/// precomputed copy of the identical double.
+private func entropyBits(_ hist: UnsafePointer<UInt32>, _ n: Int) -> Double {
     var total = 0.0
     var sum = 0.0
     var extra = 0.0
     for t in 0..<n {
-        let c = Double(hist[t])
-        if c > 0 {
+        let ci = Int(hist[t])
+        if ci > 0 {
+            let c = Double(ci)
             total += c
-            sum += c * log2(c)
+            sum += ci < kXlogXSize ? kXlogX[ci] : c * log2(c)
             extra += c * extraBitsForToken(t)
         }
     }
     if total == 0 { return 0 }
-    return total * log2(total) - sum + extra
+    let ti = Int(total)
+    let tlog = (ti < kXlogXSize && Double(ti) == total) ? kXlogX[ti] : total * log2(total)
+    return tlog - sum + extra
+}
+
+private let kMaxBoundaries = 24
+/// Quantile subsample bound: qStride = max(1, n/4096) keeps ceil(n/qStride)
+/// below 2*4096 for every n.
+private let kMaxQuantSamples = 2 * 4096
+
+/// Sample-chunk fanout for the bucketing pass on big nodes: per-chunk grids
+/// are folded in fixed chunk order, and counts are integer sums, so any
+/// chunking produces exactly the single-pass histograms.
+private let kSplitChunks = 8
+
+/// Per-property scratch for the split search — one instance per candidate
+/// property so the property evaluations can run concurrently. All raw
+/// allocations (nothing refcounted crosses into concurrentPerform).
+private struct SplitScratch {
+    let bucketHist: UnsafeMutablePointer<UInt32>  // kSplitChunks * (kMaxBoundaries+1) * numPred * bins
+    let bucketCount: UnsafeMutablePointer<Int>  // kSplitChunks * (kMaxBoundaries + 1)
+    let leftHist: UnsafeMutablePointer<UInt32>  // numPred * bins (running left)
+    let rightHist: UnsafeMutablePointer<UInt32>  // numPred * bins (total - left)
+    let quant: UnsafeMutablePointer<Int32>  // kMaxQuantSamples
+    let boundaries: UnsafeMutablePointer<Int32>  // kMaxBoundaries
+
+    init(numPred: Int) {
+        bucketHist = .allocate(
+            capacity: kSplitChunks * (kMaxBoundaries + 1) * numPred * kNumTokenBins)
+        bucketCount = .allocate(capacity: kSplitChunks * (kMaxBoundaries + 1))
+        leftHist = .allocate(capacity: numPred * kNumTokenBins)
+        rightHist = .allocate(capacity: numPred * kNumTokenBins)
+        quant = .allocate(capacity: kMaxQuantSamples)
+        boundaries = .allocate(capacity: kMaxBoundaries)
+    }
+
+    func deallocate() {
+        bucketHist.deallocate()
+        bucketCount.deallocate()
+        leftHist.deallocate()
+        rightHist.deallocate()
+        quant.deallocate()
+        boundaries.deallocate()
+    }
+}
+
+/// Phase A of one property's evaluation: quantile boundary selection into
+/// `scratch.boundaries`. Returns the boundary count (0 = nothing to split).
+/// `propRow` is the property-major row for this property (propsT + prop*n) —
+/// the transposed copy exists purely so these passes stream 4 bytes per
+/// sample instead of a 64-byte struct line; values are identical.
+private func splitBoundaries(
+    prop: Int, samples: UnsafePointer<Int32>, sampleCount: Int,
+    propRow: UnsafePointer<Int32>, scratch: SplitScratch
+) -> Int {
+    let qStride = max(1, sampleCount / 4096)
+    var quantCount = 0
+    var qi = 0
+    while qi < sampleCount {
+        scratch.quant[quantCount] = propRow[Int(samples[qi])]
+        quantCount += 1
+        qi += qStride
+    }
+    var quantBuf = UnsafeMutableBufferPointer(start: scratch.quant, count: quantCount)
+    quantBuf.sort()
+    var nb = 0
+    for q in 1..<(kMaxBoundaries + 1) {
+        let v = scratch.quant[quantCount * q / (kMaxBoundaries + 1)]
+        if v != scratch.quant[quantCount - 1] && (nb == 0 || v != scratch.boundaries[nb - 1]) {
+            scratch.boundaries[nb] = v
+            nb += 1
+        }
+    }
+    return nb
+}
+
+/// Phase B: buckets samples[from..<to] by binary search over the boundaries,
+/// accumulating per-bucket per-predictor token histograms + counts into the
+/// given chunk's region of the scratch (zeroed here first).
+/// Phase B: buckets samples[from..<to] by binary search over the boundaries,
+/// accumulating per-bucket per-predictor token histograms + counts into the
+/// given chunk's region of the scratch (zeroed here first).
+private func bucketizeSplitChunk(
+    prop: Int, samples: UnsafePointer<Int32>, from: Int, to: Int,
+    propRow: UnsafePointer<Int32>, toks: UnsafePointer<UInt8>,
+    numPred: Int, nb: Int, scratch: SplitScratch, chunk: Int
+) {
+    let boundaries = scratch.boundaries
+    let bucketHist = scratch.bucketHist + chunk * (kMaxBoundaries + 1) * numPred * kNumTokenBins
+    let bucketCount = scratch.bucketCount + chunk * (kMaxBoundaries + 1)
+    bucketHist.update(repeating: 0, count: (nb + 1) * numPred * kNumTokenBins)
+    bucketCount.update(repeating: 0, count: nb + 1)
+    for si in from..<to {
+        let s = samples[si]
+        let v = propRow[Int(s)]
+        var lo = 0
+        var hi = nb
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if boundaries[mid] < v { lo = mid + 1 } else { hi = mid }
+        }
+        bucketCount[lo] += 1
+        let dst = bucketHist + lo * numPred * kNumTokenBins
+        let base = Int(s) * numPred
+        for p in 0..<numPred {
+            dst[p * kNumTokenBins + Int(toks[base + p])] += 1
+        }
+    }
+}
+
+/// Phase C: folds chunk grids 1..<numChunks into chunk 0 (fixed order,
+/// integer adds — exact), then sweeps the boundaries high→low. The returned
+/// (gain, split) is selected exactly as the sequential search would within
+/// this property: j swept high→low, strictly-greater-than-best updates
+/// starting from kSplitGainBits.
+///
+/// The right-side histograms are node totals − running left (exact UInt32
+/// counts, so identical to the old per-boundary suffix rebuild, without the
+/// O(nb²) inner loop).
+private func sweepSplitProperty(
+    prop: Int, sampleCount: Int, numPred: Int,
+    totalHist: UnsafePointer<UInt32>, baseCost: Double,
+    nb: Int, numChunks: Int, scratch: SplitScratch
+) -> (gain: Double, split: Int32, found: Bool) {
+    let gridSize = (kMaxBoundaries + 1) * numPred * kNumTokenBins
+    let bucketHist = scratch.bucketHist
+    let bucketCount = scratch.bucketCount
+    for c in 1..<max(1, numChunks) {
+        let srcH = bucketHist + c * gridSize
+        for t in 0..<((nb + 1) * numPred * kNumTokenBins) { bucketHist[t] += srcH[t] }
+        let srcC = bucketCount + c * (kMaxBoundaries + 1)
+        for b in 0..<(nb + 1) { bucketCount[b] += srcC[b] }
+    }
+
+    // Sweep boundaries high→low: left(b_j) = buckets > j, right = total − left.
+    let histSize = numPred * kNumTokenBins
+    let leftHist = scratch.leftHist
+    let rightHist = scratch.rightHist
+    leftHist.update(repeating: 0, count: histSize)
+    var nLeft = 0
+    var bestGain = kSplitGainBits
+    var bestSplit: Int32 = 0
+    var found = false
+    for j in stride(from: nb - 1, through: 0, by: -1) {
+        // Fold bucket j+1 into the left accumulator.
+        let src = bucketHist + (j + 1) * numPred * kNumTokenBins
+        for t in 0..<histSize { leftHist[t] += src[t] }
+        nLeft += bucketCount[j + 1]
+        let nRight = sampleCount - nLeft
+        if nLeft < kMinLeafSamples || nRight < kMinLeafSamples { continue }
+        var leftBest = Double.infinity
+        var rightBest = Double.infinity
+        for p in 0..<numPred {
+            let lh = leftHist + p * kNumTokenBins
+            leftBest = min(leftBest, entropyBits(lh, kNumTokenBins))
+            let rh = rightHist + p * kNumTokenBins
+            let th = totalHist + p * kNumTokenBins
+            for t in 0..<kNumTokenBins { rh[t] = th[t] - lh[t] }
+            rightBest = min(rightBest, entropyBits(rh, kNumTokenBins))
+        }
+        let gain = baseCost - leftBest - rightBest
+        if gain > bestGain {
+            bestGain = gain
+            bestSplit = scratch.boundaries[j]
+            found = true
+        }
+    }
+    return (bestGain, bestSplit, found)
+}
+
+/// Single-chunk evaluation of one candidate property (phases A→B→C in
+/// sequence). Pure function of its inputs plus private scratch — safe to run
+/// concurrently across properties.
+private func evaluateSplitProperty(
+    prop: Int, samples: UnsafePointer<Int32>, sampleCount: Int,
+    propRow: UnsafePointer<Int32>, toks: UnsafePointer<UInt8>, numPred: Int,
+    totalHist: UnsafePointer<UInt32>, baseCost: Double, scratch: SplitScratch
+) -> (gain: Double, split: Int32, found: Bool) {
+    let nb = splitBoundaries(
+        prop: prop, samples: samples, sampleCount: sampleCount, propRow: propRow,
+        scratch: scratch)
+    if nb == 0 { return (kSplitGainBits, 0, false) }
+    bucketizeSplitChunk(
+        prop: prop, samples: samples, from: 0, to: sampleCount, propRow: propRow,
+        toks: toks, numPred: numPred, nb: nb, scratch: scratch, chunk: 0)
+    return sweepSplitProperty(
+        prop: prop, sampleCount: sampleCount, numPred: numPred, totalHist: totalHist,
+        baseCost: baseCost, nb: nb, numChunks: 1, scratch: scratch)
 }
 
 /// Learns a tree over the training set. Returns the tree in the DECODER'S
@@ -181,21 +385,89 @@ func learnTree(_ training: TreeTrainingSet) -> [MATreeNode] {
                 let props = propsBuf.baseAddress!
                 let toks = tokBuf.baseAddress!
 
-                // Scratch histograms.
+                // Property-major transpose of the training properties: the
+                // split search's per-property passes then stream 4 bytes per
+                // sample instead of one 64-byte sample record per read.
+                // Values are copies — every comparison sees identical Int32s.
+                let n = training.count
+                let propsT = UnsafeMutablePointer<Int32>.allocate(capacity: kNumProps * n)
+                defer { propsT.deallocate() }
+                do {
+                    nonisolated(unsafe) let src = props
+                    nonisolated(unsafe) let dst = propsT
+                    let chunks = min(16, max(1, n / 65536))
+                    DispatchQueue.concurrentPerform(iterations: chunks) { c in
+                        let from = n * c / chunks
+                        let to = n * (c + 1) / chunks
+                        for s in from..<to {
+                            let base = s * kNumProps
+                            for p in 0..<kNumProps { dst[p * n + s] = src[base + p] }
+                        }
+                    }
+                }
+
+                // Scratch: node-total histograms + one private block per
+                // candidate property (the property search runs concurrently;
+                // each worker touches only its own block).
                 let histSize = numPred * kNumTokenBins
                 let nodeHist = UnsafeMutablePointer<UInt32>.allocate(capacity: histSize)
-                let sideHist = UnsafeMutablePointer<UInt32>.allocate(capacity: histSize)
+                var scratches: [SplitScratch] = []
+                for _ in kCandidateProperties { scratches.append(SplitScratch(numPred: numPred)) }
                 defer {
                     nodeHist.deallocate()
-                    sideHist.deallocate()
+                    for s in scratches { s.deallocate() }
+                }
+                // Raw copies for the parallel workers (nothing refcounted
+                // crosses into concurrentPerform).
+                let candProps = UnsafeMutablePointer<Int>.allocate(
+                    capacity: kCandidateProperties.count)
+                let scratchPtr = UnsafeMutablePointer<SplitScratch>.allocate(
+                    capacity: scratches.count)
+                for (i, p) in kCandidateProperties.enumerated() { candProps[i] = p }
+                for (i, s) in scratches.enumerated() { scratchPtr[i] = s }
+                let results = UnsafeMutablePointer<(gain: Double, split: Int32, found: Bool)>
+                    .allocate(capacity: kCandidateProperties.count)
+                defer {
+                    candProps.deallocate()
+                    scratchPtr.deallocate()
+                    results.deallocate()
                 }
 
                 func leafCost(_ samples: [Int32]) -> (cost: Double, predictor: Int) {
                     nodeHist.update(repeating: 0, count: histSize)
-                    for s in samples {
-                        let base = Int(s) * numPred
-                        for p in 0..<numPred {
-                            nodeHist[p * kNumTokenBins + Int(toks[base + p])] += 1
+                    samples.withUnsafeBufferPointer { buf in
+                        let sampP = buf.baseAddress!
+                        let count = buf.count
+                        if count >= 65536 {
+                            // Chunk-parallel into per-chunk grids (borrowing
+                            // the per-property rightHist scratch — the sweeps
+                            // that also use it run strictly later), folded in
+                            // chunk order: exact integer sums.
+                            let numChunks = min(kSplitChunks, count / 32768)
+                            nonisolated(unsafe) let scrP = scratchPtr
+                            nonisolated(unsafe) let sp = sampP
+                            nonisolated(unsafe) let toksP = toks
+                            DispatchQueue.concurrentPerform(iterations: numChunks) { c in
+                                let g = scrP[c].rightHist
+                                g.update(repeating: 0, count: histSize)
+                                for si in (count * c / numChunks)..<(count * (c + 1) / numChunks) {
+                                    let base = Int(sp[si]) * numPred
+                                    for p in 0..<numPred {
+                                        g[p * kNumTokenBins + Int(toksP[base + p])] += 1
+                                    }
+                                }
+                            }
+                            for c in 0..<numChunks {
+                                let g = scratchPtr[c].rightHist
+                                for t in 0..<histSize { nodeHist[t] += g[t] }
+                            }
+                        } else {
+                            for si in 0..<count {
+                                let base = Int(sampP[si]) * numPred
+                                for p in 0..<numPred {
+                                    nodeHist[p * kNumTokenBins + Int(toks[base + p])] += 1
+                                }
+                            }
                         }
                     }
                     var best = Double.infinity
@@ -210,20 +482,6 @@ func learnTree(_ training: TreeTrainingSet) -> [MATreeNode] {
                     return (best, bestP)
                 }
 
-                // Bucketed split search: per property, ONE pass buckets every
-                // sample by quantile boundary (binary search), accumulating
-                // per-bucket per-predictor token histograms; suffix sums then
-                // evaluate every boundary. Left = prop > boundary (decoder
-                // branch rule).
-                let kMaxBoundaries = 24
-                let bucketHist = UnsafeMutablePointer<UInt32>.allocate(
-                    capacity: (kMaxBoundaries + 1) * numPred * kNumTokenBins)
-                let bucketCount = UnsafeMutablePointer<Int>.allocate(capacity: kMaxBoundaries + 1)
-                defer {
-                    bucketHist.deallocate()
-                    bucketCount.deallocate()
-                }
-
                 func split(_ node: BuildNode, _ samples: [Int32], depth: Int) {
                     let (baseCost, bestPred) = leafCost(samples)
                     node.predictor = bestPred
@@ -232,85 +490,105 @@ func learnTree(_ training: TreeTrainingSet) -> [MATreeNode] {
                     {
                         return
                     }
+                    // leafCost left the node-total histograms in nodeHist —
+                    // the sweep's right side is total − left.
+
+                    let numProps = kCandidateProperties.count
+                    samples.withUnsafeBufferPointer { samplesBuf in
+                        let samplesP = samplesBuf.baseAddress!
+                        let sampleCount = samplesBuf.count
+                        if sampleCount >= 65536 {
+                            // Big nodes, three phases so the expensive
+                            // bucketing pass fans out over properties AND
+                            // sample chunks (per-chunk grids folded in fixed
+                            // order — exact integer sums). Results land in
+                            // fixed slots; the reduce below runs in
+                            // kCandidateProperties order — the same winner
+                            // and tie-breaks as the sequential loop.
+                            nonisolated(unsafe) let resultsP = results
+                            nonisolated(unsafe) let candP = candProps
+                            nonisolated(unsafe) let scrP = scratchPtr
+                            nonisolated(unsafe) let propsTP = propsT
+                            nonisolated(unsafe) let toksP = toks
+                            nonisolated(unsafe) let totalP = nodeHist
+                            nonisolated(unsafe) let sampP = samplesP
+                            // Grid-zeroing costs ~179KB per (property, chunk):
+                            // keep chunks big enough that it stays noise.
+                            let numChunks = min(kSplitChunks, max(1, sampleCount / 32768))
+                            let nbs = UnsafeMutablePointer<Int>.allocate(capacity: numProps)
+                            defer { nbs.deallocate() }
+                            nonisolated(unsafe) let nbsP = nbs
+                            DispatchQueue.concurrentPerform(iterations: numProps) { i in
+                                nbsP[i] = splitBoundaries(
+                                    prop: candP[i], samples: sampP, sampleCount: sampleCount,
+                                    propRow: propsTP + candP[i] * n, scratch: scrP[i])
+                            }
+                            DispatchQueue.concurrentPerform(
+                                iterations: numProps * numChunks
+                            ) { k in
+                                let i = k / numChunks
+                                let c = k % numChunks
+                                if nbsP[i] == 0 { return }
+                                bucketizeSplitChunk(
+                                    prop: candP[i], samples: sampP,
+                                    from: sampleCount * c / numChunks,
+                                    to: sampleCount * (c + 1) / numChunks,
+                                    propRow: propsTP + candP[i] * n, toks: toksP,
+                                    numPred: numPred,
+                                    nb: nbsP[i], scratch: scrP[i], chunk: c)
+                            }
+                            DispatchQueue.concurrentPerform(iterations: numProps) { i in
+                                if nbsP[i] == 0 {
+                                    resultsP[i] = (kSplitGainBits, 0, false)
+                                    return
+                                }
+                                resultsP[i] = sweepSplitProperty(
+                                    prop: candP[i], sampleCount: sampleCount, numPred: numPred,
+                                    totalHist: totalP, baseCost: baseCost,
+                                    nb: nbsP[i], numChunks: numChunks, scratch: scrP[i])
+                            }
+                        } else if sampleCount >= 4096 {
+                            // Parallel across properties: each evaluation is
+                            // independent (private scratch), results land in
+                            // fixed slots, and the reduce below runs in
+                            // kCandidateProperties order — the same winner and
+                            // tie-breaks as the sequential loop.
+                            nonisolated(unsafe) let resultsP = results
+                            nonisolated(unsafe) let candP = candProps
+                            nonisolated(unsafe) let scrP = scratchPtr
+                            nonisolated(unsafe) let propsTP = propsT
+                            nonisolated(unsafe) let toksP = toks
+                            nonisolated(unsafe) let totalP = nodeHist
+                            nonisolated(unsafe) let sampP = samplesP
+                            DispatchQueue.concurrentPerform(iterations: numProps) { i in
+                                resultsP[i] = evaluateSplitProperty(
+                                    prop: candP[i], samples: sampP, sampleCount: sampleCount,
+                                    propRow: propsTP + candP[i] * n, toks: toksP,
+                                    numPred: numPred,
+                                    totalHist: totalP, baseCost: baseCost, scratch: scrP[i])
+                            }
+                        } else {
+                            for i in 0..<numProps {
+                                results[i] = evaluateSplitProperty(
+                                    prop: candProps[i], samples: samplesP,
+                                    sampleCount: sampleCount,
+                                    propRow: propsT + candProps[i] * n, toks: toks,
+                                    numPred: numPred,
+                                    totalHist: nodeHist, baseCost: baseCost,
+                                    scratch: scratchPtr[i])
+                            }
+                        }
+                    }
 
                     var bestGain = kSplitGainBits
                     var bestProp = -1
                     var bestSplit: Int32 = 0
-                    for prop in kCandidateProperties {
-                        // Boundary candidates: quantiles from a value subsample.
-                        var quantSample: [Int32] = []
-                        let qStride = max(1, samples.count / 4096)
-                        var qi = 0
-                        while qi < samples.count {
-                            quantSample.append(props[Int(samples[qi]) * kNumProps + prop])
-                            qi += qStride
-                        }
-                        quantSample.sort()
-                        var boundaries: [Int32] = []
-                        for q in 1..<(kMaxBoundaries + 1) {
-                            let v = quantSample[quantSample.count * q / (kMaxBoundaries + 1)]
-                            if v != quantSample[quantSample.count - 1]
-                                && (boundaries.isEmpty || v != boundaries.last!)
-                            {
-                                boundaries.append(v)
-                            }
-                        }
-                        if boundaries.isEmpty { continue }
-                        let nb = boundaries.count
-
-                        // Single pass: bucket(v) = #boundaries < v via binary
-                        // search; accumulate histograms + counts per bucket.
-                        bucketHist.update(repeating: 0, count: (nb + 1) * numPred * kNumTokenBins)
-                        bucketCount.update(repeating: 0, count: nb + 1)
-                        for s in samples {
-                            let v = props[Int(s) * kNumProps + prop]
-                            var lo = 0
-                            var hi = nb
-                            while lo < hi {
-                                let mid = (lo + hi) / 2
-                                if boundaries[mid] < v { lo = mid + 1 } else { hi = mid }
-                            }
-                            let bucket = lo
-                            bucketCount[bucket] += 1
-                            let dst = bucketHist + bucket * numPred * kNumTokenBins
-                            let base = Int(s) * numPred
-                            for p in 0..<numPred {
-                                dst[p * kNumTokenBins + Int(toks[base + p])] += 1
-                            }
-                        }
-
-                        // Sweep boundaries high→low: left(b_j) = buckets > j.
-                        nodeHist.update(repeating: 0, count: histSize)  // running left
-                        var nLeft = 0
-                        for j in stride(from: nb - 1, through: 0, by: -1) {
-                            // Fold bucket j+1 into the left accumulator.
-                            let src = bucketHist + (j + 1) * numPred * kNumTokenBins
-                            for t in 0..<histSize { nodeHist[t] += src[t] }
-                            nLeft += bucketCount[j + 1]
-                            let nRight = samples.count - nLeft
-                            if nLeft < kMinLeafSamples || nRight < kMinLeafSamples { continue }
-                            // Right histograms = node totals − left; node totals
-                            // live in the leafCost scratch? Recompute via
-                            // sideHist = total − left, built from bucket sums.
-                            var leftBest = Double.infinity
-                            var rightBest = Double.infinity
-                            for p in 0..<numPred {
-                                let lh = nodeHist + p * kNumTokenBins
-                                leftBest = min(leftBest, entropyBits(lh, kNumTokenBins))
-                                let rh = sideHist + p * kNumTokenBins
-                                for t in 0..<kNumTokenBins { rh[t] = 0 }
-                                for b in 0...j {
-                                    let bh = bucketHist + (b * numPred + p) * kNumTokenBins
-                                    for t in 0..<kNumTokenBins { rh[t] += bh[t] }
-                                }
-                                rightBest = min(rightBest, entropyBits(rh, kNumTokenBins))
-                            }
-                            let gain = baseCost - leftBest - rightBest
-                            if gain > bestGain {
-                                bestGain = gain
-                                bestProp = prop
-                                bestSplit = boundaries[j]
-                            }
+                    for i in 0..<numProps {
+                        let r = results[i]
+                        if r.found && r.gain > bestGain {
+                            bestGain = r.gain
+                            bestProp = kCandidateProperties[i]
+                            bestSplit = r.split
                         }
                     }
                     guard bestProp >= 0 else { return }
@@ -324,8 +602,11 @@ func learnTree(_ training: TreeTrainingSet) -> [MATreeNode] {
                     leaves += 1
                     var leftSamples: [Int32] = []
                     var rightSamples: [Int32] = []
+                    leftSamples.reserveCapacity(samples.count)
+                    rightSamples.reserveCapacity(samples.count)
+                    let bestRow = propsT + bestProp * n
                     for s in samples {
-                        if props[Int(s) * kNumProps + bestProp] > bestSplit {
+                        if bestRow[Int(s)] > bestSplit {
                             leftSamples.append(s)
                         } else {
                             rightSamples.append(s)
@@ -413,18 +694,31 @@ func treeNumLeaves(_ tree: [MATreeNode]) -> Int { (tree.count + 1) / 2 }
 func treeWithLeafMultipliers(
     _ tree: [MATreeNode], streams: [[EncToken]]
 ) -> [MATreeNode]? {
-    var gcds = [Int64](repeating: 0, count: treeNumLeaves(tree))
-    for stream in streams {
+    let numLeaves = treeNumLeaves(tree)
+    var gcds = [Int64](repeating: 0, count: numLeaves)
+    // Leaves whose gcd has reached 1 can never leave it (gcd(1, d) == 1), so
+    // they are skipped; once EVERY leaf is at 1 the whole scan is settled
+    // (the final guard below would return nil) and the remaining token walk
+    // is pure waste — typical photographic content settles within a few
+    // thousand tokens of an 18M-token stream set.
+    var active = numLeaves
+    outer: for stream in streams {
         for t in stream {
+            let c = Int(t.ctx)
+            let old = gcds[c]
+            if old == 1 { continue }
             var d = unpackSigned(t.value)
             if d < 0 { d = -d }
-            let c = Int(t.ctx)
-            var a = gcds[c]
+            var a = old
             var b = d
             while b != 0 {
                 (a, b) = (b, a % b)
             }
             gcds[c] = a
+            if a == 1 {
+                active -= 1
+                if active == 0 { break outer }
+            }
         }
     }
     // Multiplier fits the serialization guards for any g < 2^31; all-zero
@@ -476,6 +770,43 @@ func tokenizeChannelWithTree(
     plane px: UnsafeBufferPointer<Int32>, width: Int, x0: Int, y0: Int, gw: Int, gh: Int,
     chan: Int, streamID: Int, tree: [MATreeNode]
 ) {
+    // Output slots are extended once and filled through a raw pointer — the
+    // per-pixel `append` paid growth checks and exclusivity per token.
+    let start = tokens.count
+    tokens.append(
+        contentsOf: repeatElement(EncToken(ctx: 0, value: 0), count: gw * gh))
+    // Single-leaf shortcut (the whole of effort 1): no properties are ever
+    // read, so the props vector, its per-pixel arithmetic, and the tree walk
+    // all vanish — only the neighborhood, the leaf's predictor, and the pack
+    // remain, which is exactly what the general loop would compute for this
+    // tree. (A WP leaf still takes the general path for its state machine.)
+    if tree.count == 1 && tree[0].predictor != 6 {
+        let leaf = tree[0]
+        let pred = leaf.predictor
+        let off = Int(leaf.predictorOffset)
+        let ctx = UInt32(leaf.lchild)
+        tokens.withUnsafeMutableBufferPointer { outBuf in
+            var w = start
+            for y in 0..<gh {
+                let row = (y0 + y) * width + x0
+                let prev = row - width
+                for x in 0..<gw {
+                    let n = neighborhoodAt(
+                        px, row: row, prev: prev, width: width, x: x, y: y, gw: gw)
+                    let guess =
+                        off
+                        + predictOne(
+                            pred, left: n.left, top: n.top, toptop: n.toptop,
+                            topleft: n.topleft, topright: n.topright, leftleft: n.leftleft,
+                            toprightright: n.toprightright, wpPred: 0)
+                    let d = Int32(truncatingIfNeeded: Int(px[row + x]) - guess)
+                    outBuf[w] = EncToken(ctx: ctx, value: encPackSigned(Int(d)))
+                    w += 1
+                }
+            }
+        }
+        return
+    }
     let fastTrack = channelFastTrack(
         tree: tree, chan: chan, groupID: streamID, usesLZ77: false, width: gw)
     // WP runs only when the tree can observe it — the decoder's
@@ -485,12 +816,31 @@ func tokenizeChannelWithTree(
         node.property == -1 ? node.predictor == 6 : node.property == 15
     }
     let wpState = treeUsesWP ? WPState(header: WPHeader(), xsize: gw, ysize: gh) : nil
+    // Stores for properties the tree never reads are dead — the walk below is
+    // the only reader of props[2...14] (props[15] belongs to WP). props[9]
+    // must keep its per-pixel chain whenever 8 OR 9 is read: props[8] is
+    // W − previous-pixel-props[9].
+    var needProp = [Bool](repeating: false, count: kNumProps)
+    for node in tree where node.property >= 0 { needProp[node.property] = true }
+    let need3 = needProp[3]
+    let need4 = needProp[4]
+    let need5 = needProp[5]
+    let need6 = needProp[6]
+    let need7 = needProp[7]
+    let need8 = needProp[8]
+    let need9 = needProp[9] || needProp[8]
+    let need10 = needProp[10]
+    let need11 = needProp[11]
+    let need12 = needProp[12]
+    let need13 = needProp[13]
+    let need14 = needProp[14]
     let props = UnsafeMutablePointer<Int32>.allocate(capacity: kNumProps)
     defer { props.deallocate() }
     props.initialize(repeating: 0, count: kNumProps)
     props[0] = Int32(truncatingIfNeeded: chan)
     props[1] = Int32(truncatingIfNeeded: streamID)
-    do {
+    tokens.withUnsafeMutableBufferPointer { outBuf in
+        var w = start
         tree.withUnsafeBufferPointer { treeBuf in
             let treeP = treeBuf.baseAddress!
             for y in 0..<gh {
@@ -500,23 +850,25 @@ func tokenizeChannelWithTree(
                 let prev = row - width
                 for x in 0..<gw {
                     let n = neighborhoodAt(px, row: row, prev: prev, width: width, x: x, y: y, gw: gw)
-                    props[3] = Int32(truncatingIfNeeded: x)
-                    props[4] = Int32(truncatingIfNeeded: abs(n.top))
-                    props[5] = Int32(truncatingIfNeeded: abs(n.left))
-                    props[6] = Int32(truncatingIfNeeded: n.top)
-                    props[7] = Int32(truncatingIfNeeded: n.left)
-                    props[8] = Int32(truncatingIfNeeded: n.left) &- props[9]
-                    if fastTrack == .gradientClamp {
-                        let g = Int64(n.left) + Int64(n.top) - Int64(n.topleft)
-                        props[9] = Int32(min(max(g, -kEncPropRangeFast), kEncPropRangeFast - 1))
-                    } else {
-                        props[9] = Int32(truncatingIfNeeded: n.left + n.top - n.topleft)
+                    if need3 { props[3] = Int32(truncatingIfNeeded: x) }
+                    if need4 { props[4] = Int32(truncatingIfNeeded: abs(n.top)) }
+                    if need5 { props[5] = Int32(truncatingIfNeeded: abs(n.left)) }
+                    if need6 { props[6] = Int32(truncatingIfNeeded: n.top) }
+                    if need7 { props[7] = Int32(truncatingIfNeeded: n.left) }
+                    if need9 {
+                        if need8 { props[8] = Int32(truncatingIfNeeded: n.left) &- props[9] }
+                        if fastTrack == .gradientClamp {
+                            let g = Int64(n.left) + Int64(n.top) - Int64(n.topleft)
+                            props[9] = Int32(min(max(g, -kEncPropRangeFast), kEncPropRangeFast - 1))
+                        } else {
+                            props[9] = Int32(truncatingIfNeeded: n.left + n.top - n.topleft)
+                        }
                     }
-                    props[10] = Int32(truncatingIfNeeded: n.left - n.topleft)
-                    props[11] = Int32(truncatingIfNeeded: n.topleft - n.top)
-                    props[12] = Int32(truncatingIfNeeded: n.top - n.topright)
-                    props[13] = Int32(truncatingIfNeeded: n.top - n.toptop)
-                    props[14] = Int32(truncatingIfNeeded: n.left - n.leftleft)
+                    if need10 { props[10] = Int32(truncatingIfNeeded: n.left - n.topleft) }
+                    if need11 { props[11] = Int32(truncatingIfNeeded: n.topleft - n.top) }
+                    if need12 { props[12] = Int32(truncatingIfNeeded: n.top - n.topright) }
+                    if need13 { props[13] = Int32(truncatingIfNeeded: n.top - n.toptop) }
+                    if need14 { props[14] = Int32(truncatingIfNeeded: n.left - n.leftleft) }
 
                     var wpPred = wpState?.predict(
                         x: x, y: y, xsize: gw, N: n.top, W: n.left, NE: n.topright,
@@ -550,7 +902,8 @@ func tokenizeChannelWithTree(
                     // differences beyond ±2^31 where the untruncated pack
                     // breaks it (E3's find, ported to the tree tokenizer).
                     let d = Int32(truncatingIfNeeded: Int(px[row + x]) - guess)
-                    tokens.append(EncToken(ctx: UInt32(leaf.lchild), value: encPackSigned(Int(d))))
+                    outBuf[w] = EncToken(ctx: UInt32(leaf.lchild), value: encPackSigned(Int(d)))
+                    w += 1
                     wpState?.updateErrors(Int(px[row + x]), x: x, y: y, xsize: gw)
                 }
             }
