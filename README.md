@@ -13,7 +13,10 @@ weighted predictor, palette, YCoCg RCT, per-leaf multipliers, squeeze
 float32 + alpha, any dimensions, two effort levels — with every stream
 oracle-validated byte-exact against `djxl`, plus a seeded encoder-input
 fuzzer. On a 6-megapixel photo it beats `cjxl -e3` for size
-(10.05 vs 10.91 MB) at ~0.37 s to encode.
+(10.05 vs 10.91 MB) at ~0.37 s to encode. A baseline lossy encoder
+(XYB VarDCT, all-DCT8, uniform quantization — `jxl encode … q90`) produces
+streams that our decoder and `djxl` agree on to >99 dB; it aims for
+validity, not density competitiveness.
 
 > **Status: feature-complete for real-world files.** Both coding modes decode
 > end to end — **Modular** (lossless and lossy, byte-exact vs `djxl` including

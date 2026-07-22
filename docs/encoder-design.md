@@ -236,8 +236,13 @@ every milestone lands with djxl round-trip proof, never just self-consistency.
   side only. The encoder is now **feature-complete for lossless**; open
   threads: palette∘squeeze composition, squeeze auto-off heuristic, E5
   lossy decision (design §7).
-- **E5 (undecided) — baseline lossy**: XYB forward, fixed DCT8, uniform
-  quant, quality knob; explicitly "valid, not competitive."
+- **E5 — baseline lossy** (GO decision 2026-07-22, per §7's "decide with E4
+  numbers in hand": the modular machinery lossy needs — trees, entropy
+  writers, quantized-channel streams — is built and oracle-hardened, and
+  the complete VarDCT decode pipeline is the dual to write against; E5a in
+  progress): XYB forward, fixed DCT8, uniform quant, quality knob;
+  explicitly "valid, not competitive." Gates include a CROSS-ORACLE check:
+  our decoder and djxl must agree to high precision on the same lossy file.
 - **E6 (undecided) — jbrd**: JPEG recompression, byte-exact reconstruction.
 
 Each milestone = the full existing ritual: suite + fuzz + bench + size gate +
