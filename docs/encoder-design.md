@@ -221,10 +221,21 @@ every milestone lands with djxl round-trip proof, never just self-consistency.
   wall; e2 default = everything, 1.31 s), and parallel encoding
   (training/tokenization/section entropy across groups via concurrentPerform
   under the decoder's no-refcounts rules; channel planes copied once into
-  raw buffers). Remaining for feature-complete: **squeeze** (responsive
-  mode) — the last un-shipped lossless feature; speed follow-ups: learning
-  and histogram clustering are still serial, cjxl -e2 wall is ~0.06 s
-  (SIMD C++) vs our 1.31 s.
+  raw buffers). E4d (✅ 2026-07-22, two subagents in jj workspaces +
+  encoder-input fuzzing in main): **squeeze** (responsive mode; forward
+  transform derived as the exact invSqueeze inverse, layout produced by
+  executing the decoder's own metaSqueeze, DC-group streams; the 6MP photo
+  gets ~1% SMALLER with progressive decode as a bonus; float+squeeze
+  rejected — diff/2 is not congruence-preserving mod 2^32) and a
+  **byte-identical perf round**: 6MP e2 1.33 → 0.37 s wall (3.7×), e1
+  0.27 → 0.11 s, proven by a 60-encode SHA256 battery. The new
+  `Scripts/fuzz-encode.sh` (seeded random images → encode/decode bit-exact,
+  all efforts/backends/squeeze) found a latent channel-index bug on its
+  12th case: per-group streams number channels LOCALLY (decoder renumbers
+  from beginC) — palette's meta channel shifted property 0 on the encode
+  side only. The encoder is now **feature-complete for lossless**; open
+  threads: palette∘squeeze composition, squeeze auto-off heuristic, E5
+  lossy decision (design §7).
 - **E5 (undecided) — baseline lossy**: XYB forward, fixed DCT8, uniform
   quant, quality knob; explicitly "valid, not competitive."
 - **E6 (undecided) — jbrd**: JPEG recompression, byte-exact reconstruction.

@@ -1,11 +1,19 @@
 # JXL — a pure-Swift JPEG XL codec
 
 A from-scratch implementation of a [JPEG XL](https://jpeg.org/jpegxl/)
-(ISO/IEC 18181) decoder — and a growing lossless encoder — in Swift: a
-dependency-free core library (`JXLCore`), a CoreGraphics bridge (`JXLKit`),
-a command-line tool (`jxl`), a macOS viewer app, and a Quick Look extension.
-libjxl is not linked — it serves only as the test oracle (`cjxl`/`djxl`
-compare runs).
+(ISO/IEC 18181) decoder — and a feature-complete lossless encoder — in
+Swift: a dependency-free core library (`JXLCore`), a CoreGraphics bridge
+(`JXLKit`), a command-line tool (`jxl`), a macOS viewer app, and a Quick
+Look extension. libjxl is not linked — it serves only as the test oracle
+(`cjxl`/`djxl` compare runs).
+
+The encoder covers lossless Modular end to end — learned MA trees, the
+weighted predictor, palette, YCoCg RCT, per-leaf multipliers, squeeze
+(responsive/progressive), rANS and prefix back-ends, 8/16-bit integer +
+float32 + alpha, any dimensions, two effort levels — with every stream
+oracle-validated byte-exact against `djxl`, plus a seeded encoder-input
+fuzzer. On a 6-megapixel photo it beats `cjxl -e3` for size
+(10.05 vs 10.91 MB) at ~0.37 s to encode.
 
 > **Status: feature-complete for real-world files.** Both coding modes decode
 > end to end — **Modular** (lossless and lossy, byte-exact vs `djxl` including
@@ -43,6 +51,8 @@ $ jxl decode image.jxl out.ppm dither   # blue-noise dither 8-bit output
                                         #   (`nospot` = don't render spot colors)
 $ jxl tojpeg recon.jxl out.jpg          # byte-exact JPEG reconstruction
 $ jxl icc image.jxl out.icc             # extract the embedded ICC profile
+$ jxl encode in.ppm out.jxl             # lossless encode (PGM/PPM/PAM/PFM)
+$ jxl encode in.ppm out.jxl e1          # ... fast effort; "responsive" = squeeze
 $ jxl bench image.jxl                   # decode benchmark
 ```
 
