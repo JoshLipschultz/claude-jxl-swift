@@ -100,6 +100,8 @@ struct TestRunner {
         progressiveDC()
         wideExtraChannels()
         ditherOutput()
+        lossyEncoderIdentities()
+        lossyEncoder()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -2818,6 +2820,259 @@ struct TestRunner {
             return ok
         }
         return false  // e.g. float fixtures — decoded but formula not checked here
+    }
+
+    // MARK: - Lossy (VarDCT) encoder — E5a
+
+    /// Gate 1 for the lossy encoder: the standalone numeric identities.
+    /// Forward DCT8 -> the decoder's own `scaledIDCT` must be the identity
+    /// (float tolerance), and forward XYB -> the decoder's own
+    /// `ConvertState.linear` must recover the linear RGB input.
+    static func lossyEncoderIdentities() {
+        // Forward DCT8 -> decoder inverse == identity on random blocks.
+        var seed: UInt64 = 0x9E3779B97F4A7C15
+        func rnd() -> Double {
+            seed = seed &* 6364136223846793005 &+ 1442695040888963407
+            return Double(seed >> 11) / Double(UInt64(1) << 53)
+        }
+        var worstDCT: Float = 0
+        for _ in 0..<50 {
+            var pix = [Float](repeating: 0, count: 64)
+            for i in 0..<64 { pix[i] = Float(rnd() * 2 - 1) }
+            var coeffs = [Float](repeating: 0, count: 64)
+            pix.withUnsafeBufferPointer { p in
+                coeffs.withUnsafeMutableBufferPointer { o in
+                    forwardDCT8(pixels: p.baseAddress!, stride: 8, out: o.baseAddress!)
+                }
+            }
+            var back = [Float](repeating: 0, count: 64)
+            var tmp = [Float](repeating: 0, count: 64)
+            coeffs.withUnsafeMutableBufferPointer { c in
+                back.withUnsafeMutableBufferPointer { b in
+                    tmp.withUnsafeMutableBufferPointer { t in
+                        scaledIDCT(
+                            c.baseAddress!, h: 8, w: 8, pixels: b.baseAddress!, stride: 8,
+                            tmp: t.baseAddress!)
+                    }
+                }
+            }
+            for i in 0..<64 { worstDCT = max(worstDCT, abs(back[i] - pix[i])) }
+        }
+        check(worstDCT < 1e-5, "forward DCT8 -> scaledIDCT identity (max err \(worstDCT))")
+
+        // DC coefficient == block mean (the DC image's currency).
+        do {
+            var pix = [Float](repeating: 0, count: 64)
+            var mean: Float = 0
+            for i in 0..<64 {
+                pix[i] = Float(rnd())
+                mean += pix[i]
+            }
+            mean /= 64
+            var coeffs = [Float](repeating: 0, count: 64)
+            pix.withUnsafeBufferPointer { p in
+                coeffs.withUnsafeMutableBufferPointer { o in
+                    forwardDCT8(pixels: p.baseAddress!, stride: 8, out: o.baseAddress!)
+                }
+            }
+            check(abs(coeffs[0] - mean) < 1e-5, "DCT8 DC == block mean")
+        }
+
+        // Forward XYB -> decoder inverse-opsin == identity on random samples.
+        let opsin = ForwardOpsin()
+        let state = ConvertState(
+            OutputColorSpec(
+                matrix: nil, quantizer: srgb8Quantizer, transfer: .srgb,
+                hlgOOTF: nil, opsinScale: 1, customOpsin: nil))
+        var worstXYB: Float = 0
+        for _ in 0..<500 {
+            let r = rnd()
+            let g = rnd()
+            let b = rnd()
+            let v = opsin.xyb(r, g, b)
+            let (lr, lg, lb) = state.linear(Float(v.x), Float(v.y), Float(v.b))
+            worstXYB = max(worstXYB, abs(lr - Float(r)), abs(lg - Float(g)), abs(lb - Float(b)))
+        }
+        check(worstXYB < 1e-4, "forward XYB -> ConvertState.linear identity (max err \(worstXYB))")
+        FileHandle.standardError.write(
+            Data("  [lossy-identities] DCT8 + XYB forward transforms invert the decoder\n".utf8))
+    }
+
+    /// Peak signal-to-noise between two integer plane sets (same depth).
+    static func planePSNR(_ a: [[Int32]], _ b: [[Int32]], maxVal: Double) -> Double {
+        var se = 0.0
+        var n = 0
+        for c in 0..<min(a.count, b.count) {
+            for i in 0..<a[c].count {
+                let d = Double(a[c][i] - b[c][i])
+                se += d * d
+                n += 1
+            }
+        }
+        let mse = se / Double(n)
+        return mse == 0 ? 999 : 10 * log10(maxVal * maxVal / mse)
+    }
+
+    /// E5a round-trips: encode -> our decode with a PSNR bound (the quality
+    /// gate), a size golden for determinism, multi-DC-group / tiny / 16-bit /
+    /// grayscale shapes, and the documented rejections. The djxl + cross-
+    /// oracle validation of the same streams was run out-of-suite (report in
+    /// the E5a change description); these tests pin the encoder against this
+    /// repo's oracle-hardened decoder.
+    static func lossyEncoder() {
+        let dir = fixturesDir()
+
+        // Photo-like source: the committed 384x256_prog fixture decoded by
+        // our own (oracle-validated) decoder.
+        guard
+            let src = try? JXL.decodeImage(
+                from: Data(contentsOf: dir.appendingPathComponent("384x256_prog.jxl")))
+        else {
+            check(false, "decode lossy-encoder source fixture")
+            return
+        }
+        let srcImage = JXLDecodedImage(
+            width: src.width, height: src.height, colorChannels: 3, extraChannels: 0,
+            bitsPerSample: 8, isFloat: false,
+            planes: [src.planes[0], src.planes[1], src.planes[2]], iccProfile: nil)
+
+        // Default quality: decodes in this decoder, PSNR > 35 dB, and clearly
+        // smaller than lossless (the same content is ~137 KB with cjxl -d 0).
+        do {
+            let jxl = try JXL.encodeLossy(image: srcImage)
+            let dec = try JXL.decodeImage(from: jxl)
+            eq(dec.width, src.width, "lossy round-trip width")
+            eq(dec.height, src.height, "lossy round-trip height")
+            eq(dec.colorChannels, 3, "lossy round-trip channels")
+            let psnr = planePSNR(
+                Array(dec.planes[0..<3]), Array(srcImage.planes[0..<3]), maxVal: 255)
+            check(psnr > 35, "default-quality PSNR > 35 dB (got \(psnr))")
+            check(jxl.count < 60000, "default quality clearly smaller than lossless (\(jxl.count) B)")
+
+            // Determinism: byte-identical re-encode + a size golden. Any
+            // change here means the bitstream changed -> re-run the djxl
+            // cross-oracle sweep before updating the constant.
+            let again = try JXL.encodeLossy(image: srcImage)
+            check(again == jxl, "lossy encode deterministic")
+            eq(jxl.count, 36303, "lossy size golden (q90, 384x256_prog)")
+
+            // Lower quality: smaller file, lower PSNR, still decodable.
+            let q50 = try JXL.encodeLossy(image: srcImage, quality: 50)
+            check(q50.count < jxl.count / 2, "q50 much smaller than q90 (\(q50.count) B)")
+            let dec50 = try JXL.decodeImage(from: q50)
+            let psnr50 = planePSNR(
+                Array(dec50.planes[0..<3]), Array(srcImage.planes[0..<3]), maxVal: 255)
+            check(psnr50 > 25 && psnr50 < psnr, "q50 PSNR sane (got \(psnr50))")
+        } catch {
+            check(false, "lossy encode/decode: \(error)")
+        }
+
+        // Multi-DC-group shape (2100 px wide: 2 DC groups, 9 AC groups) on a
+        // smooth gradient; PSNR bound is generous — the gate is the frame
+        // plumbing (TOC layout, per-DC-group modular streams, per-group AC).
+        do {
+            let w = 2100
+            let h = 40
+            var r = [Int32](repeating: 0, count: w * h)
+            var g = r
+            var b = r
+            for y in 0..<h {
+                for x in 0..<w {
+                    r[y * w + x] = Int32(127.0 + 100.0 * sin(Double(x) * 0.01 + Double(y) * 0.05))
+                    g[y * w + x] = Int32(127.0 + 100.0 * sin(Double(x) * 0.007))
+                    b[y * w + x] = Int32(127.0 + 100.0 * cos(Double(y) * 0.1))
+                }
+            }
+            let img = JXLDecodedImage(
+                width: w, height: h, colorChannels: 3, extraChannels: 0, bitsPerSample: 8,
+                isFloat: false, planes: [r, g, b], iccProfile: nil)
+            let jxl = try JXL.encodeLossy(image: img)
+            let info = try JXL.readFrameInfo(from: Data(jxl))
+            check(!info.isModular, "2100x40 is a VarDCT frame")
+            eq(info.numGroups, 9, "2100x40 group count")
+            eq(info.numDCGroups, 2, "2100x40 DC group count")
+            let dec = try JXL.decodeImage(from: jxl)
+            eq(dec.width, w, "2100x40 width")
+            let psnr = planePSNR(Array(dec.planes[0..<3]), [r, g, b], maxVal: 255)
+            check(psnr > 34, "2100x40 gradient PSNR (got \(psnr))")
+        } catch {
+            check(false, "multi-DC-group lossy encode: \(error)")
+        }
+
+        // Tiny images (coalesced single-section frames).
+        for (w, h) in [(1, 1), (3, 5), (17, 1)] {
+            do {
+                let n = w * h
+                let planes = (0..<3).map { c in
+                    (0..<n).map { Int32(($0 * 41 + c * 97) & 255) }
+                }
+                let img = JXLDecodedImage(
+                    width: w, height: h, colorChannels: 3, extraChannels: 0, bitsPerSample: 8,
+                    isFloat: false, planes: planes, iccProfile: nil)
+                let dec = try JXL.decodeImage(from: try JXL.encodeLossy(image: img))
+                check(dec.width == w && dec.height == h, "\(w)x\(h) lossy dims")
+            } catch {
+                check(false, "\(w)x\(h) lossy encode: \(error)")
+            }
+        }
+
+        // 16-bit input round-trips at 16-bit output.
+        do {
+            let w = 96
+            let h = 64
+            var planes = [[Int32]](repeating: [Int32](repeating: 0, count: w * h), count: 3)
+            for y in 0..<h {
+                for x in 0..<w {
+                    planes[0][y * w + x] = Int32(32767.0 + 30000.0 * sin(Double(x) * 0.05))
+                    planes[1][y * w + x] = Int32(32767.0 + 30000.0 * sin(Double(x + y) * 0.03))
+                    planes[2][y * w + x] = Int32(32767.0 + 30000.0 * cos(Double(y) * 0.06))
+                }
+            }
+            let img = JXLDecodedImage(
+                width: w, height: h, colorChannels: 3, extraChannels: 0, bitsPerSample: 16,
+                isFloat: false, planes: planes, iccProfile: nil)
+            let jxl = try JXL.encodeLossy(image: img)
+            let dec = try JXL.decodeImage(from: jxl, format: .uint16)
+            eq(dec.bitsPerSample, 16, "16-bit lossy output depth")
+            let psnr = planePSNR(Array(dec.planes[0..<3]), planes, maxVal: 65535)
+            check(psnr > 33, "16-bit lossy PSNR (got \(psnr))")
+        } catch {
+            check(false, "16-bit lossy encode: \(error)")
+        }
+
+        // Grayscale input: replicated into RGB before the transform; every
+        // output channel approximates the gray plane.
+        do {
+            let w = 64
+            let h = 48
+            let gray = (0..<(w * h)).map { Int32((($0 % w) * 4) & 255) }
+            let img = JXLDecodedImage(
+                width: w, height: h, colorChannels: 1, extraChannels: 0, bitsPerSample: 8,
+                isFloat: false, planes: [gray], iccProfile: nil)
+            let dec = try JXL.decodeImage(from: try JXL.encodeLossy(image: img))
+            eq(dec.colorChannels, 3, "gray lossy decodes as RGB")
+            let psnr = planePSNR(Array(dec.planes[0..<3]), [gray, gray, gray], maxVal: 255)
+            check(psnr > 35, "gray lossy PSNR (got \(psnr))")
+        } catch {
+            check(false, "gray lossy encode: \(error)")
+        }
+
+        // Documented rejections: alpha and float inputs are E5a non-goals.
+        do {
+            let one = [Int32](repeating: 128, count: 16)
+            let withAlpha = JXLDecodedImage(
+                width: 4, height: 4, colorChannels: 3, extraChannels: 1, bitsPerSample: 8,
+                isFloat: false, planes: [one, one, one, one], iccProfile: nil)
+            check(
+                (try? JXL.encodeLossy(image: withAlpha)) == nil, "lossy rejects alpha")
+            let floatImg = JXLDecodedImage(
+                width: 4, height: 4, colorChannels: 3, extraChannels: 0, bitsPerSample: 32,
+                isFloat: true, planes: [one, one, one], iccProfile: nil)
+            check((try? JXL.encodeLossy(image: floatImg)) == nil, "lossy rejects float")
+        }
+
+        FileHandle.standardError.write(
+            Data("  [lossy-encoder] VarDCT E5a round-trips, goldens, shapes, rejections\n".utf8))
     }
 
     // MARK: - Container

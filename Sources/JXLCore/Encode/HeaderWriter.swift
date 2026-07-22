@@ -110,6 +110,44 @@ enum HeaderWriter {
         w.writeBool(true)  // all_default
     }
 
+    /// ImageMetadata for the lossy (VarDCT) path: integer samples,
+    /// `xyb_encoded = true`, sRGB color encoding, no extra channels. 8-bit is
+    /// exactly the bundle's all-default shape (one bit); other depths are
+    /// written explicitly — dual of `JXLImageMetadata.init(_:)`, whose
+    /// all-default branch sets `xybEncoded = true`.
+    static func writeImageMetadataXYB(_ w: BitWriter, bitsPerSample: UInt32) {
+        if bitsPerSample == 8 {
+            w.writeBool(true)  // all_default: 8-bit sRGB, xyb_encoded, no ECs
+            return
+        }
+        w.writeBool(false)  // all_default
+        w.writeBool(false)  // extra_fields (no orientation/preview/animation)
+        writeBitDepth(w, bitsPerSample: bitsPerSample, exponentBits: 0)
+        w.writeBool(true)  // modular_16bit_buffers (integer samples)
+        w.writeU32(
+            0, .value(0), .value(1), .bits(4, offset: 2),
+            .bits(12, offset: 1))  // num_extra_channels
+        w.writeBool(true)  // xyb_encoded
+        w.writeBool(true)  // ColorEncoding all_default = sRGB
+        // (no tone_mapping: only present when extra_fields)
+        w.writeU64(0)  // extensions
+    }
+
+    /// The complete pre-frame header block for a lossy (XYB VarDCT) bare
+    /// codestream: signature, size, xyb metadata, default transform data
+    /// (default opsin — the all-default branch skips the OpsinInverseMatrix
+    /// bundle entirely), byte alignment.
+    static func writeCodestreamHeadersXYB(
+        _ w: BitWriter, width: UInt32, height: UInt32, bitsPerSample: UInt32
+    ) {
+        w.write(0xFF, 8)
+        w.write(0x0A, 8)
+        writeSizeHeader(w, width: width, height: height)
+        writeImageMetadataXYB(w, bitsPerSample: bitsPerSample)
+        writeCustomTransformData(w)
+        w.alignToByte()
+    }
+
     /// The complete pre-frame header block of a bare codestream: signature,
     /// size, metadata, transform data, byte alignment (the decoder's
     /// `JumpToByteBoundary` before frames).
