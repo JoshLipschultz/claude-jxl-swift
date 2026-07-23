@@ -1,9 +1,9 @@
 // VarDCTEncoder.swift
 //
-// E5a: the baseline lossy VarDCT encoder — valid, not competitive. One
-// regular XYB VarDCT frame, all-DCT8 strategies, a uniform quant field,
-// default dequant tables / block context map / color correlation, loop
-// filters off, single pass, 4:4:4, no extra channels.
+// E5a/E5b: the baseline lossy VarDCT encoder — valid, not yet competitive.
+// One regular XYB VarDCT frame, all-DCT8 strategies, an ADAPTIVE per-block
+// quant field (E5b), default dequant tables / block context map / color
+// correlation, loop filters off, single pass, 4:4:4, no extra channels.
 //
 // The load-bearing rule: every field written here is the exact dual of a
 // decoder reader in this repo —
@@ -22,12 +22,15 @@
 //     coefficient, for AC and DC alike) and AdjustQuantBias,
 //   * color: ForwardXYB.swift inverts ConvertState.linear + the sRGB EOTF.
 //
-// Deliberate E5a shape choices:
+// Deliberate shape choices:
 //   * flags = 128 (kSkipAdaptiveDCSmoothing) so decoded DC equals what we
 //     quantized (both this decoder and djxl honor it),
 //   * a single-leaf gradient MA tree codes the DC image + AC metadata,
-//   * quality (1…100) maps to one uniform step scale via globalScale with a
-//     fixed quant field; see `quantParams`.
+//   * quality (1…100) maps to a baseline step scale via globalScale; the
+//     per-block AC quant field (E5b, `encAdaptiveQuant`) modulates AROUND
+//     that baseline from each block's own pre-quantization luma AC energy —
+//     DC dequant stays uniform (it doesn't read the quant field at all; see
+//     `computeDCDequant`, DCImage.swift).
 
 import Foundation
 
@@ -288,6 +291,56 @@ private struct ACEntropyCoder {
     }
 }
 
+// MARK: - Adaptive quantization (E5b)
+//
+// The bitstream carries an arbitrary per-block quant field (ACMetadata.swift:
+// `quantField[block] = 1 + clamp(coded, 0, 255)`), and only the AC dequant
+// step reads it (`Reconstruct.swift`: `scaledDequant = invGlobalScale /
+// quant`) — DC dequant and the default block-context map are both
+// quant-field-independent, confirmed by reading their decode paths. That
+// makes AC-only adaptive quantization a self-contained per-block choice: any
+// masking heuristic is spec-legal, so this one is ours, not libjxl's.
+//
+// Heuristic: RMS of the block's own pre-quantization luma AC coefficients
+// (already computed by the forward DCT, no extra pass over pixels) as a
+// proxy for local texture/edge energy; busy blocks (high RMS) get a LOWER
+// quant value (coarser AC step — quant field co-varies inversely with step
+// size, so "lower quant" means "less precision") than flat ones, spending
+// the saved bits where the coarsening is cheapest.
+//
+// COARSEN-ONLY BY MEASUREMENT, NOT ASSUMPTION: the textbook move is also to
+// push flat blocks ABOVE baseline (finer, to suppress banding) — kAqMaxMul
+// > 1. Measured on a real-photo fixture and the mixed gradient/edge/noise
+// bench image (quality/size, both quant-field-only, DC untouched): any
+// maxMul > 1 (even the mild 1.05–1.15 range) blew up the bench image's size
+// by 10–70%+ for well under 1 dB of PSNR gain — large smooth/gradient
+// regions there were already near-exact under the baseline step, so
+// resolving their now-tiny residual to a finer grid turns huge numbers of
+// previously-all-zero AC blocks nonzero for almost no distortion payoff.
+// Capping at kAqMaxMul == 1.0 (never finer than baseline — only ever
+// coarsen) was Pareto-better on the photo fixture (+1.53 dB PSNR AND -5.1%
+// size vs. uniform) and a clean win on the bench image (-6.3% size for
+// -0.10 dB, i.e. effectively free) — the actual RD-optimal point across both
+// fixtures, not the intuitive one. `kAqActivitySigma` sets how quickly
+// activity saturates toward `kAqMinMul`; tuned on the same sweep.
+private let kAqMinMul: Float = 0.55
+private let kAqMaxMul: Float = 1.0
+private let kAqActivitySigma: Float = 0.008
+
+/// Adaptive per-block quant value from the block's pre-quantization Y AC
+/// coefficients (`cY[1..<64]`), scaled around `baseQuant`, clamped to the
+/// bitstream's valid range [1, 256].
+@inline(__always)
+private func encAdaptiveQuant(_ cY: [Float], baseQuant: Int32) -> Int32 {
+    var sumSq: Float = 0
+    for k in 1..<64 { sumSq += cY[k] * cY[k] }
+    let activity = (sumSq / 63).squareRoot()
+    let adj = 1 / (1 + activity / kAqActivitySigma)  // 1 (flat) .. ~0 (busy)
+    let mul = kAqMinMul + (kAqMaxMul - kAqMinMul) * adj
+    let q = (Float(baseQuant) * mul).rounded()
+    return Int32(min(256, max(1, q)))
+}
+
 // MARK: - Encoder
 
 enum VarDCTEncoder {
@@ -425,18 +478,14 @@ enum VarDCTEncoder {
 
         // AC multipliers per storage index (Reconstruct.swift dequant chain
         // with the default table, xQmScale = bQmScale = 2 => DmMul == 1,
-        // default CfL: ytox 0, ytob base 1).
+        // default CfL: ytox 0, ytob base 1). `scaledDequant` varies per block
+        // now (E5b adaptive quant field), so `table`/`invGlobalScale` are the
+        // only parts still hoisted out of the block loop.
         let invGlobalScale = Float(1 << 16) / Float(params.globalScale)
-        let scaledDequant = invGlobalScale / Float(params.quantField)
         let table = defaultDequantTable(.dct)  // [X 64, Y 64, B 64]
         var xMul = [Float](repeating: 0, count: 64)
         var yMul = xMul
         var bMul = xMul
-        for k in 0..<64 {
-            xMul[k] = table[k] * scaledDequant
-            yMul[k] = table[64 + k] * scaledDequant
-            bMul[k] = table[128 + k] * scaledDequant
-        }
         let order = computeNaturalCoeffOrder(cbx: 1, cby: 1)  // CoeffOrder.swift
 
         // ---- Per-AC-group walk: forward DCT8, quantize (DC into the shared
@@ -444,6 +493,9 @@ enum VarDCTEncoder {
         var qDCX = [Int32](repeating: 0, count: bw * bh)
         var qDCY = qDCX
         var qDCB = qDCX
+        // Per-block adaptive quant field (E5b), full block grid; read back
+        // when building each DC group's AcMetadata stream.
+        var blockQuantField = [Int32](repeating: params.quantField, count: bw * bh)
         let bgDim = dim.groupDim >> 3  // group dimension in blocks (32)
         var acTokens: [[EncToken]] = []
         acTokens.reserveCapacity(dim.numGroups)
@@ -490,10 +542,22 @@ enum VarDCTEncoder {
                         }
                     }
 
+                    // Adaptive quant field for this block (E5b): from the
+                    // block's own pre-quantization Y AC energy, then this
+                    // block's AC multiplier tables from it.
+                    let dcPos = by * bw + bx
+                    let blockQuant = encAdaptiveQuant(cY, baseQuant: params.quantField)
+                    blockQuantField[dcPos] = blockQuant
+                    let scaledDequant = invGlobalScale / Float(blockQuant)
+                    for k in 0..<64 {
+                        xMul[k] = table[k] * scaledDequant
+                        yMul[k] = table[64 + k] * scaledDequant
+                        bMul[k] = table[128 + k] * scaledDequant
+                    }
+
                     // DC (storage[0], == block mean): DequantDC inverse. The
                     // decoder reconstructs B-DC as qY*facY*cfl + qB*facB, so
                     // B is quantized minus the reconstructed Y DC.
-                    let dcPos = by * bw + bx
                     let vY = Int32((cY[0] / facY).rounded())
                     let vX = Int32((cX[0] / facX).rounded())
                     let recDCY = Float(vY) * facY
@@ -591,7 +655,15 @@ enum VarDCTEncoder {
             let count = rw * rh
             let cmapZero = [Int32](repeating: 0, count: crW * crH)
             var acsQF = [Int32](repeating: 0, count: count * 2)
-            for i in 0..<count { acsQF[count + i] = params.quantField - 1 }
+            // Row-major (iy, ix) over the DC group's rect: with every block a
+            // DCT8 varblock, `num` in decodeAcMetadataGroup increments once
+            // per (iy, ix) in exactly this order, so index i == that num.
+            for i in 0..<count {
+                let iy = i / rw
+                let ix = i % rw
+                let bq = blockQuantField[(y0 + iy) * bw + (x0 + ix)]
+                acsQF[count + i] = bq - 1  // decoder: quant = 1 + clamp(coded, 0, 255)
+            }
             let epfZero = [Int32](repeating: 0, count: rw * rh)
             var mt: [EncToken] = []
             let metaStreamID = 1 + 2 * dim.numDCGroups + dcg
@@ -769,8 +841,9 @@ extension JXL {
     /// channels, no extra channels. `quality` 1…100 (default 90) maps to a
     /// uniform quantization step scale — see `VarDCTEncoder.quantParams`.
     /// The output decodes with this decoder and djxl; expect transparent
-    /// quality at the default, not competitive density (E5a baseline:
-    /// all-DCT8, uniform quant field, no adaptive quantization).
+    /// quality at the default (E5a+E5b baseline: all-DCT8, per-block
+    /// adaptive AC quantization from a local luma-energy heuristic — not yet
+    /// competitive density: no adaptive DCT strategies or CfL search).
     public static func encodeLossy(image: JXLDecodedImage, quality: Int = 90) throws -> [UInt8] {
         try VarDCTEncoder.encodeLossy(image, quality: quality)
     }
