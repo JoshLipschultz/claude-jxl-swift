@@ -2954,7 +2954,7 @@ struct TestRunner {
             // cross-oracle sweep before updating the constant.
             let again = try JXL.encodeLossy(image: srcImage)
             check(again == jxl, "lossy encode deterministic")
-            eq(jxl.count, 33313, "lossy size golden (q90, 384x256_prog)")
+            eq(jxl.count, 30847, "lossy size golden (q90, 384x256_prog)")
 
             // Lower quality: smaller file, lower PSNR, still decodable.
             let q50 = try JXL.encodeLossy(image: srcImage, quality: 50)

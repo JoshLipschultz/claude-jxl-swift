@@ -255,8 +255,21 @@ every milestone lands with djxl round-trip proof, never just self-consistency.
       decoder reads is untouched. Photo +0.46 dB AND −2.0% size; the 6 MP
       gradient/edge bench −7.1% size AND +6.5 dB (strong Y↔chroma
       correlation there). All cross-oracle ≥117 dB.
-    - Remaining lossy quality levers (E5d+): non-DCT8 AC strategies, an
-      RD-driven (rather than nonzero-count) quant search, alpha-with-lossy.
+    - **E5d** (2026-07-23): RD (rate-distortion) coefficient quantization —
+      per AC coefficient, minimize distortion + λ·rate over {naive, one step
+      toward zero, zero} instead of round-to-nearest. The scaled inverse DCT
+      is an isometry (per-coefficient pixel energy = 64 for all frequencies),
+      so pixel MSE ∝ coefficient-space SE and a single λ (scaled ∝ mul² for
+      quality-invariant drop behavior) suffices — no per-frequency weight.
+      Evaluated as an RD *curve* (not single points — dropping coefficients
+      trivially trades size for PSNR): λ₀=0.10 gives matched-size gains of
+      ~+0.4 dB at q90 on both the photo and the 6 MP bench, and a −24%
+      Pareto win (smaller AND higher PSNR) at q70 on the bench, while q90's
+      absolute PSNR barely moves (quality ladder preserved). Only changes
+      emitted coefficient values (all legal); no bitstream-structure change.
+    - Remaining lossy quality levers (E5e+): non-DCT8 AC strategies, real
+      trellis/joint RD across the block, Gaborish/EPF with encoder
+      compensation, alpha-with-lossy.
 - **E6 (undecided) — jbrd**: JPEG recompression, byte-exact reconstruction.
 
 Each milestone = the full existing ritual: suite + fuzz + bench + size gate +
