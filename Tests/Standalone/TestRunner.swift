@@ -89,6 +89,7 @@ struct TestRunner {
         nestedDCFrames()
         bitWriterRoundTrip()
         headerWriterRoundTrip()
+        rctForwardInverseIdentity()
         encoderRoundTrip()
         encoderSizeGate()
         squeezeEncoder()
@@ -328,6 +329,61 @@ struct TestRunner {
             Data("  [bitwriter] 10k-op write->read identity\n".utf8))
     }
 
+    /// The RCT search's load-bearing property: for EVERY one of the 42
+    /// reversible color transforms, `forwardRCT(type:)` must be the exact
+    /// inverse of the decoder's own `invRCT`. The encoder picks a type per
+    /// image, so a single wrong type would silently corrupt output for the
+    /// images that select it — and the round-trip suite only exercises the
+    /// types its fixtures happen to choose. This pins all 42 directly,
+    /// including the sign/wrap extremes where the >>1 arithmetic diverges.
+    static func rctForwardInverseIdentity() {
+        var state: UInt64 = 0x0BAD_F00D_1234_5678
+        func rnd() -> UInt64 {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            return state >> 16
+        }
+        let w = 7
+        let h = 5
+        var failures = 0
+        for type in 0..<42 {
+            for mode in 0..<4 {
+                // mode 0: 8-bit-ish; 1: full 16-bit; 2: integer extremes;
+                // 3: FULL Int32 range — mandatory, because float32 planes
+                // carry IEEE-754 bit patterns spanning all of Int32, and the
+                // RCT's `>> 1` steps only invert exactly when the forward
+                // shifts the same *stored* value the decoder shifts. A 64-bit
+                // forward that truncates only at the end passes modes 0-2 and
+                // silently corrupts float32 (12 of the 42 types — every
+                // mixing-5 and mixing-6 variant, YCoCg included).
+                var planes: [[Int32]] = (0..<3).map { c in
+                    (0..<(w * h)).map { i -> Int32 in
+                        switch mode {
+                        case 0: return Int32(rnd() % 256)
+                        case 1: return Int32(rnd() % 65536)
+                        case 2:
+                            let picks: [Int32] = [0, 65535, 32768, 1, 65534]
+                            return picks[Int(rnd() % 5) + 0] &+ Int32(c)
+                        default: return Int32(truncatingIfNeeded: Int64(rnd()))
+                        }
+                    }
+                }
+                let original = planes
+                forwardRCT(&planes, type: type)
+                // Feed the forward result through the DECODER's inverse.
+                let image = ModularImage(w: w, h: h, bitdepth: 16, channelCount: 3)
+                for c in 0..<3 { image.channels[c].pixels = planes[c] }
+                invRCT(image, beginC: 0, rctType: type)
+                for c in 0..<3 where image.channels[c].pixels != original[c] {
+                    check(false, "RCT type \(type) mode \(mode) channel \(c) not identity")
+                    failures += 1
+                }
+            }
+        }
+        eq(failures, 0, "forwardRCT is invRCT's exact inverse (42 types x 4 content modes)")
+        FileHandle.standardError.write(
+            Data("  [rct-search] all 42 RCT types round-trip forward->inverse\n".utf8))
+    }
+
     /// E1: encode → decode must reproduce the input planes byte-exactly, for
     /// a spread of shapes and contents (gradients, LCG noise, constants,
     /// extremes; gray and RGB; 8- and 16-bit; 1×1 up to the full 256×256
@@ -513,7 +569,7 @@ struct TestRunner {
         }
         let goldens: [(w: Int, h: Int, ch: Int, bits: Int, mode: Int, size: Int)] = [
             (96, 64, 3, 8, 0, 172), (96, 64, 3, 8, 1, 14907), (256, 256, 3, 8, 1, 87761),
-            (300, 200, 3, 8, 1, 187054), (512, 512, 1, 16, 2, 73), (100, 600, 1, 8, 0, 384),
+            (300, 200, 3, 8, 1, 186235), (512, 512, 1, 16, 2, 73), (100, 600, 1, 8, 0, 384),
         ]
         for g in goldens {
             let img = makeImage(w: g.w, h: g.h, channels: g.ch, bits: g.bits, mode: g.mode)
@@ -552,7 +608,7 @@ struct TestRunner {
             }])
         let e3Goldens: [(name: String, img: JXLDecodedImage, size: Int)] = [
             ("96x64 RGB+alpha gradient", alphaImg, 169),
-            ("64x64 float32 RGB smooth", floatImg, 9684),
+            ("64x64 float32 RGB smooth", floatImg, 6485),
             ("48x32 float32 gray noise", floatNoiseImg, 6196),
         ]
         for g in e3Goldens {

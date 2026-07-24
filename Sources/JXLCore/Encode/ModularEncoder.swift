@@ -42,7 +42,7 @@ enum ModularEncoder {
     }
 
     private enum EncTransform {
-        case rct
+        case rct(type: Int)
         case palette(numC: Int, nbColors: Int)
         case squeeze
     }
@@ -94,13 +94,31 @@ enum ModularEncoder {
             if direct.bytes.count < best.count { best = direct.bytes }
             return best
         }
+        // Non-palette RGB: the gradient-entropy RCT estimate can mis-rank by a
+        // few bytes on SMALL images (the order-0 proxy diverges from the real
+        // tree+WP+ANS cost). There, race the estimate's pick against YCoCg
+        // (both cheap at this size) and keep the smaller — a strict no-regress
+        // guard vs the old YCoCg default. Large images trust the estimate;
+        // re-encoding them would blow the time budget.
+        if candidate.rctType >= 0, candidate.rctType != 6,
+            image.width * image.height <= kRCTRaceMaxPixels
+        {
+            let ycocg = try encodeLossless(
+                image, backend: backend, effort: effort, allowPalette: false, squeeze: false,
+                forcedRCT: 6)
+            if ycocg.bytes.count < candidate.bytes.count { return ycocg.bytes }
+        }
         return candidate.bytes
     }
 
+    /// Pixel budget under which the non-palette RGB path races its estimated
+    /// RCT type against YCoCg (guards against small-image estimate noise).
+    private static let kRCTRaceMaxPixels = 1 << 18  // 262144 (e.g. 512x512)
+
     private static func encodeLossless(
         _ image: JXLDecodedImage, backend: EntropyBackend, effort: Int, allowPalette: Bool,
-        squeeze: Bool, paletteOrder: PaletteOrder = .lexicographic
-    ) throws -> (bytes: [UInt8], usedPalette: Bool) {
+        squeeze: Bool, paletteOrder: PaletteOrder = .lexicographic, forcedRCT: Int? = nil
+    ) throws -> (bytes: [UInt8], usedPalette: Bool, rctType: Int) {
         let gray = image.colorChannels == 1
         guard image.colorChannels == 1 || image.colorChannels == 3 else {
             throw JXLEncodeError(reason: "encoder supports 1 or 3 color channels")
@@ -160,12 +178,15 @@ enum ModularEncoder {
         var nbMetaChannels = 0
         var transforms: [EncTransform] = []
         var paletteApplied = false
+        var chosenRCT = -1  // rct_type applied to the color channels (-1 = none)
         if squeeze {
             var mods: [ModularChannel] = []
             var planes = (0..<image.colorChannels).map { image.planes[$0] }
             if image.colorChannels == 3 {
-                forwardYCoCg(&planes)
-                transforms.append(.rct)
+                // Squeeze keeps the long-standing YCoCg (rct_type 6); the RCT
+                // search is applied only on the primary (non-responsive) path.
+                forwardRCT(&planes, type: 6)
+                transforms.append(.rct(type: 6))
             }
             for p in planes {
                 var mc = ModularChannel(w: image.width, h: image.height)
@@ -219,8 +240,17 @@ enum ModularEncoder {
         } else {
             var planes = (0..<image.colorChannels).map { image.planes[$0] }
             if image.colorChannels == 3 {
-                forwardYCoCg(&planes)
-                transforms = [.rct]
+                // Search the 42 reversible color transforms (effort 2) unless a
+                // type is forced (the small-image YCoCg race); effort 1 stays on
+                // YCoCg to keep its fixed-work fast path. Any chosen type
+                // round-trips (forwardRCT is invRCT's exact inverse).
+                let rctType =
+                    forcedRCT
+                    ?? (effort >= 2
+                        ? chooseRCT(planes, width: image.width, height: image.height) : 6)
+                forwardRCT(&planes, type: rctType)
+                transforms = [.rct(type: rctType)]
+                chosenRCT = rctType
             }
             channels = planes.map {
                 EncChannel(plane: $0, w: image.width, h: image.height)
@@ -572,7 +602,7 @@ enum ModularEncoder {
                 lzS)
             if lzBytes.count < bytes.count { bytes = lzBytes }
         }
-        return (bytes, paletteApplied)
+        return (bytes, paletteApplied, chosenRCT)
     }
 
     private static func makeEncoder(
@@ -676,41 +706,6 @@ enum ModularEncoder {
         return (palette, index, nbColors)
     }
 
-    /// In-place forward YCoCg (rct_type 6, identity permutation): the exact
-    /// inverse of the decoder's invRCT custom == 6 branch. Every intermediate
-    /// wraps to Int32 (>> 1 is not congruence-preserving, so the wrap points
-    /// must match invRCT exactly — full-range float bit patterns reach them).
-    private static func forwardYCoCg(_ channels: inout [[Int32]]) {
-        var p0: [Int32] = []
-        var p1: [Int32] = []
-        var p2: [Int32] = []
-        swap(&p0, &channels[0])
-        swap(&p1, &channels[1])
-        swap(&p2, &channels[2])
-        let n = p0.count
-        p0.withUnsafeMutableBufferPointer { c0 in
-            p1.withUnsafeMutableBufferPointer { c1 in
-                p2.withUnsafeMutableBufferPointer { c2 in
-                    for i in 0..<n {
-                        let r = c0[i]
-                        let g = c1[i]
-                        let b = c2[i]
-                        let co = r &- b
-                        let tmp = b &+ (co >> 1)
-                        let cg = g &- tmp
-                        let y = tmp &+ (cg >> 1)
-                        c0[i] = y
-                        c1[i] = co
-                        c2[i] = cg
-                    }
-                }
-            }
-        }
-        swap(&p0, &channels[0])
-        swap(&p1, &channels[1])
-        swap(&p2, &channels[2])
-    }
-
     /// FrameHeader for the lossless shape: regular, modular, no flags, no
     /// color transform, no upsampling (incl. per-EC), single pass,
     /// full-canvas, replace blending (incl. per-EC), last frame, no name, no
@@ -770,12 +765,14 @@ enum ModularEncoder {
             .bits(8, offset: 18))
         for t in transforms {
             switch t {
-            case .rct:
+            case .rct(let type):
                 w.writeU32(0, .value(0), .value(1), .value(2), .value(3))  // id: RCT
                 w.writeU32(
                     0, .bits(3), .bits(6, offset: 8), .bits(10, offset: 72),
                     .bits(13, offset: 1096))  // begin_c
-                w.writeU32(6, .value(6), .bits(2), .bits(4, offset: 2), .bits(6, offset: 10))  // YCoCg
+                // rct_type (0..41): same U32 distribution the decoder reads.
+                w.writeU32(
+                    UInt32(type), .value(6), .bits(2), .bits(4, offset: 2), .bits(6, offset: 10))
             case .palette(let numC, let nbColors):
                 w.writeU32(1, .value(0), .value(1), .value(2), .value(3))  // id: Palette
                 w.writeU32(
