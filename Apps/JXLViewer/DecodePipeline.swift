@@ -19,6 +19,16 @@ struct DecodeResult: @unchecked Sendable {
     let image: CGImage?
     /// Per-pixel sample access for the inspector, in native bit depth.
     let sampler: PixelSampler?
+    /// The raw decoded planes (pre-orientation), retained so the re-encode
+    /// preview can feed the public encoder. Shares plane storage with `sampler`
+    /// (copy-on-write), so it adds no extra buffer memory.
+    let decoded: JXLDecodedImage?
+    /// EXIF orientation, so a re-encoded A/B image can be shown the same way up.
+    let orientation: UInt32
+    /// The file's color encoding (for tagging the re-encoded A/B image).
+    let colorEncoding: JXLColorEncoding?
+    /// True for PQ/HLG transfers (HDR): the re-encode preview keeps lossy off.
+    let isHDR: Bool
     /// One-line status summary (dimensions / channels) or an error message.
     let summary: String
     /// Multi-line metadata report for the inspector panel.
@@ -176,13 +186,18 @@ enum DecodePipeline {
             return DecodeResult(
                 image: image,
                 sampler: PixelSampler(decoded, orientation: info.orientation),
+                decoded: decoded,
+                orientation: info.orientation,
+                colorEncoding: info.colorEncoding,
+                isHDR: isHDR,
                 summary: summarize(info: info, image: decoded) + pathTag,
                 report: report)
         } catch {
             let reason = (error as? JXLError).map(String.init(describing:))
                 ?? error.localizedDescription
             return DecodeResult(
-                image: nil, sampler: nil,
+                image: nil, sampler: nil, decoded: nil,
+                orientation: 1, colorEncoding: nil, isHDR: false,
                 summary: "✗ \(name): \(reason)", report: report)
         }
     }

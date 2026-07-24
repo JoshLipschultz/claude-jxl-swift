@@ -98,6 +98,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(
             withTitle: "Show Info",
             action: #selector(DocumentWindowController.toggleInspector(_:)), keyEquivalent: "i")
+        menu.addItem(
+            withTitle: "Re-encode Preview…",
+            action: #selector(DocumentWindowController.toggleReencodePreview(_:)), keyEquivalent: "r")
         menu.addItem(.separator())
         menu.addItem(
             withTitle: "Actual Size",

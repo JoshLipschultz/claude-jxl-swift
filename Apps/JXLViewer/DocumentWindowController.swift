@@ -9,6 +9,7 @@
 
 import AppKit
 import Foundation
+import JXLCore
 
 final class DocumentWindowController: NSWindowController, NSMenuItemValidation {
 
@@ -18,6 +19,20 @@ final class DocumentWindowController: NSWindowController, NSMenuItemValidation {
     private let hoverLabel = NSTextField(labelWithString: "")
     private var inspectorPanel: NSPanel?
     private var decodeGeneration = 0
+
+    // Re-encode preview (⌘R): a floating panel that runs the currently decoded
+    // pixels back through the PUBLIC encoder and reports size + PSNR, with an
+    // A/B switch that swaps the canvas to the re-encoded result.
+    private let reencodePanelView = ReencodePanelView()
+    private var reencodePanel: NSPanel?
+    private var reencodeDecoded: JXLDecodedImage?
+    private var reencodeOrientation: UInt32 = 1
+    private var reencodeColorEncoding: JXLColorEncoding?
+    private var reencodeIsHDR = false
+    private var reencodeOriginalBytes = 0
+    /// The re-encoded, re-decoded image backing the A/B switch (nil until a
+    /// lossy run produces one).
+    private var reencodeResultImage: CGImage?
 
     // Animation playback state (all main-actor). One-shot timers chained per
     // frame honor the file's variable per-frame durations.
@@ -101,6 +116,14 @@ final class DocumentWindowController: NSWindowController, NSMenuItemValidation {
             self?.hoverLabel.stringValue = text ?? ""
         }
 
+        reencodePanelView.onRun = { [weak self] mode in
+            self?.runReencode(mode)
+        }
+        reencodePanelView.onToggleAB = { [weak self] showReencoded in
+            guard let self else { return }
+            self.canvas.setComparisonImage(showReencoded ? self.reencodeResultImage : nil)
+        }
+
         // Resolve layout before the window animates on screen so the first
         // frame is drawn content, not an empty backing store.
         content.layoutSubtreeIfNeeded()
@@ -149,6 +172,108 @@ final class DocumentWindowController: NSWindowController, NSMenuItemValidation {
         panel.orderFront(nil)
     }
 
+    // MARK: - Re-encode preview panel (⌘R)
+
+    private func makeReencodePanel() -> NSPanel {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 320),
+            styleMask: [.titled, .closable, .resizable, .utilityWindow],
+            backing: .buffered, defer: false)
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = true
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.title = "Re-encode Preview"
+        reencodePanelView.translatesAutoresizingMaskIntoConstraints = true
+        reencodePanelView.frame = panel.contentView!.bounds
+        reencodePanelView.autoresizingMask = [.width, .height]
+        panel.contentView!.addSubview(reencodePanelView)
+        return panel
+    }
+
+    private var reencodeVisible: Bool { reencodePanel?.isVisible ?? false }
+
+    @objc func toggleReencodePreview(_ sender: Any?) {
+        if reencodeVisible {
+            reencodePanel?.orderOut(nil)
+            return
+        }
+        let firstShow = reencodePanel == nil
+        let panel = reencodePanel ?? makeReencodePanel()
+        reencodePanel = panel
+        if firstShow, let windowFrame = window?.frame {
+            // First show: hug the document window's right edge, below the info
+            // panel's usual spot.
+            panel.setFrameTopLeftPoint(
+                NSPoint(x: windowFrame.maxX + 8, y: windowFrame.maxY - 260))
+        }
+        panel.orderFront(nil)
+    }
+
+    /// Clears any re-encode result and A/B state (called when a new decode
+    /// starts, so stale numbers/images never linger).
+    private func resetReencodeState() {
+        reencodeDecoded = nil
+        reencodeResultImage = nil
+        reencodePanelView.resetAB()
+        reencodePanelView.clearResult()
+        canvas.setComparisonImage(nil)
+    }
+
+    /// Points the re-encode panel at a freshly decoded image.
+    private func configureReencode(from result: DecodeResult, originalBytes: Int) {
+        reencodeResultImage = nil
+        canvas.setComparisonImage(nil)
+        guard let decoded = result.decoded else {
+            reencodeDecoded = nil
+            reencodePanelView.configure(
+                lossyDisabledReason: "no decoded image", originalBytes: originalBytes)
+            return
+        }
+        reencodeDecoded = decoded
+        reencodeOrientation = result.orientation
+        reencodeColorEncoding = result.colorEncoding
+        reencodeIsHDR = result.isHDR
+        reencodeOriginalBytes = originalBytes
+        let reason = ReencodeEngine.lossyDisabledReason(for: decoded, isHDR: result.isHDR)
+        reencodePanelView.configure(lossyDisabledReason: reason, originalBytes: originalBytes)
+    }
+
+    /// Runs the encoder off the main actor for `mode`, then shows size + PSNR.
+    private func runReencode(_ mode: ReencodeMode) {
+        guard let decoded = reencodeDecoded else {
+            reencodePanelView.showError("No decoded image to re-encode.")
+            return
+        }
+        let orientation = reencodeOrientation
+        let colorEncoding = reencodeColorEncoding
+        let isHDR = reencodeIsHDR
+        let originalBytes = reencodeOriginalBytes
+        let generation = decodeGeneration
+        Task { [weak self] in
+            let out: (outcome: ReencodeOutcome?, error: String?) =
+                await Task.detached(priority: .userInitiated) {
+                    () -> (outcome: ReencodeOutcome?, error: String?) in
+                    do {
+                        let o = try ReencodeEngine.run(
+                            image: decoded, orientation: orientation,
+                            colorEncoding: colorEncoding, isHDR: isHDR,
+                            originalBytes: originalBytes, mode: mode)
+                        return (outcome: o, error: nil)
+                    } catch {
+                        return (outcome: nil, error: ReencodeEngine.describe(error))
+                    }
+                }.value
+            guard let self, generation == self.decodeGeneration else { return }
+            if let outcome = out.outcome {
+                self.reencodeResultImage = outcome.image
+                self.reencodePanelView.showResult(outcome)
+            } else {
+                self.reencodeResultImage = nil
+                self.reencodePanelView.showError(out.error ?? "unknown error")
+            }
+        }
+    }
+
     // MARK: - Decoding
 
     /// Called by the document once this controller is attached. Two stages,
@@ -162,6 +287,7 @@ final class DocumentWindowController: NSWindowController, NSMenuItemValidation {
         statusLabel.stringValue = "Decoding \(name)…"
 
         stopAnimation()
+        resetReencodeState()
         decodeGeneration += 1
         let generation = decodeGeneration
         let start = DispatchTime.now().uptimeNanoseconds
@@ -196,6 +322,7 @@ final class DocumentWindowController: NSWindowController, NSMenuItemValidation {
                 : result.summary
             self.statusLabel.stringValue = self.baseStatus
             self.inspector.setReport(result.report)
+            self.configureReencode(from: result, originalBytes: data.count)
             // Stage 3 (animated files only): decode all frames in the
             // background, then play. The still first frame above already
             // landed, so this never delays first pixels; for stills the stage
@@ -325,6 +452,9 @@ final class DocumentWindowController: NSWindowController, NSMenuItemValidation {
         case #selector(toggleInspector):
             item.title = inspectorVisible ? "Hide Info" : "Show Info"
             return true
+        case #selector(toggleReencodePreview):
+            item.title = reencodeVisible ? "Hide Re-encode Preview" : "Re-encode Preview…"
+            return canvas.hasImage
         case #selector(nextImage), #selector(previousImage):
             guard let url = (document as? JXLDocument)?.fileURL else { return false }
             return folderSiblings(of: url).count > 1

@@ -89,6 +89,13 @@ final class ImageCanvasView: NSView {
         documentImageView.clearAnimationFrame()
     }
 
+    /// A/B comparison: when non-nil, this full-resolution image replaces the
+    /// normal display (used by the re-encode preview to show the re-encoded
+    /// result in place of the original). `nil` restores the original.
+    func setComparisonImage(_ image: CGImage?) {
+        documentImageView.setComparison(image)
+    }
+
     @objc private func clipBoundsChanged(_ note: Notification) { pushEffectiveScale() }
 
     override func viewDidMoveToWindow() {
@@ -180,6 +187,8 @@ private final class DocumentImageView: NSView {
     private var fullImage: CGImage?
     /// Current animation frame; overrides preview/full while playback runs.
     private var animationFrame: CGImage?
+    /// A/B comparison image; overrides everything while set (re-encode preview).
+    private var comparisonImage: CGImage?
     private var displayed: CGImage?
     private var sampler: PixelSampler?
     private var effectiveScale: CGFloat = 1
@@ -228,7 +237,8 @@ private final class DocumentImageView: NSView {
         // Crisp pixels when zoomed in on the real image, smooth scaling for the
         // preview (only ever shown upscaled-while-waiting or far zoomed out).
         layer.magnificationFilter =
-            (displayed === fullImage || displayed === animationFrame) ? .nearest : .linear
+            (displayed === fullImage || displayed === animationFrame
+                || displayed === comparisonImage) ? .nearest : .linear
         layer.minificationFilter = .linear
     }
 
@@ -237,6 +247,7 @@ private final class DocumentImageView: NSView {
     func setPreview(_ image: CGImage, displaySize: CGSize) {
         previewImage = image
         animationFrame = nil  // a new document's decode supersedes any playback
+        comparisonImage = nil  // …and any re-encode A/B from a prior document
         if displaySize != frame.size { setFrameSize(displaySize) }
         refreshDisplayedImage(force: true)
     }
@@ -244,6 +255,7 @@ private final class DocumentImageView: NSView {
     func setFull(_ image: CGImage?, sampler: PixelSampler?) {
         fullImage = image
         animationFrame = nil  // a new document's decode supersedes any playback
+        comparisonImage = nil  // …and any re-encode A/B from a prior document
         self.sampler = sampler
         if let image {
             let size = CGSize(width: image.width, height: image.height)
@@ -269,11 +281,19 @@ private final class DocumentImageView: NSView {
         refreshDisplayedImage(force: false)
     }
 
+    func setComparison(_ image: CGImage?) {
+        comparisonImage = image
+        // Force: a nil→image or image→nil swap can leave `displayed` identical
+        // by reference in edge cases, so always re-evaluate.
+        refreshDisplayedImage(force: true)
+    }
+
     /// Which image draws: the full decode when present, except that the DC
     /// preview substitutes whenever it still has at least one sample per
     /// on-screen device pixel — at ≤1/8 effective scale downsampling makes the
     /// two identical, and the preview is far cheaper to composite.
     private func chooseImage() -> CGImage? {
+        if let comparison = comparisonImage { return comparison }
         if let frame = animationFrame { return frame }
         guard let full = fullImage else { return previewImage }
         guard let preview = previewImage, bounds.width > 0,
