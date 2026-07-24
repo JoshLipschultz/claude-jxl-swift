@@ -1,9 +1,21 @@
 // VarDCTEncoder.swift
 //
-// E5a/E5b: the baseline lossy VarDCT encoder — valid, not yet competitive.
-// One regular XYB VarDCT frame, all-DCT8 strategies, an ADAPTIVE per-block
-// quant field (E5b), default dequant tables / block context map / color
-// correlation, loop filters off, single pass, 4:4:4, no extra channels.
+// E5a/E5b/E5c: the baseline lossy VarDCT encoder — valid, improving toward
+// competitive. One regular XYB VarDCT frame, all-DCT8 strategies, an
+// ADAPTIVE per-block quant field (E5b), a per-color-tile CHROMA-FROM-LUMA
+// search (E5c), default dequant tables / block context map, loop filters
+// off, single pass, 4:4:4, no extra channels.
+//
+// Per AC group the coefficient walk is TWO passes (see the group loop):
+//   1. forward DCT, adaptive quant field, DC, Y-AC quantization, and each
+//      color tile's least-squares CfL accumulation — order-insensitive
+//      (writes only per-block scratch + per-tile accumulators, emits no
+//      tokens), so it may run in any block order;
+//   2. X/B-AC quantization (using pass 1's chosen per-tile CfL) and token
+//      emission — STRICT group raster order, the one order decodeACGroupPass
+//      reads. Splitting the passes is what lets a tile's CfL be decided from
+//      all its blocks before any block's tokens are emitted, without
+//      perturbing the emission order the decoder depends on.
 //
 // The load-bearing rule: every field written here is the exact dual of a
 // decoder reader in this repo —
@@ -18,8 +30,8 @@
 //     mirrored computation-for-computation below,
 //   * quantization semantics: DequantDC / reconstructXYB (Reconstruct.swift)
 //     define the decoder-side multipliers this encoder divides by, including
-//     the default chroma-from-luma (B is coded minus the reconstructed Y
-//     coefficient, for AC and DC alike) and AdjustQuantBias,
+//     chroma-from-luma (X += xCC*recY, B += bCC*recY, where xCC/bCC derive
+//     from the per-tile YtoX/YtoB maps around bases 0/1) and AdjustQuantBias,
 //   * color: ForwardXYB.swift inverts ConvertState.linear + the sRGB EOTF.
 //
 // Deliberate shape choices:
@@ -328,17 +340,42 @@ private let kAqMaxMul: Float = 1.0
 private let kAqActivitySigma: Float = 0.008
 
 /// Adaptive per-block quant value from the block's pre-quantization Y AC
-/// coefficients (`cY[1..<64]`), scaled around `baseQuant`, clamped to the
-/// bitstream's valid range [1, 256].
+/// coefficients (`cY[base+1..<base+64]` in a flat per-tile buffer), scaled
+/// around `baseQuant`, clamped to the bitstream's valid range [1, 256].
 @inline(__always)
-private func encAdaptiveQuant(_ cY: [Float], baseQuant: Int32) -> Int32 {
+private func encAdaptiveQuant(_ cY: UnsafeBufferPointer<Float>, base: Int, baseQuant: Int32) -> Int32 {
     var sumSq: Float = 0
-    for k in 1..<64 { sumSq += cY[k] * cY[k] }
+    for k in 1..<64 { sumSq += cY[base + k] * cY[base + k] }
     let activity = (sumSq / 63).squareRoot()
     let adj = 1 / (1 + activity / kAqActivitySigma)  // 1 (flat) .. ~0 (busy)
     let mul = kAqMinMul + (kAqMaxMul - kAqMinMul) * adj
     let q = (Float(baseQuant) * mul).rounded()
     return Int32(min(256, max(1, q)))
+}
+
+// MARK: - Chroma-from-luma search (E5c)
+//
+// Reconstruct.swift's AC dequant adds `xCC * bufY[k]` / `bCC * bufY[k]` back
+// onto the X/B coefficients, where bufY is the ALREADY-DEQUANTIZED
+// (bias-adjusted) Y value and xCC/bCC = base + tileVal*colorScale (base 0
+// for X, 1 for B — the "B minus Y" baseline this encoder always used before
+// this milestone). Per-tile `tileVal` is free: the decoder reads whatever
+// the color-tile-resolution YtoX/YtoB channels carry. That makes the optimal
+// per-tile choice a single unweighted least-squares slope fit (no
+// intercept, since the model IS the multiplicative term) of the block's
+// forward XYB coefficients against the block's own reconstructed Y:
+//   slope = Σ(targetChannel[k] * recY[k]) / Σ(recY[k]²)  over every AC
+//   coefficient in every block of the tile.
+private let kDefaultColorFactor: Float = 84
+private let kColorScale: Float = 1 / kDefaultColorFactor
+
+/// Least-squares slope -> nearest valid per-tile int8 offset from `base`.
+@inline(__always)
+private func encFitColorTile(sumTargetY: Double, sumYY: Double, base: Float) -> Int32 {
+    guard sumYY > 1e-9 else { return 0 }
+    let slope = Float(sumTargetY / sumYY)
+    let raw = ((slope - base) / kColorScale).rounded()
+    return Int32(min(127, max(-128, raw)))
 }
 
 // MARK: - Encoder
@@ -483,9 +520,6 @@ enum VarDCTEncoder {
         // only parts still hoisted out of the block loop.
         let invGlobalScale = Float(1 << 16) / Float(params.globalScale)
         let table = defaultDequantTable(.dct)  // [X 64, Y 64, B 64]
-        var xMul = [Float](repeating: 0, count: 64)
-        var yMul = xMul
-        var bMul = xMul
         let order = computeNaturalCoeffOrder(cbx: 1, cby: 1)  // CoeffOrder.swift
 
         // ---- Per-AC-group walk: forward DCT8, quantize (DC into the shared
@@ -496,13 +530,16 @@ enum VarDCTEncoder {
         // Per-block adaptive quant field (E5b), full block grid; read back
         // when building each DC group's AcMetadata stream.
         var blockQuantField = [Int32](repeating: params.quantField, count: bw * bh)
+        // Per-color-tile CfL ints (E5c), full-frame color-tile grid (8x8
+        // blocks/tile); read back the same way when building AcMetadata.
+        let cmapFullW = divCeil(bw, kColorTileDimInBlocks)
+        let cmapFullH = divCeil(bh, kColorTileDimInBlocks)
+        var globalYtoX = [Int32](repeating: 0, count: cmapFullW * cmapFullH)
+        var globalYtoB = [Int32](repeating: 0, count: cmapFullW * cmapFullH)
         let bgDim = dim.groupDim >> 3  // group dimension in blocks (32)
         var acTokens: [[EncToken]] = []
         acTokens.reserveCapacity(dim.numGroups)
 
-        var cY = [Float](repeating: 0, count: 64)
-        var cX = cY
-        var cB = cY
         var qY = [Int32](repeating: 0, count: 64)
         var qX = qY
         var qB = qY
@@ -510,6 +547,18 @@ enum VarDCTEncoder {
         let blockCtxOf: [Int] = [1, 0, 2].reduce(into: [Int](repeating: 0, count: 3)) {
             out, c in out[c] = encBlockContext(channel: c, order: kStrategyOrder[0])
         }
+
+        // Per-group scratch (sized to the largest possible group,
+        // bgDim x bgDim blocks): forward DCT results flat (block-major, 64
+        // coefficients each), Y quantization + its reconstructed value, and
+        // the per-block adaptive-quant scale. Reused across groups.
+        let maxGroupBlocks = bgDim * bgDim
+        var gcY = [Float](repeating: 0, count: maxGroupBlocks * 64)
+        var gcX = gcY
+        var gcB = gcY
+        var gRecY = gcY
+        var gQY = [Int32](repeating: 0, count: maxGroupBlocks * 64)
+        var gScaledDequant = [Float](repeating: 0, count: maxGroupBlocks)
 
         for g in 0..<dim.numGroups {
             let bx0 = (g % dim.xsizeGroups) * bgDim
@@ -521,66 +570,128 @@ enum VarDCTEncoder {
             // at full block resolution).
             var nzeros = [[Int32]](repeating: [Int32](repeating: 0, count: gw * gh), count: 3)
 
+            // ---- Pass 1: forward DCT, adaptive quant field, DC, Y AC
+            // quantization + its reconstructed value, accumulating each
+            // color tile's least-squares CfL sums (E5c) — in ANY block
+            // order, since this pass only writes into per-block scratch
+            // (indexed by group-local position, not visitation order) and
+            // per-TILE accumulators, nothing here is order-sensitive. Kept
+            // as the group's natural raster order purely for simplicity.
+            let tilesX = divCeil(gw, kColorTileDimInBlocks)
+            let tilesY = divCeil(gh, kColorTileDimInBlocks)
+            var tileSumXY = [Double](repeating: 0, count: tilesX * tilesY)
+            var tileSumBY = [Double](repeating: 0, count: tilesX * tilesY)
+            var tileSumYY = [Double](repeating: 0, count: tilesX * tilesY)
+
             for byl in 0..<gh {
                 let by = by0 + byl
                 for bxl in 0..<gw {
                     let bx = bx0 + bxl
+                    let gi = byl * gw + bxl
+                    let base = gi * 64
                     let px = by * 8 * pw + bx * 8
                     planeY.withUnsafeBufferPointer { p in
-                        cY.withUnsafeMutableBufferPointer { o in
-                            forwardDCT8(pixels: p.baseAddress! + px, stride: pw, out: o.baseAddress!)
+                        gcY.withUnsafeMutableBufferPointer { o in
+                            forwardDCT8(pixels: p.baseAddress! + px, stride: pw, out: o.baseAddress! + base)
                         }
                     }
                     planeX.withUnsafeBufferPointer { p in
-                        cX.withUnsafeMutableBufferPointer { o in
-                            forwardDCT8(pixels: p.baseAddress! + px, stride: pw, out: o.baseAddress!)
+                        gcX.withUnsafeMutableBufferPointer { o in
+                            forwardDCT8(pixels: p.baseAddress! + px, stride: pw, out: o.baseAddress! + base)
                         }
                     }
                     planeB.withUnsafeBufferPointer { p in
-                        cB.withUnsafeMutableBufferPointer { o in
-                            forwardDCT8(pixels: p.baseAddress! + px, stride: pw, out: o.baseAddress!)
+                        gcB.withUnsafeMutableBufferPointer { o in
+                            forwardDCT8(pixels: p.baseAddress! + px, stride: pw, out: o.baseAddress! + base)
                         }
                     }
 
-                    // Adaptive quant field for this block (E5b): from the
-                    // block's own pre-quantization Y AC energy, then this
-                    // block's AC multiplier tables from it.
+                    // Adaptive quant field (E5b): from this block's own
+                    // pre-quantization Y AC energy.
                     let dcPos = by * bw + bx
-                    let blockQuant = encAdaptiveQuant(cY, baseQuant: params.quantField)
+                    let blockQuant = gcY.withUnsafeBufferPointer {
+                        encAdaptiveQuant($0, base: base, baseQuant: params.quantField)
+                    }
                     blockQuantField[dcPos] = blockQuant
                     let scaledDequant = invGlobalScale / Float(blockQuant)
-                    for k in 0..<64 {
-                        xMul[k] = table[k] * scaledDequant
-                        yMul[k] = table[64 + k] * scaledDequant
-                        bMul[k] = table[128 + k] * scaledDequant
-                    }
+                    gScaledDequant[gi] = scaledDequant
 
-                    // DC (storage[0], == block mean): DequantDC inverse. The
-                    // decoder reconstructs B-DC as qY*facY*cfl + qB*facB, so
-                    // B is quantized minus the reconstructed Y DC.
-                    let vY = Int32((cY[0] / facY).rounded())
-                    let vX = Int32((cX[0] / facX).rounded())
+                    // DC (storage[0], == block mean): DequantDC inverse,
+                    // independent of the AC CfL search (the decoder
+                    // overwrites AC-dequant's k=0 entry with the DC image
+                    // value regardless — insertLLF).
+                    let vY = Int32((gcY[base] / facY).rounded())
+                    let vX = Int32((gcX[base] / facX).rounded())
                     let recDCY = Float(vY) * facY
-                    let vB = Int32(((cB[0] - cflBDC * recDCY) / facB).rounded())
+                    let vB = Int32(((gcB[base] - cflBDC * recDCY) / facB).rounded())
                     qDCY[dcPos] = vY
                     qDCX[dcPos] = vX
                     qDCB[dcPos] = vB
 
-                    // AC: quantize each storage index (1..63); B minus the
-                    // reconstructed (bias-adjusted) Y coefficient — the
-                    // decoder adds bufY back with the default ytob base 1.
+                    // Y AC quantization (never CfL-corrected — Y is the
+                    // reference channel) and its reconstructed (bias-
+                    // adjusted) value, both cached for pass 2, plus this
+                    // block's contribution to its color tile's CfL fit.
+                    let tileIdx = (byl / kColorTileDimInBlocks) * tilesX + (bxl / kColorTileDimInBlocks)
+                    for k in 1..<64 {
+                        let yMulK = table[64 + k] * scaledDequant
+                        let yq = Int32((gcY[base + k] / yMulK).rounded())
+                        gQY[base + k] = yq
+                        let recY = encAdjustQuantBias(yq, kEncQuantBiasY) * yMulK
+                        gRecY[base + k] = recY
+                        tileSumXY[tileIdx] += Double(gcX[base + k]) * Double(recY)
+                        tileSumBY[tileIdx] += Double(gcB[base + k]) * Double(recY)
+                        tileSumYY[tileIdx] += Double(recY) * Double(recY)
+                    }
+                }
+            }
+
+            // ---- Finalize this group's per-tile CfL ints (E5c) into the
+            // full-frame map (group block offsets are 8-block-aligned —
+            // bgDim is a multiple of kColorTileDimInBlocks — so the divide
+            // below is exact).
+            var groupYtoX = [Int32](repeating: 0, count: tilesX * tilesY)
+            var groupYtoB = [Int32](repeating: 0, count: tilesX * tilesY)
+            for t in 0..<(tilesX * tilesY) {
+                let ytoX = encFitColorTile(sumTargetY: tileSumXY[t], sumYY: tileSumYY[t], base: 0)
+                let ytoB = encFitColorTile(sumTargetY: tileSumBY[t], sumYY: tileSumYY[t], base: 1)
+                groupYtoX[t] = ytoX
+                groupYtoB[t] = ytoB
+                let fullTileX = bx0 / kColorTileDimInBlocks + t % tilesX
+                let fullTileY = by0 / kColorTileDimInBlocks + t / tilesX
+                globalYtoX[fullTileY * cmapFullW + fullTileX] = ytoX
+                globalYtoB[fullTileY * cmapFullW + fullTileX] = ytoB
+            }
+
+            // ---- Pass 2: X/B AC quantization with each block's tile CfL,
+            // then token emission — STRICT raster order (byl outer, bxl
+            // inner, across the FULL group), matching decodeACGroupPass's
+            // own traversal exactly. This is the one order the decoder
+            // actually cares about; pass 1 above may run in any order
+            // precisely because it never emits tokens.
+            for byl in 0..<gh {
+                for bxl in 0..<gw {
+                    let gi = byl * gw + bxl
+                    let base = gi * 64
+                    let scaledDequant = gScaledDequant[gi]
+                    let tileIdx = (byl / kColorTileDimInBlocks) * tilesX + (bxl / kColorTileDimInBlocks)
+                    let xCC = Float(groupYtoX[tileIdx]) * kColorScale
+                    let bCC = 1 + Float(groupYtoB[tileIdx]) * kColorScale
+
                     var nzY = 0
                     var nzX = 0
                     var nzB = 0
                     for k in 1..<64 {
-                        let yq = Int32((cY[k] / yMul[k]).rounded())
+                        let yq = gQY[base + k]
                         qY[k] = yq
                         if yq != 0 { nzY += 1 }
-                        let xq = Int32((cX[k] / xMul[k]).rounded())
+                        let recY = gRecY[base + k]
+                        let xMulK = table[k] * scaledDequant
+                        let xq = Int32(((gcX[base + k] - xCC * recY) / xMulK).rounded())
                         qX[k] = xq
                         if xq != 0 { nzX += 1 }
-                        let recY = encAdjustQuantBias(yq, kEncQuantBiasY) * yMul[k]
-                        let bq = Int32(((cB[k] - recY) / bMul[k]).rounded())
+                        let bMulK = table[128 + k] * scaledDequant
+                        let bq = Int32(((gcB[base + k] - bCC * recY) / bMulK).rounded())
                         qB[k] = bq
                         if bq != 0 { nzB += 1 }
                     }
@@ -648,12 +759,24 @@ enum VarDCTEncoder {
             dcTokens.append(t)
 
             // AcMetadata stream: 4 channels — YtoX/YtoB color-tile maps
-            // (zeros: default CfL), (count x 2) strategy+quant rows, EPF
+            // (E5c per-tile CfL search), (count x 2) strategy+quant rows, EPF
             // sharpness (zeros). All-DCT8 => count == rw*rh varblocks.
             let crW = divCeil(rw, kColorTileDimInBlocks)
             let crH = divCeil(rh, kColorTileDimInBlocks)
             let count = rw * rh
-            let cmapZero = [Int32](repeating: 0, count: crW * crH)
+            // Same (ctX0, ctY0) full-frame color-tile origin the decoder
+            // computes from the DC group's rect (ACMetadata.swift).
+            let ctX0 = x0 >> 3
+            let ctY0 = y0 >> 3
+            var cmapX = [Int32](repeating: 0, count: crW * crH)
+            var cmapB = [Int32](repeating: 0, count: crW * crH)
+            for cy in 0..<crH {
+                for cx in 0..<crW {
+                    let src = (ctY0 + cy) * cmapFullW + (ctX0 + cx)
+                    cmapX[cy * crW + cx] = globalYtoX[src]
+                    cmapB[cy * crW + cx] = globalYtoB[src]
+                }
+            }
             var acsQF = [Int32](repeating: 0, count: count * 2)
             // Row-major (iy, ix) over the DC group's rect: with every block a
             // DCT8 varblock, `num` in decodeAcMetadataGroup increments once
@@ -668,7 +791,7 @@ enum VarDCTEncoder {
             var mt: [EncToken] = []
             let metaStreamID = 1 + 2 * dim.numDCGroups + dcg
             let chans: [(plane: [Int32], w: Int, h: Int)] = [
-                (cmapZero, crW, crH), (cmapZero, crW, crH),
+                (cmapX, crW, crH), (cmapB, crW, crH),
                 (acsQF, count, 2), (epfZero, rw, rh),
             ]
             for (i, ch) in chans.enumerated() {

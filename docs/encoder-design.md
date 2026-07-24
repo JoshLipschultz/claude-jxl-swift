@@ -239,10 +239,24 @@ every milestone lands with djxl round-trip proof, never just self-consistency.
 - **E5 — baseline lossy** (GO decision 2026-07-22, per §7's "decide with E4
   numbers in hand": the modular machinery lossy needs — trees, entropy
   writers, quantized-channel streams — is built and oracle-hardened, and
-  the complete VarDCT decode pipeline is the dual to write against; E5a in
-  progress): XYB forward, fixed DCT8, uniform quant, quality knob;
-  explicitly "valid, not competitive." Gates include a CROSS-ORACLE check:
-  our decoder and djxl must agree to high precision on the same lossy file.
+  the complete VarDCT decode pipeline is the dual to write against). XYB
+  forward, fixed DCT8, quality knob; "valid, improving." Gate for every
+  sub-milestone includes a CROSS-ORACLE check: our decoder and djxl must
+  agree to high precision (>100 dB) on the same lossy file.
+    - **E5a** (2026-07-22): uniform quant field. Baseline lossy end to end.
+    - **E5b** (2026-07-22): adaptive per-block AC quant field from local
+      luma-AC energy. Coarsen-only (measured: boosting flat blocks above
+      baseline loses on gradient content). Photo +1.53 dB AND −5.1% size.
+    - **E5c** (2026-07-23): per-color-tile chroma-from-luma search — the
+      per-tile YtoX/YtoB maps (which E5a/E5b left at the base-0/base-1
+      default) fitted by unweighted least squares of each block's forward
+      X/B AC coefficients against its reconstructed Y AC. Two-pass AC walk
+      (fit, then quantize+emit in raster order) so the emission order the
+      decoder reads is untouched. Photo +0.46 dB AND −2.0% size; the 6 MP
+      gradient/edge bench −7.1% size AND +6.5 dB (strong Y↔chroma
+      correlation there). All cross-oracle ≥117 dB.
+    - Remaining lossy quality levers (E5d+): non-DCT8 AC strategies, an
+      RD-driven (rather than nonzero-count) quant search, alpha-with-lossy.
 - **E6 (undecided) — jbrd**: JPEG recompression, byte-exact reconstruction.
 
 Each milestone = the full existing ritual: suite + fuzz + bench + size gate +
