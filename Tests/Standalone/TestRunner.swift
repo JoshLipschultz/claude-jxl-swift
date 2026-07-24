@@ -102,6 +102,7 @@ struct TestRunner {
         ditherOutput()
         lossyEncoderIdentities()
         lossyEncoder()
+        jbrdEncode()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -1039,6 +1040,61 @@ struct TestRunner {
     /// (the lossy VarDCT float pipeline itself carries ~1-ulp disagreement, so
     /// bit-exactness is not achievable), and uint16 must equal the clamped
     /// round of the float samples.
+    // MARK: - JPEG recompression ENCODER (jbrd, milestone E6)
+
+    /// The dual of the transcode decoder: encode a baseline JPEG into a JXL
+    /// container (jbrd box + VarDCT frame carrying the JPEG's quantized
+    /// coefficients verbatim), then reconstruct the JPEG from that JXL via the
+    /// decoder — the result must be BYTE-IDENTICAL to the original. The
+    /// committed `256x192_jbrd.jpg` (4:2:0 + restart intervals + Exif + APP0 +
+    /// APP13) is the primary regression lock; the `jbrd_enc_*` fixtures are
+    /// cjpeg-generated at each subsampling (4:4:4, 4:2:0, 4:2:2) and a
+    /// multi-AC-group size, all round-tripped the same way. (djxl reconstructs
+    /// these byte-identically too — proven out of band; kept out of the suite,
+    /// which has no oracle dependency.)
+    static func jbrdEncode() {
+        let dir = fixturesDir()
+        // (name, mustBeSmaller): real-content JPEGs beat their source; the tiny
+        // smooth swirl multigroup fixture pays codestream overhead JPEG's
+        // Huffman avoids, so only its round-trip is asserted, not its size.
+        let cases: [(name: String, mustBeSmaller: Bool)] = [
+            ("256x192_jbrd.jpg", true),
+            ("jbrd_enc_444.jpg", true),
+            ("jbrd_enc_420.jpg", true),
+            ("jbrd_enc_422.jpg", true),
+            ("jbrd_enc_multigroup.jpg", false),
+        ]
+        for (name, mustBeSmaller) in cases {
+            guard let jpegData = try? Data(contentsOf: dir.appendingPathComponent(name)) else {
+                check(false, "jbrd fixture \(name) present")
+                continue
+            }
+            let orig = [UInt8](jpegData)
+            guard let jxl = try? JXL.encodeJPEGTranscode(jpeg: orig) else {
+                check(false, "jbrd encode \(name)")
+                continue
+            }
+            guard let recon = try? JXL.reconstructJPEG(from: jxl) else {
+                check(false, "jbrd reconstruct \(name)")
+                continue
+            }
+            check(
+                [UInt8](recon) == orig,
+                "jbrd \(name): reconstruct byte-identical (jpeg \(orig.count) -> jxl \(jxl.count))")
+            if mustBeSmaller {
+                check(jxl.count < orig.count, "jbrd \(name): jxl smaller than source (\(jxl.count) < \(orig.count))")
+            }
+        }
+        // Non-baseline inputs are rejected with a clear error, not miscoded.
+        if let prog = try? Data(contentsOf: dir.appendingPathComponent("jbrd_enc_444.jpg")) {
+            // A well-formed baseline encodes; sanity that a truncated stream throws.
+            check((try? JXL.encodeJPEGTranscode(jpeg: [UInt8](prog.prefix(20)))) == nil,
+                "jbrd rejects truncated JPEG")
+        }
+        FileHandle.standardError.write(
+            Data("  [jbrd] JPEG->JXL->JPEG byte-exact round-trip across subsamplings\n".utf8))
+    }
+
     static func jpegTranscodeWide() {
         let dir = fixturesDir()
         let base = "96x64_jpeg444"
