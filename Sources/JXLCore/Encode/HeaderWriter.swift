@@ -2,9 +2,9 @@
 //
 // Codestream header writing (E0 of docs/encoder-design.md): the duals of
 // SizeHeader / ImageMetadata / CustomTransformData for the encoder's initial
-// subset — integer bit depths, RGB or grayscale, no extra channels, no
-// animation, enumerated sRGB, xyb_encoded=false (native-space lossless
-// Modular). Every field written here is read back by the decoder's own
+// subset — integer bit depths, RGB or grayscale, alpha extra channels, no
+// animation, enumerated sRGB, and either xyb_encoded=false (native-space
+// lossless Modular) or xyb_encoded=true (the lossy VarDCT path). Every field written here is read back by the decoder's own
 // parsers in-suite (write→read identity), which are themselves
 // oracle-validated against libjxl.
 
@@ -111,12 +111,15 @@ enum HeaderWriter {
     }
 
     /// ImageMetadata for the lossy (VarDCT) path: integer samples,
-    /// `xyb_encoded = true`, sRGB color encoding, no extra channels. 8-bit is
-    /// exactly the bundle's all-default shape (one bit); other depths are
+    /// `xyb_encoded = true`, sRGB color encoding, and `alphaChannels` alpha
+    /// extra channels. 8-bit with no ECs is exactly the bundle's all-default
+    /// shape (one bit); anything else is
     /// written explicitly — dual of `JXLImageMetadata.init(_:)`, whose
     /// all-default branch sets `xybEncoded = true`.
-    static func writeImageMetadataXYB(_ w: BitWriter, bitsPerSample: UInt32) {
-        if bitsPerSample == 8 {
+    static func writeImageMetadataXYB(
+        _ w: BitWriter, bitsPerSample: UInt32, alphaChannels: Int = 0
+    ) {
+        if bitsPerSample == 8 && alphaChannels == 0 {
             w.writeBool(true)  // all_default: 8-bit sRGB, xyb_encoded, no ECs
             return
         }
@@ -125,8 +128,13 @@ enum HeaderWriter {
         writeBitDepth(w, bitsPerSample: bitsPerSample, exponentBits: 0)
         w.writeBool(true)  // modular_16bit_buffers (integer samples)
         w.writeU32(
-            0, .value(0), .value(1), .bits(4, offset: 2),
+            UInt32(alphaChannels), .value(0), .value(1), .bits(4, offset: 2),
             .bits(12, offset: 1))  // num_extra_channels
+        // Alpha ECs at the color bit depth. In a VarDCT frame these are
+        // modular-coded, so alpha stays LOSSLESS while color is lossy.
+        for _ in 0..<alphaChannels {
+            writeExtraChannelInfo(w, bitsPerSample: bitsPerSample, exponentBits: 0)
+        }
         w.writeBool(true)  // xyb_encoded
         w.writeBool(true)  // ColorEncoding all_default = sRGB
         // (no tone_mapping: only present when extra_fields)
@@ -138,12 +146,14 @@ enum HeaderWriter {
     /// (default opsin — the all-default branch skips the OpsinInverseMatrix
     /// bundle entirely), byte alignment.
     static func writeCodestreamHeadersXYB(
-        _ w: BitWriter, width: UInt32, height: UInt32, bitsPerSample: UInt32
+        _ w: BitWriter, width: UInt32, height: UInt32, bitsPerSample: UInt32,
+        alphaChannels: Int = 0
     ) {
         w.write(0xFF, 8)
         w.write(0x0A, 8)
         writeSizeHeader(w, width: width, height: height)
-        writeImageMetadataXYB(w, bitsPerSample: bitsPerSample)
+        writeImageMetadataXYB(
+            w, bitsPerSample: bitsPerSample, alphaChannels: alphaChannels)
         writeCustomTransformData(w)
         w.alignToByte()
     }

@@ -1,11 +1,16 @@
 // VarDCTEncoder.swift
 //
-// E5a–E5e: the baseline lossy VarDCT encoder — valid, improving toward
+// E5a–E5g: the baseline lossy VarDCT encoder — valid, improving toward
 // competitive. One regular XYB VarDCT frame, VARIABLE-SIZE AC transforms
-// (DCT8 + DCT16, E5e), an ADAPTIVE per-block quant field (E5b), a
-// per-color-tile CHROMA-FROM-LUMA search (E5c), RATE-DISTORTION coefficient
-// quantization (E5d), default dequant tables / block context map, loop
-// filters off, single pass, 4:4:4, no extra channels.
+// (DCT8 + DCT16, E5e) chosen by a frame-level race (E5f), an ADAPTIVE
+// per-block quant field (E5b), a per-color-tile CHROMA-FROM-LUMA search
+// (E5c), RATE-DISTORTION coefficient quantization (E5d), default dequant
+// tables / block context map, loop filters off, single pass, 4:4:4.
+//
+// EXTRA CHANNELS (E5g) are supported and are LOSSLESS: the format codes them
+// as a modular image inside the VarDCT frame, sharing the DC/metadata global
+// tree and ANS code, so alpha round-trips byte-exactly while color is lossy.
+// See the EC section in encodeLossyPass for the group-split rule.
 //
 // Per AC group the coefficient walk is FOUR passes (see the group loop):
 //   1a. forward DCT8 of every block + its adaptive quant value;
@@ -530,12 +535,15 @@ enum VarDCTEncoder {
     /// DCT16 encode chose no DCT16 blocks at all (then the two are identical
     /// by construction).
     static func encodeLossy(_ image: JXLDecodedImage, quality: Int = 90) throws -> [UInt8] {
-        let withDCT16 = try encodeLossyPass(image, quality: quality, allowDCT16: true)
-        guard kEncDCT16Enabled, withDCT16.usedDCT16 else { return withDCT16.bytes }
-        let plainDCT8 = try encodeLossyPass(image, quality: quality, allowDCT16: false)
-
-        // Score both on what was actually produced: true SSE against the
-        // source (decoded through our own decoder) plus lambda * bytes.
+        // Score any candidate on what was actually produced: true SSE against
+        // the source (decoded through our own decoder) plus lambda * bytes.
+        //
+        // Decoding rather than modelling is what makes E5h possible at all.
+        // Gaborish and EPF happen at the very end of reconstruction, so a
+        // modelled score would have to simulate both — including EPF's
+        // nonlinear, quant-field-driven behaviour — and any drift between that
+        // simulation and the real filters would silently corrupt the decision.
+        // Decoding our own output measures the truth by construction.
         func rdScore(_ bytes: [UInt8]) -> Double? {
             guard let dec = try? JXL.decodeImage(from: bytes),
                 dec.width == image.width, dec.height == image.height,
@@ -558,20 +566,59 @@ enum VarDCTEncoder {
             let step = Double(1 << 16) / Double(params.globalScale)
             return sse + kEncFrameRaceLambda * step * step * Double(bytes.count)
         }
-        guard let s16 = rdScore(withDCT16.bytes), let s8 = rdScore(plainDCT8.bytes) else {
-            return withDCT16.bytes  // decode failure: keep the primary path
+
+        // The race is a LADDER, not a cross product: each axis is settled
+        // against the current best rather than every combination being encoded,
+        // which keeps the worst case at three encodes instead of four+ while
+        // still letting either axis flip the outcome.
+        //
+        // Axis 1 (E5h): restoration filters. Raced first because it changes
+        // what the coefficients should even represent (Gaborish compensation
+        // pre-sharpens the input), so the DCT16 decision is better made on the
+        // filter setting we are actually keeping.
+        var best = try encodeLossyPass(
+            image, quality: quality, allowDCT16: true, filters: kEncDefaultFilters)
+        var bestScore = rdScore(best.bytes)
+        if kEncFilterRaceEnabled, kEncDefaultFilters != .off {
+            let unfiltered = try encodeLossyPass(
+                image, quality: quality, allowDCT16: true, filters: .off)
+            if let a = bestScore, let b = rdScore(unfiltered.bytes), b < a {
+                best = unfiltered
+                bestScore = b
+            } else if bestScore == nil {
+                // Filtered candidate failed to decode: fall back rather than
+                // ship something we could not verify.
+                best = unfiltered
+                bestScore = rdScore(unfiltered.bytes)
+            }
         }
-        return s8 < s16 ? plainDCT8.bytes : withDCT16.bytes
+        let bestFilters = best.usedFilters
+
+        // Axis 2 (E5f): DCT16 vs all-DCT8, on the winning filter setting. Only
+        // worth an encode when some cell actually chose DCT16 — otherwise the
+        // two candidates are identical by construction.
+        guard kEncDCT16Enabled, best.usedDCT16 else { return best.bytes }
+        let plainDCT8 = try encodeLossyPass(
+            image, quality: quality, allowDCT16: false, filters: bestFilters)
+        guard let s16 = bestScore, let s8 = rdScore(plainDCT8.bytes) else {
+            return best.bytes  // decode failure: keep the primary path
+        }
+        return s8 < s16 ? plainDCT8.bytes : best.bytes
     }
 
     private static func encodeLossyPass(
-        _ image: JXLDecodedImage, quality: Int, allowDCT16: Bool
-    ) throws -> (bytes: [UInt8], usedDCT16: Bool) {
+        _ image: JXLDecodedImage, quality: Int, allowDCT16: Bool,
+        filters: EncFilterConfig = .off
+    ) throws -> (bytes: [UInt8], usedDCT16: Bool, usedFilters: EncFilterConfig) {
         guard !image.isFloat else {
             throw JXLEncodeError(reason: "lossy encode supports integer samples only")
         }
-        guard image.extraChannels == 0 else {
-            throw JXLEncodeError(reason: "lossy encode does not support extra channels yet")
+        // Extra channels are modular-coded inside a VarDCT frame, so alpha
+        // rides along LOSSLESS while the color planes are lossy. Float ECs are
+        // rejected because the decoder rejects them too
+        // (decodeExtraChannelGlobal).
+        guard image.planes.count == image.colorChannels + image.extraChannels else {
+            throw JXLEncodeError(reason: "plane count must be colorChannels + extraChannels")
         }
         guard image.colorChannels == 1 || image.colorChannels == 3 else {
             throw JXLEncodeError(reason: "lossy encode supports 1 or 3 color channels")
@@ -583,10 +630,8 @@ enum VarDCTEncoder {
             throw JXLEncodeError(reason: "empty image")
         }
         let planeSize = image.width * image.height
-        guard image.planes.count == image.colorChannels,
-            image.planes.allSatisfy({ $0.count == planeSize })
-        else {
-            throw JXLEncodeError(reason: "plane count/size mismatch")
+        guard image.planes.allSatisfy({ $0.count == planeSize }) else {
+            throw JXLEncodeError(reason: "plane size mismatch")
         }
         let maxSample = Int32((1 << image.bitsPerSample) - 1)
         for p in image.planes {
@@ -637,6 +682,36 @@ enum VarDCTEncoder {
                     planeX[dst + x] = planeX[dst + w - 1]
                     planeY[dst + x] = planeY[dst + w - 1]
                     planeB[dst + x] = planeB[dst + w - 1]
+                }
+            }
+            // E5h: when the frame asks the decoder to run Gaborish, the
+            // coefficients must describe a PRE-SHARPENED image, so that the
+            // decoder's blur lands back on the source instead of shipping a
+            // blurred one. Done on the visible rect with the padded stride,
+            // matching the rect and mirror rule the decoder filters over; the
+            // padding below is (re)built afterwards because sharpening moves
+            // edge pixels.
+            //
+            // EPF gets no compensation: it is edge-preserving and
+            // quant-field-driven, i.e. nonlinear with no useful inverse. Its
+            // value is removing ringing, and whether that pays is settled by
+            // the frame race on measured output rather than modelled here.
+            if filters.gaborish {
+                // The header is written with gab_custom = false, so all three
+                // planes use the shared defaults the decoder will read back.
+                let g1 = kGaborishDefaultWeight1
+                let g2 = kGaborishDefaultWeight2
+                encGaborishInverse(&planeX, w: w, h: h, stride: pw, weight1: g1, weight2: g2)
+                encGaborishInverse(&planeY, w: w, h: h, stride: pw, weight1: g1, weight2: g2)
+                encGaborishInverse(&planeB, w: w, h: h, stride: pw, weight1: g1, weight2: g2)
+                // Re-replicate the right edge, now that column w-1 changed.
+                for y in 0..<h {
+                    let dst = y * pw
+                    for x in w..<pw {
+                        planeX[dst + x] = planeX[dst + w - 1]
+                        planeY[dst + x] = planeY[dst + w - 1]
+                        planeB[dst + x] = planeB[dst + w - 1]
+                    }
                 }
             }
             // Pad bottom edge.
@@ -1194,10 +1269,61 @@ enum VarDCTEncoder {
             metaTokens.append(mt)
         }
 
+        // ---- Extra channels (E5g). In a VarDCT frame the ECs are a MODULAR
+        // image carried in the same streams as the DC/metadata data and coded
+        // with the same global tree — so alpha is lossless while color is
+        // lossy. Geometry mirrors decodeExtraChannelGlobal: ec_upsampling 1
+        // and color upsampling 1 give shift 0 and full-frame dimensions.
+        // Split mirrors modularDecode's maxChanSize == groupDim: channels no
+        // larger than group_dim ride in the LfGlobal stream, bigger ones are
+        // split across the AC-group sections (the same rects
+        // decodeModularGroupImage computes, tile = groupDim).
+        let ecCount = image.extraChannels
+        let ecGlobalFits = ecCount > 0 && w <= dim.groupDim && h <= dim.groupDim
+        var ecGlobalTokens: [EncToken] = []
+        var ecGroupTokens = [[EncToken]](repeating: [], count: dim.numGroups)
+        if ecCount > 0 {
+            let ecPlanes = (0..<ecCount).map { image.planes[image.colorChannels + $0] }
+            if ecGlobalFits {
+                for (chan, plane) in ecPlanes.enumerated() {
+                    plane.withUnsafeBufferPointer { buf in
+                        tokenizeChannelWithTree(
+                            into: &ecGlobalTokens, plane: buf, width: w,
+                            x0: 0, y0: 0, gw: w, gh: h,
+                            chan: chan, streamID: 0, tree: tree)
+                    }
+                }
+            } else {
+                for g in 0..<dim.numGroups {
+                    let gx0 = (g % dim.xsizeGroups) * dim.groupDim
+                    let gy0 = (g / dim.xsizeGroups) * dim.groupDim
+                    let gw = min(dim.groupDim, w - gx0)
+                    let gh = min(dim.groupDim, h - gy0)
+                    guard gw > 0, gh > 0 else { continue }
+                    // ecStreamID(g, 0) = 1 + 3*numDCGroups + 17 + g
+                    let sid = 1 + 3 * dim.numDCGroups + 17 + g
+                    for (chan, plane) in ecPlanes.enumerated() {
+                        plane.withUnsafeBufferPointer { buf in
+                            tokenizeChannelWithTree(
+                                into: &ecGroupTokens[g], plane: buf, width: w,
+                                x0: gx0, y0: gy0, gw: gw, gh: gh,
+                                chan: chan, streamID: sid, tree: tree)
+                        }
+                    }
+                }
+            }
+        }
+
         // ---- Entropy back-ends: the shared modular machinery for the global
         // tree + DC/metadata residuals; the local AC coder for coefficients.
+        // The EC streams are appended only when there are extra channels, so an
+        // ordinary lossy encode builds the exact same coder it always did (the
+        // size goldens are the gate on that).
         let residual = ANSEntropyEncoder(
-            numContexts: treeNumLeaves(tree), streams: dcTokens + metaTokens)
+            numContexts: treeNumLeaves(tree),
+            streams: ecCount > 0
+                ? dcTokens + metaTokens + [ecGlobalTokens] + ecGroupTokens
+                : dcTokens + metaTokens)
         let acCoder = ACEntropyCoder(numContexts: kNumACContexts, streams: acTokens)
 
         // ---- Section writers (bit-exact duals listed in the file header).
@@ -1221,6 +1347,17 @@ enum VarDCTEncoder {
             tEnc.writeHeader(s)
             tEnc.encodeStream(s, tTokens)
             residual.writeHeader(s)
+            // decodeExtraChannelGlobal reads the EC modular image here, right
+            // after the histograms. modularDecode always consumes a
+            // GroupHeader; the channel data itself is present only for
+            // channels <= group_dim (numChans > 0), so a large-EC frame writes
+            // the header and leaves the samples to the AC groups.
+            if ecCount > 0 {
+                s.writeBool(true)  // use_global_tree
+                s.writeBool(true)  // wp_header: all_default
+                s.write(0, 2)  // nb_transforms = 0
+                if ecGlobalFits { residual.encodeStream(s, ecGlobalTokens) }
+            }
         }
         func writeDCGroup(_ s: BitWriter, _ dcg: Int) {
             // decodeVarDCTDC: extra_precision, then a modular sub-stream
@@ -1259,6 +1396,15 @@ enum VarDCTEncoder {
             // decodeACGroupPass: numHistograms == 1 => no selector bits; the
             // group's token stream under one fresh ANS state.
             acCoder.encodeStream(s, acTokens[g])
+            // Then this group's slice of the EC modular image, which
+            // decodeACGroupPass reads from the same reader (only for channels
+            // bigger than group_dim — smaller ones already rode in LfGlobal).
+            if ecCount > 0 && !ecGlobalFits {
+                s.writeBool(true)  // use_global_tree
+                s.writeBool(true)  // wp_header: all_default
+                s.write(0, 2)  // nb_transforms = 0
+                residual.encodeStream(s, ecGroupTokens[g])
+            }
         }
 
         // ---- Assembly: headers, frame header, TOC, sections (the modular
@@ -1266,8 +1412,9 @@ enum VarDCTEncoder {
         let head = BitWriter()
         HeaderWriter.writeCodestreamHeadersXYB(
             head, width: UInt32(w), height: UInt32(h),
-            bitsPerSample: UInt32(image.bitsPerSample))
-        writeFrameHeader(head)
+            bitsPerSample: UInt32(image.bitsPerSample),
+            alphaChannels: image.extraChannels)
+        writeFrameHeader(head, numExtraChannels: image.extraChannels, filters: filters)
 
         if dim.numGroups == 1 {
             // Coalesced: every stage concatenates into section 0, read
@@ -1283,7 +1430,7 @@ enum VarDCTEncoder {
             writeTocSize(head, section.count)
             head.alignToByte()
             head.append(bytes: section)
-            return (head.finalize(), anyDCT16)
+            return (head.finalize(), anyDCT16, filters)
         }
 
         var sections: [[UInt8]] = []
@@ -1309,7 +1456,7 @@ enum VarDCTEncoder {
         for section in sections { writeTocSize(head, section.count) }
         head.alignToByte()
         for section in sections { head.append(bytes: section) }
-        return (head.finalize(), anyDCT16)
+        return (head.finalize(), anyDCT16, filters)
     }
 
     /// FrameHeader for the E5a lossy shape — dual of `FrameHeader.init` with
@@ -1317,27 +1464,70 @@ enum VarDCTEncoder {
     /// kSkipAdaptiveDCSmoothing, no upsampling, default QM scales, single
     /// pass, full canvas, replace blending, last frame, no name, loop
     /// filters off.
-    private static func writeFrameHeader(_ w: BitWriter) {
+    /// Which restoration filters the frame asks the decoder to run (E5h). The
+    /// encoder races these against each other on measured output, so both a
+    /// filtered and an unfiltered candidate must be expressible.
+    struct EncFilterConfig: Equatable {
+        let gaborish: Bool
+        let epfIters: UInt32
+
+        /// Filters disabled — every frame the encoder wrote before E5h.
+        static let off = EncFilterConfig(gaborish: false, epfIters: 0)
+        /// libjxl's own defaults, and the bundle's all_default shape.
+        static let defaultOn = EncFilterConfig(gaborish: true, epfIters: 2)
+        /// Gaborish alone: useful because it is the half of the pair the
+        /// encoder can compensate for exactly.
+        static let gaborishOnly = EncFilterConfig(gaborish: true, epfIters: 0)
+    }
+
+    private static func writeFrameHeader(
+        _ w: BitWriter, numExtraChannels: Int = 0, filters: EncFilterConfig = .off
+    ) {
         w.writeBool(false)  // all_default
         w.write(0, 2)  // frame_type: regular (U32 Val selector)
         w.writeBool(false)  // encoding: VarDCT
         w.writeU64(128)  // flags: kSkipAdaptiveDCSmoothing
         // (xyb_encoded => color transform is XYB, nothing serialized)
         w.write(0, 2)  // upsampling = 1 (U32 Val selector)
-        // (no extra channels => no ec_upsampling)
+        for _ in 0..<numExtraChannels {
+            w.write(0, 2)  // ec_upsampling = 1 (U32 Val selector)
+        }
         // (VarDCT => no group_size_shift; group_size_shift stays default 1)
         w.write(2, 3)  // x_qm_scale = 2 (xDmMul == 1)
         w.write(2, 3)  // b_qm_scale = 2 (bDmMul == 1)
         w.write(0, 2)  // num_passes = 1 (U32 Val selector)
         w.writeBool(false)  // custom_size_or_origin
         w.write(0, 2)  // blending mode: replace (U32 Val selector)
+        // Then one ec_blending_info per extra channel (parseBlendingInfo is
+        // called numExtraChannels extra times). Mode 0 (replace) on a non-
+        // partial frame serializes nothing beyond the selector: no
+        // alpha_channel/clamp (those need a blend mode involving alpha, or
+        // kMul) and no source.
+        for _ in 0..<numExtraChannels {
+            w.write(0, 2)  // ec blending mode: replace
+        }
         w.writeBool(true)  // is_last
         // (is_last => no save_as_reference; not referenceable => no save_before)
         w.write(0, 2)  // name length = 0 (U32 Val selector)
-        w.writeBool(false)  // loop filter: not all_default
-        w.writeBool(false)  // gaborish off
-        w.write(0, 2)  // epf_iters = 0
-        w.writeU64(0)  // loop-filter extensions
+        // Loop filter. The bundle's all_default shape is exactly libjxl's
+        // default (gaborish ON, epf_iters 2), so that combination costs a
+        // single bit; anything else is written explicitly.
+        if filters == .defaultOn {
+            w.writeBool(true)  // loop filter all_default: gab on, epf_iters 2
+        } else {
+            w.writeBool(false)  // not all_default
+            w.writeBool(filters.gaborish)
+            // (gaborish on => gab_custom bit; we always use the default
+            // weights, so it stays false)
+            if filters.gaborish { w.writeBool(false) }
+            w.write(UInt64(filters.epfIters), 2)
+            if filters.epfIters > 0 {
+                w.writeBool(false)  // epf_sharp_custom (non-modular)
+                w.writeBool(false)  // epf_weight_custom
+                w.writeBool(false)  // epf_sigma_custom
+            }
+            w.writeU64(0)  // loop-filter extensions
+        }
         w.writeU64(0)  // frame-header extensions
     }
 
@@ -1351,13 +1541,20 @@ enum VarDCTEncoder {
 
 extension JXL {
     /// Encodes integer pixel planes as a lossy (XYB VarDCT) bare-codestream
-    /// JXL: 8/16-bit integer samples, 1 (replicated to RGB) or 3 color
-    /// channels, no extra channels. `quality` 1…100 (default 90) maps to a
-    /// uniform quantization step scale — see `VarDCTEncoder.quantParams`.
-    /// The output decodes with this decoder and djxl. Current shape (E5a–E5e):
-    /// DCT8 + DCT16 variable-size transforms chosen per aligned 2x2 block cell
-    /// by rate-distortion, a per-block adaptive AC quant field, a per-color-
-    /// tile chroma-from-luma search, and RD coefficient quantization.
+    /// JXL: 1…16-bit integer samples, 1 (replicated to RGB) or 3 color
+    /// channels, and any number of integer extra channels. `quality` 1…100
+    /// (default 90) maps to a uniform quantization step scale — see
+    /// `VarDCTEncoder.quantParams`. The output decodes with this decoder and
+    /// djxl. Current shape (E5a–E5g): DCT8 + DCT16 variable-size transforms
+    /// chosen per aligned 2x2 block cell by rate-distortion, a per-block
+    /// adaptive AC quant field, a per-color-tile chroma-from-luma search, RD
+    /// coefficient quantization, and a frame-level DCT8-vs-DCT16 race.
+    ///
+    /// Extra channels (alpha) are carried as a MODULAR image inside the VarDCT
+    /// frame — the format gives them no lossy coding path — so **alpha is
+    /// lossless while the color planes are lossy**. Float samples are still
+    /// rejected, matching the decoder, which rejects float extra channels in a
+    /// VarDCT frame outright.
     public static func encodeLossy(image: JXLDecodedImage, quality: Int = 90) throws -> [UInt8] {
         try VarDCTEncoder.encodeLossy(image, quality: quality)
     }

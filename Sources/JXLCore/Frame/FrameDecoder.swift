@@ -302,6 +302,8 @@ final class FrameDecoder {
             frameType: frameHeader.frameType,
             flags: frameHeader.flags,
             isLast: frameHeader.isLast,
+            loopFilterGab: frameHeader.loopFilterGab,
+            loopFilterEpfIters: frameHeader.loopFilterEpfIters,
             numGroups: dim.numGroups,
             numDCGroups: dim.numDCGroups,
             numPasses: Int(frameHeader.numPasses),

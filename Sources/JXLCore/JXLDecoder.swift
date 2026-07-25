@@ -60,6 +60,11 @@ public struct JXLFrameInfo: Sendable {
     public let frameType: FrameType
     public let flags: UInt64
     public let isLast: Bool
+    /// Restoration filters the frame requests. Exposed so encoder tests can
+    /// assert the loop-filter header says what the encoder intended — a
+    /// quality check alone would not catch filters silently not being written.
+    public let loopFilterGab: Bool
+    public let loopFilterEpfIters: UInt32
     public let numGroups: Int
     public let numDCGroups: Int
     public let numPasses: Int

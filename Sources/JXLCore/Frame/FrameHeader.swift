@@ -116,12 +116,12 @@ public struct FrameHeader: Sendable {
     public var loopFilterEpfIters: UInt32 = 2
     /// Uniform EPF sigma for Modular frames (libjxl `epf_sigma_for_modular`).
     public var loopFilterEpfSigmaForModular: Float = 1.0
-    public var gabXWeight1: Float = 1.1 * 0.104699568
-    public var gabXWeight2: Float = 1.1 * 0.055680538
-    public var gabYWeight1: Float = 1.1 * 0.104699568
-    public var gabYWeight2: Float = 1.1 * 0.055680538
-    public var gabBWeight1: Float = 1.1 * 0.104699568
-    public var gabBWeight2: Float = 1.1 * 0.055680538
+    public var gabXWeight1: Float = kGaborishDefaultWeight1
+    public var gabXWeight2: Float = kGaborishDefaultWeight2
+    public var gabYWeight1: Float = kGaborishDefaultWeight1
+    public var gabYWeight2: Float = kGaborishDefaultWeight2
+    public var gabBWeight1: Float = kGaborishDefaultWeight1
+    public var gabBWeight2: Float = kGaborishDefaultWeight2
 
     public var isModular: Bool { encoding == .modular }
 

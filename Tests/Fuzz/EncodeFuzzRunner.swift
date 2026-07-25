@@ -121,6 +121,37 @@ func runCase(seed: UInt64) -> String? {
         for c in 0..<img.planes.count where dec.planes[c] != img.planes[c] {
             return "\(what): plane \(c) mismatch"
         }
+        // Lossy arm (E5g). Same random geometry, which is the point: extra
+        // channels in a VarDCT frame are modular-coded and split by
+        // modularDecode's `maxChanSize == groupDim` rule, so random dimensions
+        // sweep both the LfGlobal-only layout and the per-AC-group one. The
+        // color planes are lossy and can only be checked for geometry, but the
+        // extra channels must come back BYTE-EXACT.
+        // Restricted to 8/16-bit because any other declared depth is rescaled
+        // to the output format on decode, which would make the byte-exact
+        // comparison below meaningless rather than wrong.
+        if !img.isFloat, img.bitsPerSample == 8 || img.bitsPerSample == 16,
+            img.colorChannels == 1 || img.colorChannels == 3 {
+            let quality = [30, 70, 90][Int(rng.below(3))]
+            let lossyWhat = "\(what) lossy q\(quality)"
+            do {
+                let lossy = try JXL.encodeLossy(image: img, quality: quality)
+                let ldec = try JXL.decodeImage(
+                    from: lossy, format: img.bitsPerSample > 8 ? .uint16 : .uint8)
+                guard ldec.width == img.width, ldec.height == img.height,
+                    ldec.extraChannels == img.extraChannels
+                else { return "\(lossyWhat): geometry mismatch" }
+                for e in 0..<img.extraChannels {
+                    let want = img.planes[img.colorChannels + e]
+                    let got = ldec.planes[ldec.colorChannels + e]
+                    if got != want { return "\(lossyWhat): extra channel \(e) not byte-exact" }
+                }
+            } catch let e as JXLEncodeError {
+                return "\(lossyWhat): unexpected rejection: \(e)"
+            } catch {
+                return "\(lossyWhat): decode threw: \(error)"
+            }
+        }
         return nil
     } catch let e as JXLEncodeError {
         // Clean rejections are fine only for inputs we document as

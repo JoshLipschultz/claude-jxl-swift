@@ -39,7 +39,18 @@ private func adjustQuantBias(_ q: Int32, _ bias: Float, _ numerator: Float) -> F
 /// the edge (N/S/E/W) weight, `weight2` the corner weight; the center is 1,
 /// then all are normalized to sum to 1. Output rows depend only on the input
 /// snapshot, so rows run concurrently.
-private func gaborish(_ p: inout [Float], w: Int, h: Int, stride: Int, weight1: Float, weight2: Float) {
+/// Default Gaborish side and corner weights (libjxl `LoopFilter` defaults).
+/// Declared once and referenced by both `FrameHeader`'s property defaults and
+/// the encoder's compensation, so the filter the encoder inverts can never
+/// drift from the filter the decoder applies.
+let kGaborishDefaultWeight1: Float = 1.1 * 0.104699568
+let kGaborishDefaultWeight2: Float = 1.1 * 0.055680538
+
+/// Internal rather than private so the ENCODER's Gaborish compensation
+/// (GaborishCompensation.swift) can invert this exact operator. Deriving the
+/// pre-sharpening from a separately-written kernel would risk inverting a
+/// filter subtly different from the one the decoder applies.
+func gaborish(_ p: inout [Float], w: Int, h: Int, stride: Int, weight1: Float, weight2: Float) {
     let div = 1.0 + 4.0 * (weight1 + weight2)
     let c0 = 1.0 / div
     let c1 = weight1 / div

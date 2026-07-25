@@ -3328,14 +3328,188 @@ struct TestRunner {
             check(false, "gray lossy encode: \(error)")
         }
 
-        // Documented rejections: alpha and float inputs are E5a non-goals.
+        // E5g: extra channels in a lossy frame. ECs are a MODULAR image inside
+        // the VarDCT frame, so alpha is LOSSLESS while the color planes are
+        // lossy — "alpha byte-exact" is the gate, not a PSNR bound. Both
+        // layouts are covered, because they are different code paths in
+        // modularDecode's `maxChanSize == groupDim` split:
+        //   <= 256 px  ->  the whole EC image rides in the LfGlobal stream
+        //   >  256 px  ->  LfGlobal carries only the GroupHeader and the
+        //                  samples are split across the AC-group sections
+        // The 288x272 case is deliberately just over group_dim in BOTH axes so
+        // the group split is 2x2 rather than a single strip.
+        for (w, h, nec) in [(64, 48, 1), (255, 256, 1), (288, 272, 1), (300, 200, 2)] {
+            do {
+                let n = w * h
+                var planes: [[Int32]] = (0..<3).map { c in
+                    (0..<n).map { i in
+                        let x = i % w
+                        let y = i / w
+                        // Clamped into [0, 255]: the encoder rejects
+                        // out-of-range samples, and the raw sinusoid sum dips
+                        // to -70 once the arguments span enough of a period.
+                        let v =
+                            128.0 + 60.0 * sin(Double(x) * 0.02 + Double(c))
+                            + 40.0 * cos(Double(y) * 0.03)
+                        return Int32(Swift.max(0, Swift.min(255, v)))
+                    }
+                }
+                // Alpha with hard edges and a flat run: content a lossy path
+                // would visibly damage, so an exact match is a real signal.
+                for e in 0..<nec {
+                    planes.append(
+                        (0..<n).map { i in
+                            let x = i % w
+                            let y = i / w
+                            if x < w / 4 { return 255 }
+                            if y > 3 * h / 4 { return 0 }
+                            return Int32((x * 7 + y * 13 + e * 61) & 255)
+                        })
+                }
+                let img = JXLDecodedImage(
+                    width: w, height: h, colorChannels: 3, extraChannels: nec,
+                    bitsPerSample: 8, isFloat: false, planes: planes, iccProfile: nil)
+                let jxl = try JXL.encodeLossy(image: img)
+                let dec = try JXL.decodeImage(from: jxl)
+                eq(dec.width, w, "\(w)x\(h)+\(nec)ec lossy width")
+                eq(dec.extraChannels, nec, "\(w)x\(h)+\(nec)ec extra-channel count")
+                eq(dec.planes.count, 3 + nec, "\(w)x\(h)+\(nec)ec plane count")
+                for e in 0..<nec {
+                    check(
+                        dec.planes[3 + e] == planes[3 + e],
+                        "\(w)x\(h)+\(nec)ec extra channel \(e) is byte-exact (lossless in a lossy frame)")
+                }
+                let psnr = planePSNR(Array(dec.planes[0..<3]), Array(planes[0..<3]), maxVal: 255)
+                check(psnr > 33, "\(w)x\(h)+\(nec)ec color PSNR (got \(psnr))")
+                // The color planes must actually be lossy — an exact match here
+                // would mean the alpha check above proves nothing.
+                check(
+                    dec.planes[0] != planes[0], "\(w)x\(h)+\(nec)ec color is lossy (not a copy)")
+            } catch {
+                check(false, "\(w)x\(h)+\(nec)ec lossy encode: \(error)")
+            }
+        }
+
+        // 16-bit alpha: the EC bit depth follows the image bit depth.
+        do {
+            let w = 96
+            let h = 64
+            let n = w * h
+            var planes: [[Int32]] = (0..<3).map { c in
+                (0..<n).map { Int32(20000 + (($0 * 13 + c * 997) % 40000)) }
+            }
+            planes.append((0..<n).map { Int32(($0 * 29) & 65535) })
+            let img = JXLDecodedImage(
+                width: w, height: h, colorChannels: 3, extraChannels: 1, bitsPerSample: 16,
+                isFloat: false, planes: planes, iccProfile: nil)
+            let dec = try JXL.decodeImage(from: try JXL.encodeLossy(image: img), format: .uint16)
+            eq(dec.bitsPerSample, 16, "16-bit alpha lossy output depth")
+            check(dec.planes[3] == planes[3], "16-bit extra channel byte-exact")
+        } catch {
+            check(false, "16-bit alpha lossy encode: \(error)")
+        }
+
+        // E5h: Gaborish compensation. The gate is the RESIDUAL of the actual
+        // inversion — re-blur the compensated planes with the decoder's own
+        // gaborish and measure how far that lands from the source. This is
+        // deliberately not a comparison against hardcoded kernel constants:
+        // it verifies the property we actually need (that the decoder's blur
+        // undoes our sharpening) against the operator that will really run.
+        do {
+            let w = 96
+            let h = 72
+            let stride = 104  // padded stride, as the encoder uses
+            var src = [Float](repeating: 0, count: stride * h)
+            for y in 0..<h {
+                for x in 0..<w {
+                    // Include a hard edge and a high-frequency region: the
+                    // places an approximate inverse is worst.
+                    let e: Float = x < w / 3 ? 0.9 : -0.4
+                    let f = 0.25 * sin(Float(x) * 1.7) * cos(Float(y) * 1.3)
+                    src[y * stride + x] = e + f
+                }
+            }
+            let g1 = kGaborishDefaultWeight1
+            let g2 = kGaborishDefaultWeight2
+            // Uncompensated, the decoder's blur is visibly off the source —
+            // this is the baseline the compensation has to beat.
+            let plain = encGaborishResidual(
+                source: src, compensated: src, w: w, h: h, stride: stride,
+                weight1: g1, weight2: g2)
+            var comp = src
+            encGaborishInverse(
+                &comp, w: w, h: h, stride: stride, weight1: g1, weight2: g2)
+            let residual = encGaborishResidual(
+                source: src, compensated: comp, w: w, h: h, stride: stride,
+                weight1: g1, weight2: g2)
+            check(
+                residual < plain / 30,
+                "gaborish compensation cuts the residual >30x (plain \(plain), compensated \(residual))")
+            // Absolute bound. XYB samples here are order 1, so 0.01 is ~1% of
+            // the step this content contains. The bound is set from what the
+            // iteration actually achieves on a HARD EDGE, which is its slowest
+            // case: three steps reached only 0.0225, which is what drove
+            // kEncGaborishInverseIterations up to five.
+            check(
+                residual < 0.01,
+                "gaborish compensation residual below 0.01 (got \(residual))")
+        }
+
+        // E5h: filters actually reach the bitstream, and the race is honest.
+        // Encoding the same source with the race enabled must produce a frame
+        // whose loop-filter header is one of the raced configurations, and it
+        // must decode cleanly either way.
+        do {
+            let w = 128
+            let h = 96
+            let n = w * h
+            let planes = (0..<3).map { c in
+                (0..<n).map { i -> Int32 in
+                    let x = i % w
+                    let y = i / w
+                    let v =
+                        128.0 + 70.0 * sin(Double(x) * 0.05 + Double(c) * 0.7)
+                        + 40.0 * cos(Double(y) * 0.04)
+                    return Int32(Swift.max(0, Swift.min(255, v)))
+                }
+            }
+            let img = JXLDecodedImage(
+                width: w, height: h, colorChannels: 3, extraChannels: 0, bitsPerSample: 8,
+                isFloat: false, planes: planes, iccProfile: nil)
+            var psnrByQuality: [Double] = []
+            for q in [30, 70, 90] {
+                let jxl = try JXL.encodeLossy(image: img, quality: q)
+                let info = try JXL.readFrameInfo(from: Data(jxl))
+                // Whichever branch the race picked, the header must describe a
+                // configuration we actually emit — never a half-written one.
+                // EPF is inert for this encoder (zero sharpness field skips
+                // every block), so the raced configurations are filters-off and
+                // Gaborish-only — never epf_iters > 0.
+                let filtersOff = !info.loopFilterGab && info.loopFilterEpfIters == 0
+                let gaborishOnly = info.loopFilterGab && info.loopFilterEpfIters == 0
+                check(
+                    filtersOff || gaborishOnly,
+                    "q\(q) loop-filter header is a raced config (gab \(info.loopFilterGab), epf \(info.loopFilterEpfIters))")
+                let dec = try JXL.decodeImage(from: jxl)
+                let psnr = planePSNR(Array(dec.planes[0..<3]), planes, maxVal: 255)
+                psnrByQuality.append(psnr)
+                // A loose floor only. The race optimizes SSE + lambda*bytes, NOT
+                // PSNR, so it may legitimately keep a smaller file at lower
+                // PSNR; q30 measures ~23 dB across content here, so an
+                // aspirational bound would just be wrong. The meaningful
+                // property is monotonicity, asserted below.
+                check(psnr > 18, "q\(q) filter-race round-trip PSNR floor (got \(psnr))")
+            }
+            check(
+                psnrByQuality == psnrByQuality.sorted(),
+                "filter race keeps PSNR monotonic in quality (got \(psnrByQuality))")
+        } catch {
+            check(false, "filter race encode: \(error)")
+        }
+
+        // Documented rejection: float input is still an E5a non-goal.
         do {
             let one = [Int32](repeating: 128, count: 16)
-            let withAlpha = JXLDecodedImage(
-                width: 4, height: 4, colorChannels: 3, extraChannels: 1, bitsPerSample: 8,
-                isFloat: false, planes: [one, one, one, one], iccProfile: nil)
-            check(
-                (try? JXL.encodeLossy(image: withAlpha)) == nil, "lossy rejects alpha")
             let floatImg = JXLDecodedImage(
                 width: 4, height: 4, colorChannels: 3, extraChannels: 0, bitsPerSample: 32,
                 isFloat: true, planes: [one, one, one], iccProfile: nil)

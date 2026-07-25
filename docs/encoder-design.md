@@ -304,9 +304,84 @@ every milestone lands with djxl round-trip proof, never just self-consistency.
       both axes so a smaller-but-worse candidate cannot win), which is the
       same "race the real encodings" pattern the lossless encoder uses for
       palette. The second encode is skipped when no cell chose DCT16.
-    - Remaining lossy quality levers (E5g+): further strategies (DCT32,
+    - **E5g** (2026-07-25): **alpha (extra channels) with lossy** — closes a
+      real gap, since `encodeLossy` previously rejected any image with extra
+      channels and alpha is common. The format gives extra channels no lossy
+      coding path in a VarDCT frame: they are a **modular** image carried in
+      the same streams as the DC/AC-metadata data and coded with the same
+      global tree and ANS code. So the honest description is **alpha is
+      lossless while the color planes are lossy**, and "alpha byte-exact" —
+      not a PSNR bound — is the gate.
+      The subtlety that decides correctness is the split rule. `modularDecode`
+      partitions on `maxChanSize == group_dim`: channels no larger than 256 px
+      decode entirely inside the LfGlobal stream, larger ones per AC group.
+      But `modularDecode` **always** consumes a `GroupHeader` first, and only
+      then returns early when no channel is small enough — so a large-EC frame
+      must still write that header in LfGlobal and leave only the samples to
+      the AC groups. Writing the header only in the small case desyncs every
+      image wider or taller than 256 px, i.e. essentially all real ones.
+      Two smaller mirrors, each of which alone corrupts the stream: the frame
+      header carries one `ec_blending_info` per extra channel after the color
+      one (omitting them mis-sizes the header and the TOC read fails), and the
+      per-group EC data uses **decoder-local** channel indices (property 0),
+      renumbered from `beginC` — the same trap that cost a bug in E3.
+      Verified: alpha byte-exact against the source on both layouts (160x120
+      and 96x64 16-bit global; 300x200 and 600x300 per-group, 2x1 and 3x2 group
+      grids), **and byte-exact through djxl's own decoder**, which is the real
+      proof that libjxl agrees the alpha is lossless. Color cross-oracle
+      113–131 dB. Alpha exactness is now also an invariant in the encode
+      fuzzer's new lossy arm, so random geometry keeps sweeping both layouts.
+      Note the cross-oracle for lossy+alpha must run on **float PFM**: djxl
+      0.12 blue-noise-dithers 8-bit output by default and we do not, which
+      floors 8-bit agreement near 54 dB and would look like a bug.
+      Known density limitation, deliberately not addressed here: the ECs share
+      the DC/metadata single-leaf gradient tree and its one histogram, so alpha
+      is coded with a context fitted to DC residuals. Cheap for typical
+      flat/edge alpha, but a learned tree (or a second context) is the lever if
+      alpha-heavy content ever matters.
+    - **E5h** (2026-07-25): **restoration filters with encoder
+      compensation** — every frame before this disabled both (gaborish off,
+      epf_iters 0) while cjxl enables both by default.
+      The work is the COMPENSATION, not the header bit. With `loop_filter_gab`
+      set the decoder blurs the reconstructed XYB planes, so flipping the flag
+      alone ships a blurred image; the coefficients must describe a
+      pre-sharpened P with `gaborish(P) ~= S`. libjxl hardcodes a 5x5 kernel
+      approximating that inverse — deliberately NOT transcribed here, because
+      those constants are unverifiable from first principles and would invert a
+      filter subtly different from ours if any weight drifted. Instead the
+      encoder inverts the decoder's OWN `gaborish` as a black box by Van
+      Cittert / Richardson iteration (`P += S - gaborish(P)`), which converges
+      because the filter is a mild near-identity blur. `gaborish` became
+      internal and the default weights moved to one shared constant referenced
+      by both FrameHeader and the compensation, so the two cannot drift.
+      RESULT — Gaborish is STRICTLY DOMINANT at low bitrate (smaller AND
+      higher PSNR), and the race declines it at high quality:
+        content   q    OFF                GAB(compensated)   race
+        photo     30   1446 / 22.63       1407 / 23.02       GAB
+        photo     50   3134 / 31.55       3108 / 31.98       GAB
+        photo     90   27264 / 39.94      35373 / 42.27      OFF
+        smooth    50    917 / 33.99        915 / 34.40       GAB
+        noise     90   128262 / 19.72     150323 / 22.45     GAB
+      The q90 photo size golden is UNCHANGED at 27264 because the race keeps
+      filters off there. Iteration count is 5, not the 3 first guessed: three
+      measured only an 11.8x residual improvement (0.265 -> 0.0225) across a
+      HARD EDGE, the slowest case for a deconvolution.
+      **NEGATIVE RESULT — EPF IS INERT for this encoder, so E5h ships Gaborish
+      only.** `epf_iters = 2` produced output PIXEL-IDENTICAL to Gaborish alone
+      in all 12 measured cases, and the mechanism is exact: `computeEPFSigma`
+      forms `sharp = epfSharpness/7`, and this encoder writes an ALL-ZERO
+      sharpness field, so `sigma -> min(-1e-4, 0)`, `invSigma -> -10000`, and
+      every block trips `rowSigma < kEpfMinSigma` and is skipped. Zero
+      sharpness means "maximally sharp, do not filter". Requesting EPF would
+      only cost header bits and make the decoder build a sigma field it never
+      reads. EPF becomes a real lever once the encoder emits a meaningful
+      per-block sharpness — that is the work, tracked separately.
+      COST: the filter race adds an encode+decode per frame (worst case three
+      of each, vs two before). Whether that stays is a measurement question,
+      and `JXL_FILTER_RACE=0` is the lever.
+    - Remaining lossy quality levers (E5i+): further strategies (DCT32,
       rectangular, AFV), real trellis/joint RD across the block,
-      Gaborish/EPF with encoder compensation, alpha-with-lossy. Note the
+      a real EPF sharpness field (above). Note the
       E5f finding generalizes: adding a strategy whose blocks use a distinct
       context bucket carries a frame-global histogram-fragmentation cost, so
       each new strategy likely wants the same race treatment rather than
