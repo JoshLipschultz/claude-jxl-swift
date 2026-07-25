@@ -267,7 +267,27 @@ every milestone lands with djxl round-trip proof, never just self-consistency.
       Pareto win (smaller AND higher PSNR) at q70 on the bench, while q90's
       absolute PSNR barely moves (quality ladder preserved). Only changes
       emitted coefficient values (all legal); no bitstream-structure change.
-    - Remaining lossy quality levers (E5e+): non-DCT8 AC strategies, real
+    - **E5e** (2026-07-25): DCT16x16 AC strategy, RD-selected per 2x2 cell —
+      the largest single quality jump of the series. Forward DCT16 plus the
+      LLF↔DC coupling (a DCT16 varblock's lowest 2x2 coefficients ARE the
+      DC-image samples of its four covered blocks, re-inserted by the
+      decoder's `insertLLF`; the encoder inverts that and excludes storage
+      positions {0,1,16,17} from the AC scan) and generalized AcMetadata
+      varblock placement. Photo fixture is strictly dominant — smaller AND
+      higher PSNR at every quality (q50 3134 B/31.55 dB vs 6627 B/29.05 dB;
+      q90 27264 B/39.94 dB vs 30847/37.64). Cross-oracle 122–130 dB.
+      **Known regression, kept deliberately:** on noise-heavy synthetic
+      content DCT16 loses at q70 (+23% size for +0.07 dB). A sweep of the
+      rate model's zero-token cost shrinks that monotonically but never
+      reaches the DCT8-only size while degrading photos — it is structural
+      (noise needs more coded coefficients under a 16x16 transform), so the
+      fix is a content-adaptive guard (E5f), not another global constant.
+      Rate-model lesson: counting only non-zeros is dishonest here — every
+      zero BEFORE the last non-zero costs a zero-density token, and a
+      256-coefficient scan pays that far more often than four 64-coefficient
+      scans; ignoring it made DCT16 lose ~35% at q70.
+    - Remaining lossy quality levers (E5f+): a content-adaptive strategy
+      guard (see above), further strategies (DCT32, rectangular, AFV), real
       trellis/joint RD across the block, Gaborish/EPF with encoder
       compensation, alpha-with-lossy.
 - **E6 (undecided) — jbrd**: JPEG recompression, byte-exact reconstruction.
