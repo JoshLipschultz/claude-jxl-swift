@@ -511,7 +511,62 @@ enum VarDCTEncoder {
     /// codestream. Grayscale is replicated into RGB before the color
     /// transform (the decoded image is 3-channel). Alpha/extra channels and
     /// float samples are E5a non-goals and rejected.
+    /// E5f: race the DCT16-enabled encode against an all-DCT8 one and keep
+    /// whichever is better in true rate-distortion terms.
+    ///
+    /// Per-cell criteria cannot decide this. Two sweeps (the rate model's
+    /// zero-token cost, and a scan-depth guard) both floored ~12% above the
+    /// all-DCT8 size on noise-dominated content, because DCT16 and DCT8 blocks
+    /// use different block-context buckets: ANY mixture fragments the ANS
+    /// histograms, a frame-global cost invisible to a per-cell model. So the
+    /// decision is made where the cost actually lives — per frame, on measured
+    /// output rather than a model — the same "race the real encodings" pattern
+    /// the lossless encoder uses for palette.
+    ///
+    /// Both candidates are decoded and scored as `distortion + lambda * bytes`
+    /// with lambda from the same quality knob, so a candidate that is merely
+    /// smaller-and-worse cannot win. The extra cost is one encode plus two
+    /// decodes; it is skipped entirely when DCT16 is disabled or when the
+    /// DCT16 encode chose no DCT16 blocks at all (then the two are identical
+    /// by construction).
     static func encodeLossy(_ image: JXLDecodedImage, quality: Int = 90) throws -> [UInt8] {
+        let withDCT16 = try encodeLossyPass(image, quality: quality, allowDCT16: true)
+        guard kEncDCT16Enabled, withDCT16.usedDCT16 else { return withDCT16.bytes }
+        let plainDCT8 = try encodeLossyPass(image, quality: quality, allowDCT16: false)
+
+        // Score both on what was actually produced: true SSE against the
+        // source (decoded through our own decoder) plus lambda * bytes.
+        func rdScore(_ bytes: [UInt8]) -> Double? {
+            guard let dec = try? JXL.decodeImage(from: bytes),
+                dec.width == image.width, dec.height == image.height,
+                dec.planes.count >= image.colorChannels
+            else { return nil }
+            var sse = 0.0
+            for c in 0..<image.colorChannels {
+                let a = image.planes[c]
+                let b = dec.planes[c]
+                guard a.count == b.count else { return nil }
+                for i in 0..<a.count {
+                    let d = Double(a[i]) - Double(b[i])
+                    sse += d * d
+                }
+            }
+            // lambda in SSE-per-byte: the same step-scale relationship the
+            // coefficient RD uses, so the frame decision and the per-cell
+            // decisions agree about what a byte is worth.
+            let params = quantParams(quality: quality)
+            let step = Double(1 << 16) / Double(params.globalScale)
+            return sse + kEncFrameRaceLambda * step * step * Double(bytes.count)
+        }
+        guard let s16 = rdScore(withDCT16.bytes), let s8 = rdScore(plainDCT8.bytes) else {
+            return withDCT16.bytes  // decode failure: keep the primary path
+        }
+        return s8 < s16 ? plainDCT8.bytes : withDCT16.bytes
+    }
+
+    private static func encodeLossyPass(
+        _ image: JXLDecodedImage, quality: Int, allowDCT16: Bool
+    ) throws -> (bytes: [UInt8], usedDCT16: Bool) {
         guard !image.isFloat else {
             throw JXLEncodeError(reason: "lossy encode supports integer samples only")
         }
@@ -542,6 +597,8 @@ enum VarDCTEncoder {
         }
 
         let params = quantParams(quality: quality)
+        // Set when any cell selects DCT16; drives the E5f frame-level race.
+        var anyDCT16 = false
         let w = image.width
         let h = image.height
         let bw = divCeil(w, 8)
@@ -794,7 +851,7 @@ enum VarDCTEncoder {
             // nest exactly), and is required anyway because decodeACGroupPass
             // writes the non-zero prediction plane at every covered block of
             // its own group-sized plane.
-            if kEncDCT16Enabled {
+            if kEncDCT16Enabled && allowDCT16 {
                 for cy in 0..<cellsY {
                     let byl = cy * 2
                     if byl + 2 > gh { continue }
@@ -833,6 +890,7 @@ enum VarDCTEncoder {
                         }
                         guard cost16 < cost8 else { continue }
                         cellUse16[cy * cellsX + cx] = true
+                        anyDCT16 = true
                         // Commit: the 16x16 transform of each channel replaces
                         // the four 8x8 blocks it covers, in place — those four
                         // slots ARE this cell's slots.
@@ -1225,7 +1283,7 @@ enum VarDCTEncoder {
             writeTocSize(head, section.count)
             head.alignToByte()
             head.append(bytes: section)
-            return head.finalize()
+            return (head.finalize(), anyDCT16)
         }
 
         var sections: [[UInt8]] = []
@@ -1251,7 +1309,7 @@ enum VarDCTEncoder {
         for section in sections { writeTocSize(head, section.count) }
         head.alignToByte()
         for section in sections { head.append(bytes: section) }
-        return head.finalize()
+        return (head.finalize(), anyDCT16)
     }
 
     /// FrameHeader for the E5a lossy shape — dual of `FrameHeader.init` with

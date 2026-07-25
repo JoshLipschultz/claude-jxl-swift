@@ -286,10 +286,31 @@ every milestone lands with djxl round-trip proof, never just self-consistency.
       zero BEFORE the last non-zero costs a zero-density token, and a
       256-coefficient scan pays that far more often than four 64-coefficient
       scans; ignoring it made DCT16 lose ~35% at q70.
-    - Remaining lossy quality levers (E5f+): a content-adaptive strategy
-      guard (see above), further strategies (DCT32, rectangular, AFV), real
-      trellis/joint RD across the block, Gaborish/EPF with encoder
-      compensation, alpha-with-lossy.
+    - **E5f** (2026-07-25): the E5e regression is **fixed** — a frame-level
+      race replaces the per-cell guard it was scoped as. RACE recovers the
+      better endpoint everywhere: bench q70 138482 B/33.917 dB (identical to
+      all-DCT8, regression gone) while photo q50/q70/q90 stay exactly on
+      E5e's DCT16 results (3134/31.55, 9431/35.44, 27264/39.94). 6 MP encode
+      0.91 s; cross-oracle 122–130 dB on both branches.
+      **Two negative results recorded so they are not retried:** (a) tuning
+      `kEncStratZeroBits` and (b) a per-cell scan-depth guard both floor
+      ~12% above all-DCT8 on noisy content, and (b) additionally destroys
+      the q90 win because scan depth tracks the QUANT STEP, not content
+      (fine quantization leaves non-zeros deep in the scan even for smooth
+      cells). That shared floor is the tell: DCT16 and DCT8 use different
+      block-context buckets, so ANY mixture fragments the ANS histograms — a
+      frame-global cost no per-cell criterion can price. Hence the decision
+      belongs per frame, judged on measured output (`SSE + λ·step²·bytes`,
+      both axes so a smaller-but-worse candidate cannot win), which is the
+      same "race the real encodings" pattern the lossless encoder uses for
+      palette. The second encode is skipped when no cell chose DCT16.
+    - Remaining lossy quality levers (E5g+): further strategies (DCT32,
+      rectangular, AFV), real trellis/joint RD across the block,
+      Gaborish/EPF with encoder compensation, alpha-with-lossy. Note the
+      E5f finding generalizes: adding a strategy whose blocks use a distinct
+      context bucket carries a frame-global histogram-fragmentation cost, so
+      each new strategy likely wants the same race treatment rather than
+      per-cell selection alone.
 - **E6 (undecided) — jbrd**: JPEG recompression, byte-exact reconstruction.
 
 Each milestone = the full existing ritual: suite + fuzz + bench + size gate +

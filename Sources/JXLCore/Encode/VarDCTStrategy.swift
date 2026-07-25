@@ -153,6 +153,42 @@ let kEncStratZeroBits: Float = {
     return 0.22
 }()
 
+// E5f NEGATIVE RESULT, recorded so it is not retried: a per-cell "scan depth"
+// guard (reject DCT16 when its non-zeros run deeper than a fraction of the
+// 256-coefficient scan) was implemented and swept over {0.45, 0.30, 0.20,
+// 0.12} against a guard-disabled control in the same run. It does not work,
+// for a reason worth keeping: scan depth is dominated by the QUANT STEP, not
+// by content. At q90 the fine step leaves non-zeros deep in the scan even for
+// smooth cells, so every threshold <= 0.45 rejected ALL DCT16 blocks and
+// reproduced the DCT8-only result exactly (30847 B / 37.643 dB), destroying
+// E5e's entire q90 win (27264 B / 39.940 dB) — while the noisy bench still
+// never approached the DCT8-only 138482 B (best 155001 at depth 0.12).
+//
+// Both that sweep and the earlier `kEncStratZeroBits` sweep floor around
+// 155-156 KB on the noisy bench, well above pure DCT8. That common floor is
+// the actual mechanism: DCT16 blocks use a different block-context bucket
+// than DCT8 (`kStrategyOrder`), so ANY mixture fragments the ANS histograms —
+// a frame-global cost no per-cell criterion can price. On such content the
+// choice is effectively all-or-nothing, which is why the fix below is a
+// FRAME-LEVEL race rather than a smarter per-cell test.
+
+/// Lambda for the E5f frame-level race, in SSE per byte per squared quant
+/// step. The race scores each candidate as `SSE + lambda * step^2 * bytes`,
+/// so it slides along the same rate/quality tradeoff the coefficient RD uses
+/// and a merely-smaller-but-worse candidate cannot win. Calibrated so the
+/// measured cases land the way true RD says they should: the noisy bench at
+/// q70 (DCT16 +23% size for +0.07 dB) picks all-DCT8, while the photo (DCT16
+/// smaller AND higher PSNR at every quality) picks DCT16 — the latter is
+/// decided on both axes at once, so it is insensitive to this constant.
+let kEncFrameRaceLambda: Double = {
+    if let s = ProcessInfo.processInfo.environment["JXL_FRAME_RACE_LAMBDA"],
+        let v = Double(s)
+    {
+        return v
+    }
+    return 6.0
+}()
+
 /// Reference squared luma AC step at unit `scaledDequant`, already in
 /// pixel-SSE units (mean of the DCT8 table's Y AC dequant values squared,
 /// times the 8x8 basis energy 64). Fixed and shared by both candidates, so the
@@ -190,10 +226,17 @@ func encCellQuant(_ blockQuant: [Int32], gw: Int, bxl: Int, byl: Int) -> Int32 {
 /// the scan the last non-zero sits", and hence how many zero tokens each
 /// channel pays, is measured, not assumed. `table` is the candidate's dequant
 /// table (`[X size, Y size, B size]`).
+/// Returns the RD cost and, as `scanDepth`, the deepest position in the
+/// coefficient scan at which ANY channel still has a non-zero (relative to
+/// `size`). Scan depth is the signal the E5f guard uses: a large transform
+/// earns its place by CONCENTRATING energy at low frequencies, so a candidate
+/// whose non-zeros run deep into a 256-coefficient scan is precisely the
+/// content (noise) where the modeled rate underestimates the real cost.
 func encStrategyACCost(
     cX: UnsafePointer<Float>, cY: UnsafePointer<Float>, cB: UnsafePointer<Float>,
     table: UnsafePointer<Float>, order: UnsafePointer<UInt32>,
-    size: Int, covered: Int, scaledDequant: Float, lambda: Float
+    size: Int, covered: Int, scaledDequant: Float, lambda: Float,
+    scanDepth: UnsafeMutablePointer<Float>? = nil
 ) -> Float {
     var dist: Float = 0
     var nzBits: Float = 0
@@ -244,5 +287,9 @@ func encStrategyACCost(
         Float(lastY + 1 - covered - nonzerosY) + Float(lastX + 1 - covered - nonzerosX)
         + Float(lastB + 1 - covered - nonzerosB)
     let rate = 3 * kEncStratBlockBits + nzBits + kEncStratZeroBits * zeros
+    if let scanDepth {
+        let deepest = max(lastY, max(lastX, lastB))
+        scanDepth.pointee = Float(deepest + 1) / Float(size)
+    }
     return Float(size) * dist + lambda * rate
 }
