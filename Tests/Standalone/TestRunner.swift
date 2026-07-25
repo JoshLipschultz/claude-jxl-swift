@@ -3382,10 +3382,16 @@ struct TestRunner {
                 }
                 let psnr = planePSNR(Array(dec.planes[0..<3]), Array(planes[0..<3]), maxVal: 255)
                 check(psnr > 33, "\(w)x\(h)+\(nec)ec color PSNR (got \(psnr))")
-                // The color planes must actually be lossy — an exact match here
-                // would mean the alpha check above proves nothing.
+                // The color planes must actually be lossy — an exact match
+                // would mean the alpha check above proves nothing. The one
+                // legitimate exception is E5i's dominance rule: if lossless
+                // came out SMALLER, encodeLossy ships a modular frame, and
+                // exact color is then the correct outcome rather than a vacuous
+                // test. Distinguish the two rather than weakening the check.
+                let isModular = (try? JXL.readFrameInfo(from: Data(jxl)))?.isModular ?? false
                 check(
-                    dec.planes[0] != planes[0], "\(w)x\(h)+\(nec)ec color is lossy (not a copy)")
+                    dec.planes[0] != planes[0] || isModular,
+                    "\(w)x\(h)+\(nec)ec color is lossy, or lossless won on size (modular \(isModular))")
             } catch {
                 check(false, "\(w)x\(h)+\(nec)ec lossy encode: \(error)")
             }
@@ -3485,12 +3491,17 @@ struct TestRunner {
                 // configuration we actually emit — never a half-written one.
                 // EPF is inert for this encoder (zero sharpness field skips
                 // every block), so the raced configurations are filters-off and
-                // Gaborish-only — never epf_iters > 0.
-                let filtersOff = !info.loopFilterGab && info.loopFilterEpfIters == 0
-                let gaborishOnly = info.loopFilterGab && info.loopFilterEpfIters == 0
-                check(
-                    filtersOff || gaborishOnly,
-                    "q\(q) loop-filter header is a raced config (gab \(info.loopFilterGab), epf \(info.loopFilterEpfIters))")
+                // Gaborish-only — never epf_iters > 0. Only meaningful for a
+                // VarDCT frame: E5i's dominance rule can ship a MODULAR frame
+                // when lossless is smaller, which carries its own loop-filter
+                // defaults and is not part of this race.
+                if !info.isModular {
+                    let filtersOff = !info.loopFilterGab && info.loopFilterEpfIters == 0
+                    let gaborishOnly = info.loopFilterGab && info.loopFilterEpfIters == 0
+                    check(
+                        filtersOff || gaborishOnly,
+                        "q\(q) loop-filter header is a raced config (gab \(info.loopFilterGab), epf \(info.loopFilterEpfIters))")
+                }
                 let dec = try JXL.decodeImage(from: jxl)
                 let psnr = planePSNR(Array(dec.planes[0..<3]), planes, maxVal: 255)
                 psnrByQuality.append(psnr)
@@ -3506,6 +3517,74 @@ struct TestRunner {
                 "filter race keeps PSNR monotonic in quality (got \(psnrByQuality))")
         } catch {
             check(false, "filter race encode: \(error)")
+        }
+
+        // E5i: lossy-vs-lossless dominance. On flat/text-like content our lossy
+        // path was emitting a file MANY times larger than our own lossless one
+        // (measured: 64299 B vs 4042 B on the benchmark's text image), so
+        // encodeLossy now ships the lossless stream whenever it is smaller —
+        // smaller AND exact beats the lossy candidate on both axes at once.
+        do {
+            let w = 200
+            let h = 150
+            let n = w * h
+            // Text-like: a few flat colors in blocky runs with sharp edges. Not
+            // a real glyph raster, but it has the statistics that matter —
+            // large constant regions and hard transitions, which VarDCT spends
+            // enormously on and modular codes almost for free.
+            let planes = (0..<3).map { c in
+                (0..<n).map { i -> Int32 in
+                    let x = i % w
+                    let y = i / w
+                    let onBar = ((x / 7) % 3 == 0) && ((y / 11) % 2 == 0)
+                    return onBar ? Int32(20 + c * 10) : Int32(235 - c * 5)
+                }
+            }
+            let img = JXLDecodedImage(
+                width: w, height: h, colorChannels: 3, extraChannels: 0, bitsPerSample: 8,
+                isFloat: false, planes: planes, iccProfile: nil)
+            let lossyOut = try JXL.encodeLossy(image: img, quality: 90)
+            let lossless = try JXL.encodeLossless(image: img, effort: 2)
+            let dec = try JXL.decodeImage(from: lossyOut)
+            // The rule fired: output is no larger than plain lossless, and the
+            // pixels came back EXACT despite the caller asking for lossy.
+            check(
+                lossyOut.count <= lossless.count,
+                "flat content: encodeLossy is no larger than lossless (\(lossyOut.count) vs \(lossless.count))")
+            check(
+                dec.planes[0] == planes[0] && dec.planes[1] == planes[1],
+                "flat content: dominance rule returns exact pixels")
+            let info = try JXL.readFrameInfo(from: Data(lossyOut))
+            check(info.isModular, "flat content: dominance rule ships a modular frame")
+
+            // And it must NOT fire on content where lossy genuinely wins:
+            // a photograph-like field where lossless is far larger.
+            var st: UInt64 = 0x51ED_2701_ABCD_9F13
+            func r8() -> Int32 {
+                st = st &* 6364136223846793005 &+ 1442695040888963407
+                return Int32((st >> 33) & 63)
+            }
+            let busy = (0..<3).map { c in
+                (0..<n).map { i -> Int32 in
+                    let x = i % w
+                    let y = i / w
+                    let base = 128.0 + 60.0 * sin(Double(x) * 0.07 + Double(c))
+                        + 40.0 * cos(Double(y) * 0.05)
+                    return Int32(Swift.max(0, Swift.min(255, base + Double(r8()) - 32)))
+                }
+            }
+            let busyImg = JXLDecodedImage(
+                width: w, height: h, colorChannels: 3, extraChannels: 0, bitsPerSample: 8,
+                isFloat: false, planes: busy, iccProfile: nil)
+            let busyLossy = try JXL.encodeLossy(image: busyImg, quality: 70)
+            let busyInfo = try JXL.readFrameInfo(from: Data(busyLossy))
+            check(!busyInfo.isModular, "busy content: dominance rule stays out of the way")
+            let busyLossless = try JXL.encodeLossless(image: busyImg, effort: 2)
+            check(
+                busyLossy.count < busyLossless.count,
+                "busy content: lossy is genuinely smaller than lossless (\(busyLossy.count) vs \(busyLossless.count))")
+        } catch {
+            check(false, "lossless dominance rule: \(error)")
         }
 
         // Documented rejection: float input is still an E5a non-goal.

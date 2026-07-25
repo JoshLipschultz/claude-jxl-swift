@@ -597,13 +597,70 @@ enum VarDCTEncoder {
         // Axis 2 (E5f): DCT16 vs all-DCT8, on the winning filter setting. Only
         // worth an encode when some cell actually chose DCT16 — otherwise the
         // two candidates are identical by construction.
-        guard kEncDCT16Enabled, best.usedDCT16 else { return best.bytes }
+        guard kEncDCT16Enabled, best.usedDCT16 else {
+            return preferLosslessIfSmaller(image, lossy: best.bytes)
+        }
         let plainDCT8 = try encodeLossyPass(
             image, quality: quality, allowDCT16: false, filters: bestFilters)
         guard let s16 = bestScore, let s8 = rdScore(plainDCT8.bytes) else {
-            return best.bytes  // decode failure: keep the primary path
+            // decode failure: keep the primary path
+            return preferLosslessIfSmaller(image, lossy: best.bytes)
         }
-        return s8 < s16 ? plainDCT8.bytes : best.bytes
+        return preferLosslessIfSmaller(image, lossy: s8 < s16 ? plainDCT8.bytes : best.bytes)
+    }
+
+    /// Ships the LOSSLESS encoding instead when it comes out smaller than the
+    /// lossy one.
+    ///
+    /// This is a DOMINANCE check, not a rate-distortion trade, which is why it
+    /// needs no lambda: a lossless stream is exact, so if it is also smaller it
+    /// beats the lossy candidate on BOTH axes simultaneously and there is
+    /// nothing to weigh. The lossy result is only ever kept when it is actually
+    /// buying something — fewer bytes.
+    ///
+    /// Measured motivation (docs/lossy-vs-cjxl.md): on text/screen content our
+    /// lossy path emitted 64299 B where our own lossless emitted 4042 B — 16x
+    /// larger AND worse. The benchmark scored that class at +874% BD-rate, by
+    /// far our largest gap, and cjxl's advantage there is mode selection rather
+    /// than better coding tools. We already have the encoder to route to; this
+    /// is the routing.
+    ///
+    /// Racing the real encoder rather than classifying the image is the same
+    /// choice E5f and E5h made, and for the same reason: cheap proxies for "is
+    /// this flat/text-like" mis-rank exactly the mixed content that matters.
+    /// It is affordable because lossless is roughly an order of magnitude
+    /// FASTER than the lossy path (6 MP: e1 ~0.11 s vs lossy ~2.2 s), so the
+    /// probe costs a few percent. Effort 1 is the probe; effort 2 is only run
+    /// once effort 1 has already proven lossless competitive.
+    ///
+    /// `JXL_LOSSLESS_RACE=0` disables it, matching the other encoder knobs.
+    private static func preferLosslessIfSmaller(
+        _ image: JXLDecodedImage, lossy: [UInt8]
+    ) -> [UInt8] {
+        guard kEncLosslessRaceEnabled else { return lossy }
+        // GRAYSCALE IS EXCLUDED, and the reason is a contract issue rather than
+        // a quality one. The lossy path replicates a gray plane into RGB before
+        // the XYB transform, so its output decodes as 3 channels; the lossless
+        // path correctly preserves grayscale and decodes as 1. Letting the rule
+        // fire here would make `encodeLossy`'s decoded channel COUNT depend on
+        // which candidate happened to win — an unpredictable API is a worse
+        // failure than a missed size win, and it crashed a caller that indexed
+        // planes[0..<3] the first time it happened.
+        //
+        // The real fix is native grayscale lossy (the replication is a wart in
+        // its own right, costing 3 channels where 1 would do); once the lossy
+        // path preserves gray, both candidates agree and this guard can go.
+        // Until then gray content — including scanned text, where this rule
+        // would otherwise pay well — keeps the lossy stream. Tracked separately.
+        guard image.colorChannels != 1 else { return lossy }
+        guard let fast = try? ModularEncoder.encodeLossless(image, effort: 1),
+            fast.count < lossy.count
+        else { return lossy }
+        if let dense = try? ModularEncoder.encodeLossless(image, effort: 2),
+            dense.count < fast.count {
+            return dense
+        }
+        return fast
     }
 
     private static func encodeLossyPass(

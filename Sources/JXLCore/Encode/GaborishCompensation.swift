@@ -66,6 +66,14 @@ let kEncDefaultFilters: VarDCTEncoder.EncFilterConfig = {
     }
 }()
 
+/// Master switch for the lossy-vs-lossless dominance check in `encodeLossy`
+/// (see `preferLosslessIfSmaller`). `JXL_LOSSLESS_RACE=0` disables it, which is
+/// how the benchmark measures the lossy path in isolation.
+let kEncLosslessRaceEnabled: Bool = {
+    if let s = ProcessInfo.processInfo.environment["JXL_LOSSLESS_RACE"] { return s != "0" }
+    return true
+}()
+
 /// Master switch for the filters-vs-no-filters frame race. `JXL_FILTER_RACE=0`
 /// pins the encoder to `kEncDefaultFilters` with no second encode — which is
 /// how the two branches are measured in isolation, and the lever to cut encode
