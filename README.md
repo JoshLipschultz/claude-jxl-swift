@@ -20,6 +20,9 @@ of an all-DCT8 baseline; our decoder and `djxl` agree on its output to
 >99 dB. It is still climbing toward density parity with libjxl (non-DCT8
 transform strategies and loop filters are the next levers), but each quality
 setting is perceptually clean and the RD curve is measured, not assumed.
+Baseline JPEGs can also be **losslessly recompressed** (`jxl fromjpeg`): the
+JXL is ~10-15% smaller and reconstructs the byte-identical original — verified
+against `djxl`'s own reconstruction as well as ours.
 
 > **Status: feature-complete for real-world files.** Both coding modes decode
 > end to end — **Modular** (lossless and lossy, byte-exact vs `djxl` including
@@ -55,6 +58,7 @@ $ jxl decode image.jxl out.ppm          # decode to PGM/PPM (or .pam with alpha)
 $ jxl decode image.jxl out.ppm 16       # ... at 16-bit, or `float` -> PFM
 $ jxl decode image.jxl out.ppm dither   # blue-noise dither 8-bit output
                                         #   (`nospot` = don't render spot colors)
+$ jxl fromjpeg photo.jpg out.jxl        # losslessly recompress a JPEG (~10-15%)
 $ jxl tojpeg recon.jxl out.jpg          # byte-exact JPEG reconstruction
 $ jxl icc image.jxl out.icc             # extract the embedded ICC profile
 $ jxl encode in.ppm out.jxl             # lossless encode (PGM/PPM/PAM/PFM)

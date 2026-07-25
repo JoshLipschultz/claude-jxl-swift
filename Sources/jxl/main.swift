@@ -40,6 +40,8 @@ func usage() -> Never {
                                            e1 = fast, e2 = smaller (default);
                                            "responsive" = squeeze (progressive);
                                            q<N> (1-100) = lossy XYB VarDCT
+          jxl fromjpeg <in.jpg> <out.jxl>  Recompress a baseline JPEG losslessly
+                                           (reconstruct with `jxl tojpeg`)
           jxl icc    <file.jxl> [out.icc]  Extract the embedded ICC profile
           jxl vardct <file.jxl>            Preflight VarDCT global metadata
           jxl vardct-dc <file.jxl> [dump]  Decode VarDCT XYB DC image (lossy)
@@ -166,6 +168,17 @@ do {
         let jpeg = try JXL.reconstructJPEG(from: bytes)
         try jpeg.write(to: URL(fileURLWithPath: args[3]))
         print("reconstructed \(jpeg.count) JPEG bytes -> \(args[3])")
+
+    case "fromjpeg":
+        // JPEG recompression: the output JXL reconstructs the byte-identical
+        // original via `jxl tojpeg` (or djxl).
+        guard args.count >= 4 else { usage() }
+        let jxl = try JXL.encodeJPEGTranscode(jpeg: bytes)
+        try Data(jxl).write(to: URL(fileURLWithPath: args[3]))
+        let pct = 100.0 * Double(jxl.count) / Double(max(1, bytes.count))
+        print(
+            "recompressed \(bytes.count) -> \(jxl.count) bytes "
+                + "(\(String(format: "%.1f", pct))% of original) -> \(args[3])")
 
     case "vardct":
         let info = try JXL.readVarDCTInfo(from: bytes)
