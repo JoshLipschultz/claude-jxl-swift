@@ -2990,6 +2990,94 @@ struct TestRunner {
             check(abs(coeffs[0] - mean) < 1e-5, "DCT8 DC == block mean")
         }
 
+        // E5e: forward DCT16 -> the decoder's own scaledIDCT(h:16, w:16) ==
+        // identity, on the same storage layout (transposed, S[u*16+v]).
+        var worstDCT16: Float = 0
+        for _ in 0..<50 {
+            var pix = [Float](repeating: 0, count: 256)
+            for i in 0..<256 { pix[i] = Float(rnd() * 2 - 1) }
+            var coeffs = [Float](repeating: 0, count: 256)
+            pix.withUnsafeBufferPointer { p in
+                coeffs.withUnsafeMutableBufferPointer { o in
+                    forwardDCT16(pixels: p.baseAddress!, stride: 16, out: o.baseAddress!)
+                }
+            }
+            var back = [Float](repeating: 0, count: 256)
+            var tmp = [Float](repeating: 0, count: 256)
+            coeffs.withUnsafeMutableBufferPointer { c in
+                back.withUnsafeMutableBufferPointer { b in
+                    tmp.withUnsafeMutableBufferPointer { t in
+                        scaledIDCT(
+                            c.baseAddress!, h: 16, w: 16, pixels: b.baseAddress!, stride: 16,
+                            tmp: t.baseAddress!)
+                    }
+                }
+            }
+            for i in 0..<256 { worstDCT16 = max(worstDCT16, abs(back[i] - pix[i])) }
+        }
+        check(worstDCT16 < 1e-5, "forward DCT16 -> scaledIDCT identity (max err \(worstDCT16))")
+
+        // DCT16 DC coefficient == mean of the 16x16 region.
+        do {
+            var pix = [Float](repeating: 0, count: 256)
+            var mean: Float = 0
+            for i in 0..<256 {
+                pix[i] = Float(rnd())
+                mean += pix[i]
+            }
+            mean /= 256
+            var coeffs = [Float](repeating: 0, count: 256)
+            pix.withUnsafeBufferPointer { p in
+                coeffs.withUnsafeMutableBufferPointer { o in
+                    forwardDCT16(pixels: p.baseAddress!, stride: 16, out: o.baseAddress!)
+                }
+            }
+            check(abs(coeffs[0] - mean) < 1e-5, "DCT16 DC == 16x16 region mean")
+        }
+
+        // E5e LLF <-> DC coupling: the four DC-image samples derived from a
+        // DCT16's 2x2 corner must be exactly what the DECODER'S OWN insertLLF
+        // turns back into that corner. This is the subtle half of DCT16 — the
+        // resample scales live only in the decoder, so this test (not the
+        // spec) is what pins the encoder's inverse.
+        var worstLLF: Float = 0
+        for _ in 0..<200 {
+            var coeffs = [Float](repeating: 0, count: 256)
+            for i in 0..<256 { coeffs[i] = Float(rnd() * 2 - 1) }
+            let want = (coeffs[0], coeffs[1], coeffs[16], coeffs[17])
+            let dc = coeffs.withUnsafeBufferPointer { encDCT16DCFromLLF($0.baseAddress!) }
+            // Lay the four samples out as a 2x2 patch of a DC image and let
+            // the decoder re-insert them.
+            let dcPlane: [Float] = [dc.0, dc.1, dc.2, dc.3]
+            var round = [Float](repeating: 0, count: 256)
+            round.withUnsafeMutableBufferPointer { c in
+                dcPlane.withUnsafeBufferPointer { d in
+                    insertLLF(
+                        c.baseAddress!, strategy: kEncStrategyDCT16,
+                        dc: d.baseAddress!, dcStride: 2, dcOrigin: 0)
+                }
+            }
+            worstLLF = max(
+                worstLLF, abs(round[0] - want.0), abs(round[1] - want.1),
+                abs(round[16] - want.2), abs(round[17] - want.3))
+        }
+        check(worstLLF < 1e-5, "DCT16 LLF -> DC -> insertLLF identity (max err \(worstLLF))")
+
+        // The AC stream must skip exactly the four LLF positions: the natural
+        // coefficient order's first `covered` entries (what decodeACGroupPass
+        // starts past) are {0, 1, 16, 17}, and encIsLLF agrees.
+        do {
+            let order = computeNaturalCoeffOrder(cbx: 2, cby: 2)
+            eq(order.count, 256, "DCT16 natural coeff order size")
+            let llf = Set(order[0..<4].map { Int($0) })
+            check(llf == Set([0, 1, 16, 17]), "DCT16 LLF order positions \(llf.sorted())")
+            var mismatches = 0
+            for k in 0..<256 where encIsLLF(size: 256, k) != llf.contains(k) { mismatches += 1 }
+            eq(mismatches, 0, "encIsLLF matches the DCT16 order's LLF prefix")
+            let order8 = computeNaturalCoeffOrder(cbx: 1, cby: 1)
+            check(order8[0] == 0, "DCT8 LLF order position")
+        }
+
         // Forward XYB -> decoder inverse-opsin == identity on random samples.
         let opsin = ForwardOpsin()
         let state = ConvertState(
@@ -3007,7 +3095,7 @@ struct TestRunner {
         }
         check(worstXYB < 1e-4, "forward XYB -> ConvertState.linear identity (max err \(worstXYB))")
         FileHandle.standardError.write(
-            Data("  [lossy-identities] DCT8 + XYB forward transforms invert the decoder\n".utf8))
+            Data("  [lossy-identities] DCT8/DCT16 + LLF + XYB forward transforms invert the decoder\n".utf8))
     }
 
     /// Peak signal-to-noise between two integer plane sets (same depth).
@@ -3066,7 +3154,7 @@ struct TestRunner {
             // cross-oracle sweep before updating the constant.
             let again = try JXL.encodeLossy(image: srcImage)
             check(again == jxl, "lossy encode deterministic")
-            eq(jxl.count, 30847, "lossy size golden (q90, 384x256_prog)")
+            eq(jxl.count, 27264, "lossy size golden (q90, 384x256_prog)")
 
             // Lower quality: smaller file, lower PSNR, still decodable.
             let q50 = try JXL.encodeLossy(image: srcImage, quality: 50)
@@ -3109,6 +3197,77 @@ struct TestRunner {
             check(psnr > 34, "2100x40 gradient PSNR (got \(psnr))")
         } catch {
             check(false, "multi-DC-group lossy encode: \(error)")
+        }
+
+        // E5e: variable-size transforms. Smooth/gradient content is exactly
+        // what a 16x16 transform exists for and must select DCT16 varblocks;
+        // pseudo-random noise must stay overwhelmingly DCT8. Reading the
+        // placement back through `decodeVarDCTACMetadata` runs the decoder's
+        // own AcMetadata walk, which enforces exact varblock tiling (num ==
+        // count, no overlap, no AC-group/image overflow) — so a clean decode
+        // here IS the placement gate. Odd dimensions are included so the
+        // edge-fallback path (cells that do not fit) is exercised.
+        for (w, h) in [(256, 192), (251, 187)] {
+            do {
+                var smooth = [[Int32]](repeating: [Int32](repeating: 0, count: w * h), count: 3)
+                var noisy = smooth
+                var st: UInt64 = 0x1234_5678_9ABC_DEF0
+                func r8() -> Int32 {
+                    st = st &* 6364136223846793005 &+ 1442695040888963407
+                    return Int32((st >> 33) & 255)
+                }
+                for y in 0..<h {
+                    for x in 0..<w {
+                        let i = y * w + x
+                        smooth[0][i] = Int32(40.0 + 180.0 * Double(x) / Double(w))
+                        smooth[1][i] = Int32(60.0 + 150.0 * Double(y) / Double(h))
+                        smooth[2][i] = Int32(128.0 + 60.0 * sin(Double(x + y) * 0.008))
+                        for c in 0..<3 { noisy[c][i] = r8() }
+                    }
+                }
+                func placement(_ planes: [[Int32]]) throws -> (jxl: [UInt8], n8: Int, n16: Int) {
+                    let img = JXLDecodedImage(
+                        width: w, height: h, colorChannels: 3, extraChannels: 0,
+                        bitsPerSample: 8, isFloat: false, planes: planes, iccProfile: nil)
+                    let jxl = try JXL.encodeLossy(image: img)
+                    let meta = try decodeVarDCTACMetadata(from: jxl)
+                    var n8 = 0
+                    var n16 = 0
+                    for i in 0..<(meta.widthBlocks * meta.heightBlocks) where meta.isFirstBlock[i] {
+                        if meta.strategy[i] == UInt8(kEncStrategyDCT16) {
+                            n16 += 1
+                        } else if meta.strategy[i] == UInt8(kEncStrategyDCT8) {
+                            n8 += 1
+                        }
+                    }
+                    eq(meta.varblockCount, n8 + n16, "\(w)x\(h) varblock count == placement")
+                    check(
+                        meta.usedACs & ~UInt32(0x11) == 0,
+                        "\(w)x\(h) uses only DCT8/DCT16 (mask 0x\(String(meta.usedACs, radix: 16)))")
+                    return (jxl, n8, n16)
+                }
+
+                let s = try placement(smooth)
+                check(
+                    s.n16 > 0,
+                    "\(w)x\(h) smooth gradient selects DCT16 (\(s.n16) of \(s.n8 + s.n16))")
+                check(
+                    4 * s.n16 > s.n8,
+                    "\(w)x\(h) smooth gradient is mostly DCT16 coverage (\(4 * s.n16) vs \(s.n8) blocks)")
+                let dec = try JXL.decodeImage(from: s.jxl)
+                check(dec.width == w && dec.height == h, "\(w)x\(h) DCT16 round-trip dims")
+                let psnr = planePSNR(Array(dec.planes[0..<3]), smooth, maxVal: 255)
+                check(psnr > 38, "\(w)x\(h) DCT16 gradient PSNR (got \(psnr))")
+
+                let n = try placement(noisy)
+                check(
+                    4 * n.n16 < n.n8 / 4,
+                    "\(w)x\(h) noise stays DCT8 (\(n.n16) DCT16 vs \(n.n8) DCT8)")
+                let decN = try JXL.decodeImage(from: n.jxl)
+                check(decN.width == w, "\(w)x\(h) noise round-trip dims")
+            } catch {
+                check(false, "\(w)x\(h) DCT16 selection: \(error)")
+            }
         }
 
         // Tiny images (coalesced single-section frames).

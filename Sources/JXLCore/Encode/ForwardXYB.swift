@@ -16,11 +16,11 @@
 //   * The sRGB EOTF (encoded -> linear), mirroring the decoder's
 //     `OutputTransfer.srgb.inverse` code exactly (same constants/branch).
 //
-//   * Forward scaled DCT8 producing coefficients in the decoder's storage
-//     convention for square blocks (`scaledIDCT` with h = w = 8: transposed
-//     storage S[u*8+v] = F[v][u], self-normalizing basis w(0)=1, w(k>0)=√2,
-//     forward scale 1/N per axis so DC == block mean). The suite pins
-//     forward -> decoder-inverse == identity.
+//   * Forward scaled DCT8 and DCT16 producing coefficients in the decoder's
+//     storage convention for square blocks (`scaledIDCT` with h = w = N:
+//     transposed storage S[u*N+v] = F[v][u], self-normalizing basis w(0)=1,
+//     w(k>0)=√2, forward scale 1/N per axis so DC == block mean). The suite
+//     pins forward -> decoder-inverse == identity for both sizes.
 
 import Foundation
 
@@ -135,6 +135,63 @@ func forwardDCT8(
                     let basisRow = v * 8
                     for y in 0..<8 { s += fb[basisRow + y] * t1b[u * 8 + y] }
                     out[u * 8 + v] = Float(s)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Forward DCT16 (E5e)
+
+/// Forward basis rows for N = 16: `fdct16Basis[k*16 + t] = w(k)/16 *
+/// cos((2t+1) k π / 32)` — the exact inverse weighting of `makeIDCTBasis(16)`
+/// (DCTTransforms.swift), whose 1D basis has squared norm 16 per frequency
+/// (w(0)² · 16 = 16 and w(k>0)² · 8 = 16), so dividing by 16 makes
+/// forward ∘ inverse the identity. Note the DCT is amplitude-preserving for
+/// every N: a sinusoid of amplitude A lands on a coefficient of A/√2
+/// regardless of block size, which is what makes DCT8 and DCT16 coefficient
+/// magnitudes (and hence their quant tables) directly comparable.
+private let fdct16Basis: [Double] = {
+    var b = [Double](repeating: 0, count: 256)
+    for k in 0..<16 {
+        let w: Double = k == 0 ? 1.0 : 2.0.squareRoot()
+        for t in 0..<16 {
+            b[k * 16 + t] = w / 16.0 * cos(Double(2 * t + 1) * Double(k) * Double.pi / 32.0)
+        }
+    }
+    return b
+}()
+
+/// Forward scaled DCT of one 16x16 pixel region into the decoder's coefficient
+/// storage for square blocks: `out[u*16 + v] = F[v][u]` (v = vertical
+/// frequency, u = horizontal), the layout `scaledIDCT(h:16, w:16)` consumes —
+/// and the same layout `insertLLF` writes its 2x2 lowest frequencies into
+/// (`coeffs[u*cm + v]`, cm = 16). `pixels` is row-major with `stride` floats
+/// per row; `out` gets 256 values. out[0] is the DC coefficient (== the mean
+/// of the 16x16 region).
+func forwardDCT16(
+    pixels: UnsafePointer<Float>, stride: Int, out: UnsafeMutablePointer<Float>
+) {
+    // Pass 1 (horizontal): t1[u*16 + y] = Σ_x basis[u][x] * p[y][x].
+    var t1 = [Double](repeating: 0, count: 256)
+    fdct16Basis.withUnsafeBufferPointer { fb in
+        t1.withUnsafeMutableBufferPointer { t1b in
+            for y in 0..<16 {
+                let row = pixels + y * stride
+                for u in 0..<16 {
+                    var s = 0.0
+                    let basisRow = u * 16
+                    for x in 0..<16 { s += fb[basisRow + x] * Double(row[x]) }
+                    t1b[u * 16 + y] = s
+                }
+            }
+            // Pass 2 (vertical): out[u*16 + v] = Σ_y basis[v][y] * t1[u*16 + y].
+            for u in 0..<16 {
+                for v in 0..<16 {
+                    var s = 0.0
+                    let basisRow = v * 16
+                    for y in 0..<16 { s += fb[basisRow + y] * t1b[u * 16 + y] }
+                    out[u * 16 + v] = Float(s)
                 }
             }
         }
