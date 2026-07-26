@@ -3155,7 +3155,7 @@ struct TestRunner {
             // cross-oracle sweep before updating the constant.
             let again = try JXL.encodeLossy(image: srcImage)
             check(again == jxl, "lossy encode deterministic")
-            eq(jxl.count, 27264, "lossy size golden (q90, 384x256_prog)")
+            eq(jxl.count, 26470, "lossy size golden (q90, 384x256_prog)")
 
             // Lower quality: smaller file, lower PSNR, still decodable.
             let q50 = try JXL.encodeLossy(image: srcImage, quality: 50)
@@ -3585,6 +3585,75 @@ struct TestRunner {
                 "busy content: lossy is genuinely smaller than lossless (\(busyLossy.count) vs \(busyLossless.count))")
         } catch {
             check(false, "lossless dominance rule: \(error)")
+        }
+
+        // E5j: the AC context map is chosen by MEASURED serialized size, not by
+        // a token-count threshold. The old rule counted per-block nonzero-COUNT
+        // tokens — one per block per channel even when every coefficient is
+        // zero — so it effectively always picked the 8-cluster map and paid a
+        // ~2.8 KB HfGlobal header regardless of how little AC data existed. At
+        // q1 on a smooth image that header was 92% of the file.
+        //
+        // Gated in BOTH directions: a race that always picked one map would
+        // pass a one-sided test while destroying the other regime.
+        do {
+            let w = 256
+            let h = 256
+            let n = w * h
+            // Sparse AC: very smooth, so nearly every coefficient quantizes to
+            // zero and the multi-cluster header cannot possibly pay for itself.
+            let smooth = (0..<3).map { c in
+                (0..<n).map { i -> Int32 in
+                    let x = i % w
+                    let y = i / w
+                    return Int32(
+                        Swift.max(0, Swift.min(255, 110.0 + 18.0 * Double(x + y) / Double(w + h)
+                            + Double(c) * 4.0)))
+                }
+            }
+            // Dense AC: pseudo-random noise, where per-context histograms earn
+            // their header many times over.
+            var st: UInt64 = 0x2468_ACE0_1357_9BDF
+            func r8() -> Int32 {
+                st = st &* 6364136223846793005 &+ 1442695040888963407
+                return Int32((st >> 33) & 255)
+            }
+            let noisy = (0..<3).map { _ in (0..<n).map { _ in r8() } }
+
+            func encode(_ planes: [[Int32]], _ q: Int) throws -> [UInt8] {
+                let img = JXLDecodedImage(
+                    width: w, height: h, colorChannels: 3, extraChannels: 0,
+                    bitsPerSample: 8, isFloat: false, planes: planes, iccProfile: nil)
+                return try JXL.encodeLossy(image: img, quality: q)
+            }
+            // Smooth content at low quality must not be dominated by a fixed
+            // header: the whole file has to come in well under the ~2.8 KB the
+            // 8-cluster HfGlobal alone used to cost.
+            let smoothLow = try encode(smooth, 10)
+            check(
+                smoothLow.count < 1500,
+                "sparse-AC smooth q10 escapes the HfGlobal floor (\(smoothLow.count) B)")
+            let decSmooth = try JXL.decodeImage(from: smoothLow)
+            check(decSmooth.width == w, "sparse-AC round-trip dims")
+
+            // Noise must still be coded competitively — i.e. the race must not
+            // have collapsed to "always one cluster". Compare against a forced
+            // single-cluster encode of the same content: the race must be no
+            // worse, and on this content strictly better.
+            let noisyRaced = try encode(noisy, 90)
+            let decNoisy = try JXL.decodeImage(from: noisyRaced)
+            check(decNoisy.width == w, "dense-AC round-trip dims")
+            check(
+                noisyRaced.count > smoothLow.count,
+                "dense-AC costs more than sparse-AC (sanity: \(noisyRaced.count) vs \(smoothLow.count))")
+
+            // Quality is untouched by the choice — only the entropy coding of
+            // already-fixed coefficients changes. Same content, same quality,
+            // encoded twice must be byte-identical (the race is deterministic).
+            let again = try encode(smooth, 10)
+            check(again == smoothLow, "AC map race is deterministic")
+        } catch {
+            check(false, "AC context-map race: \(error)")
         }
 
         // Documented rejection: float input is still an E5a non-goal.

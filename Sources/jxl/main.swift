@@ -106,6 +106,40 @@ do {
             print(
                 "orientation: \(info.orientation), animation: \(info.hasAnimation ? "yes" : "no")")
         }
+        // `sections` totals the TOC by role. Where the bytes actually go is the
+        // first question in any density investigation, and answering it by
+        // differencing whole files (encode a constant image, subtract) is both
+        // slow and imprecise — this reads it straight out of the TOC.
+        if args.count >= 4 && args[3] == "sections" {
+            let frame = try JXL.readFrameInfo(from: Data(bytes))
+            var byRole: [(String, Int, Int)] = []  // label, bytes, count
+            func bump(_ label: String, _ size: Int) {
+                if let i = byRole.firstIndex(where: { $0.0 == label }) {
+                    byRole[i].1 += size
+                    byRole[i].2 += 1
+                } else {
+                    byRole.append((label, size, 1))
+                }
+            }
+            for s in frame.sections {
+                switch s.role {
+                case .singleSectionCoalesced: bump("coalesced (all roles)", s.size)
+                case .dcGlobal: bump("LfGlobal (DC global)", s.size)
+                case .dcGroup: bump("DC groups", s.size)
+                case .acGlobal: bump("HfGlobal (AC global)", s.size)
+                case .acGroup: bump("AC groups", s.size)
+                }
+            }
+            let total = frame.sections.reduce(0) { $0 + $1.size }
+            print("sections: \(frame.sections.count), \(total) B of payload")
+            for (label, size, count) in byRole {
+                let pct = total > 0 ? 100.0 * Double(size) / Double(total) : 0
+                let n = count > 1 ? " x\(count)" : ""
+                print(String(format: "  %-24s %8d B  %5.1f%%%@", (label as NSString).utf8String!, size, pct, n))
+            }
+            let overhead = bytes.count - total
+            print("  \(overhead) B headers/TOC outside the sections")
+        }
 
     case "boxes":
         let parsed = try JXLContainer.parse(bytes)

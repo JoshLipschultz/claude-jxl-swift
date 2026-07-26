@@ -216,16 +216,56 @@ private struct ACEntropyCoder {
     private let counts: [[Int32]]
     private let slots: [[[UInt16]]]
 
-    init(numContexts: Int, streams: [[EncToken]]) {
+    /// Picks the AC context map by MEASURED serialized size.
+    ///
+    /// The multi-cluster map makes the AC payload cheaper but costs a
+    /// 7425-entry context map plus one ANS histogram per cluster in HfGlobal —
+    /// and that header cost does NOT shrink with the amount of AC data. The
+    /// previous rule (`total < 4096` tokens) could not see this, because
+    /// `total` counts every AC token including the per-block nonzero-COUNT
+    /// tokens, of which there is one per block per channel even when every
+    /// coefficient is zero. At 768x512 that is ~18k tokens before a single
+    /// coefficient exists, so the threshold was effectively never met and the
+    /// expensive map was always chosen.
+    ///
+    /// The cost of getting it wrong is severe in both directions, so neither
+    /// map can simply be preferred (photo_sky, races off):
+    ///     q1   8-cluster 3065 B   1-cluster  271 B   (-91%)
+    ///     q30  8-cluster 3829 B   1-cluster 1077 B   (-72%)
+    ///     q90  photo_bridge 151715 B vs 159242 B     (+5% the other way)
+    ///     q90  synth_noise  391025 B vs 442228 B     (+13% the other way)
+    /// Sparse AC wants one cluster; dense AC wants eight.
+    ///
+    /// This is a PURE SIZE choice with no quality dimension — the coefficients
+    /// are already fixed, and only their entropy coding changes — so the
+    /// candidates are compared on real serialized bytes with no lambda, and the
+    /// smaller simply wins. Measuring costs building the histograms twice and
+    /// serializing twice; it does NOT re-encode any coefficients.
+    ///
+    /// `JXL_AC_CLUSTERS=1` / `=8` pins one map for measurement.
+    static func choose(numContexts: Int, streams: [[EncToken]]) -> ACEntropyCoder {
+        let forced = ProcessInfo.processInfo.environment["JXL_AC_CLUSTERS"]
+        let single = [UInt8](repeating: 0, count: numContexts)
+        let multi = acFixedClusterMap(numContexts: numContexts)
+        if forced == "1" { return ACEntropyCoder(numContexts: numContexts, streams: streams, map: single) }
+        if forced == "8" { return ACEntropyCoder(numContexts: numContexts, streams: streams, map: multi) }
+
+        let a = ACEntropyCoder(numContexts: numContexts, streams: streams, map: single)
+        let b = ACEntropyCoder(numContexts: numContexts, streams: streams, map: multi)
+        return a.serializedSize(streams) <= b.serializedSize(streams) ? a : b
+    }
+
+    /// Total bytes this coder would emit for `streams`: the HfGlobal header
+    /// plus every group's payload. Exact — it runs the real writers.
+    private func serializedSize(_ streams: [[EncToken]]) -> Int {
+        let w = BitWriter()
+        writeHeader(w)
+        for s in streams { encodeStream(w, s) }
+        return w.finalize().count
+    }
+
+    private init(numContexts: Int, streams: [[EncToken]], map: [UInt8]) {
         self.numContexts = numContexts
-        var total = 0
-        for s in streams { total += s.count }
-        // Tiny images: a single cluster costs 0 map bits (all-zero simple map)
-        // and one histogram; the 8-cluster map pays for itself only with
-        // enough tokens.
-        let map = total < 4096
-            ? [UInt8](repeating: 0, count: numContexts)
-            : acFixedClusterMap(numContexts: numContexts)
         contextMap = map
         let nc = Int(map.max()!) + 1
         numClusters = nc
@@ -1419,7 +1459,7 @@ enum VarDCTEncoder {
             streams: ecCount > 0
                 ? dcTokens + metaTokens + [ecGlobalTokens] + ecGroupTokens
                 : dcTokens + metaTokens)
-        let acCoder = ACEntropyCoder(numContexts: kNumACContexts, streams: acTokens)
+        let acCoder = ACEntropyCoder.choose(numContexts: kNumACContexts, streams: acTokens)
 
         // ---- Section writers (bit-exact duals listed in the file header).
         func writeLfGlobal(_ s: BitWriter) {
