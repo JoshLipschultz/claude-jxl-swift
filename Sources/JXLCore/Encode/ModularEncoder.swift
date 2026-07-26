@@ -65,19 +65,24 @@ enum ModularEncoder {
     /// learned trees + WP + palette + leaf multipliers.
     /// `squeeze` applies the default squeeze sequence (responsive-mode
     /// hierarchical decomposition; integer samples only, palette skipped).
+    /// `icc`, when set, is embedded in the codestream metadata as the image's
+    /// color encoding (`want_icc`); the native samples are then in that
+    /// profile's space. It adds a fixed number of bytes to every candidate, so
+    /// the size races below are unaffected.
     static func encodeLossless(
         _ image: JXLDecodedImage, backend: EntropyBackend = .ans, effort: Int = 2,
-        squeeze: Bool = false
+        squeeze: Bool = false, icc: [UInt8]? = nil
     ) throws -> [UInt8] {
         if squeeze {
             // Squeeze skips palette this round (an index channel's discrete
             // codes don't average meaningfully), so no double-encode either.
             return try encodeLossless(
-                image, backend: backend, effort: effort, allowPalette: false, squeeze: true
+                image, backend: backend, effort: effort, allowPalette: false, squeeze: true,
+                icc: icc
             ).bytes
         }
         let candidate = try encodeLossless(
-            image, backend: backend, effort: effort, allowPalette: true, squeeze: false)
+            image, backend: backend, effort: effort, allowPalette: true, squeeze: false, icc: icc)
         if candidate.usedPalette {
             // Palette-eligible images (≤256 colors) are cheap to encode; the
             // RCT + multiplier path occasionally wins on small ones, and the
@@ -87,10 +92,11 @@ enum ModularEncoder {
             var best = candidate.bytes
             let nn = try encodeLossless(
                 image, backend: backend, effort: effort, allowPalette: true, squeeze: false,
-                paletteOrder: .nnChain)
+                paletteOrder: .nnChain, icc: icc)
             if nn.bytes.count < best.count { best = nn.bytes }
             let direct = try encodeLossless(
-                image, backend: backend, effort: effort, allowPalette: false, squeeze: false)
+                image, backend: backend, effort: effort, allowPalette: false, squeeze: false,
+                icc: icc)
             if direct.bytes.count < best.count { best = direct.bytes }
             return best
         }
@@ -105,7 +111,7 @@ enum ModularEncoder {
         {
             let ycocg = try encodeLossless(
                 image, backend: backend, effort: effort, allowPalette: false, squeeze: false,
-                forcedRCT: 6)
+                forcedRCT: 6, icc: icc)
             if ycocg.bytes.count < candidate.bytes.count { return ycocg.bytes }
         }
         return candidate.bytes
@@ -117,7 +123,8 @@ enum ModularEncoder {
 
     private static func encodeLossless(
         _ image: JXLDecodedImage, backend: EntropyBackend, effort: Int, allowPalette: Bool,
-        squeeze: Bool, paletteOrder: PaletteOrder = .lexicographic, forcedRCT: Int? = nil
+        squeeze: Bool, paletteOrder: PaletteOrder = .lexicographic, forcedRCT: Int? = nil,
+        icc: [UInt8]? = nil
     ) throws -> (bytes: [UInt8], usedPalette: Bool, rctType: Int) {
         let gray = image.colorChannels == 1
         guard image.colorChannels == 1 || image.colorChannels == 3 else {
@@ -509,14 +516,35 @@ enum ModularEncoder {
             }
         }
 
+        // ---- Pre-frame header block. Byte-aligned at its end (the decoder's
+        // JumpToByteBoundary before frames), so it is serialized once here and
+        // appended verbatim by every candidate — identical bytes to writing it
+        // inline. With `icc`, the ICC-carrying variant is used instead; that
+        // one can throw (profile size limits), which is why it is hoisted out
+        // of the non-throwing `assemble`.
+        let headerBlock: [UInt8]
+        do {
+            let hw = BitWriter()
+            if let icc {
+                try ICCHeaderWriter.writeCodestreamHeaders(
+                    hw, width: UInt32(image.width), height: UInt32(image.height),
+                    bitsPerSample: UInt32(image.bitsPerSample), grayscale: gray,
+                    exponentBits: image.isFloat ? 8 : 0, alphaChannels: image.extraChannels,
+                    iccProfile: icc)
+            } else {
+                HeaderWriter.writeCodestreamHeaders(
+                    hw, width: UInt32(image.width), height: UInt32(image.height),
+                    bitsPerSample: UInt32(image.bitsPerSample), grayscale: gray,
+                    exponentBits: image.isFloat ? 8 : 0, alphaChannels: image.extraChannels)
+            }
+            headerBlock = hw.finalize()
+        }
+
         // ---- Header + sections (assembled per entropy variant; the LZ77
         // race keeps whichever full bitstream is smaller).
         func assemble(_ residual: any TokenEntropyEncoder, _ streamsF: [[EncToken]]) -> [UInt8] {
             let w = BitWriter()
-            HeaderWriter.writeCodestreamHeaders(
-                w, width: UInt32(image.width), height: UInt32(image.height),
-                bitsPerSample: UInt32(image.bitsPerSample), grayscale: gray,
-                exponentBits: image.isFloat ? 8 : 0, alphaChannels: image.extraChannels)
+            w.append(bytes: headerBlock)
             writeFrameHeader(w, numExtraChannels: image.extraChannels)
 
             let s0 = BitWriter()

@@ -104,6 +104,7 @@ struct TestRunner {
         lossyEncoderIdentities()
         lossyEncoder()
         jbrdEncode()
+        containerEncode()
 
         print("\n\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
@@ -3552,5 +3553,304 @@ struct TestRunner {
         } catch {
             check(false, "wrong error type")
         }
+    }
+
+    // MARK: - Container + metadata WRITING (E7)
+
+    /// A deterministic RGB/gray/alpha test image (gradients, so lossless
+    /// encodes are stable and cheap).
+    static func metaTestImage(
+        w: Int, h: Int, colorChannels: Int, extraChannels: Int = 0, bits: Int = 8,
+        icc: Data? = nil
+    ) -> JXLDecodedImage {
+        let maxV = Int32((1 << bits) - 1)
+        var planes: [[Int32]] = []
+        for c in 0..<(colorChannels + extraChannels) {
+            var p = [Int32](repeating: 0, count: w * h)
+            for y in 0..<h {
+                for x in 0..<w {
+                    p[y * w + x] = Int32((x * 7 + y * 11 + c * 29) % (Int(maxV) + 1))
+                }
+            }
+            planes.append(p)
+        }
+        return JXLDecodedImage(
+            width: w, height: h, colorChannels: colorChannels, extraChannels: extraChannels,
+            bitsPerSample: bits, isFloat: false, planes: planes, iccProfile: icc)
+    }
+
+    static func planesEqual(_ a: JXLDecodedImage, _ b: JXLDecodedImage) -> Bool {
+        a.width == b.width && a.height == b.height && a.planes.count == b.planes.count
+            && zip(a.planes, b.planes).allSatisfy { $0 == $1 }
+    }
+
+    /// The container writer, ICC embedding, and Exif/XMP boxes: write → read
+    /// identity through our own parsers, plus the structural invariants the
+    /// oracle sweep checks out of band (djxl v0.12 decodes every file written
+    /// here and its extracted ICC/Exif/XMP match byte-for-byte; verified out of
+    /// band, kept out of the suite, which has no oracle dependency).
+    static func containerEncode() {
+        let dir = fixturesDir()
+        let img = metaTestImage(w: 48, h: 32, colorChannels: 3)
+
+        // (1) Default options must be byte-identical to encodeLossless: the
+        //     size goldens depend on this.
+        guard let bare = try? JXL.encode(image: img),
+            let legacy = try? JXL.encodeLossless(image: img)
+        else {
+            check(false, "default encode")
+            return
+        }
+        check(bare == legacy, "JXL.encode default == encodeLossless (bare, goldens unmoved)")
+        check(Array(bare.prefix(2)) == [0xFF, 0x0A], "default output is a bare codestream")
+
+        // (2) Container output wraps the SAME codestream; boxes appear in
+        //     signature/ftyp/…/jxlc order and our parser recovers it.
+        guard let contained = try? JXL.encode(
+            image: img, options: JXLEncodeOptions(format: .container))
+        else {
+            check(false, "container encode")
+            return
+        }
+        if let parsed = try? JXLContainer.parse(contained) {
+            check(parsed.isContainer, "container encode is a container")
+            eq(parsed.boxes.map(\.type), ["JXL ", "ftyp", "jxlc"], "box types + order")
+            eq(parsed.codestream, bare, "jxlc payload is the bare codestream verbatim")
+        } else {
+            check(false, "container parses")
+        }
+        if let info = try? JXL.readInfo(from: contained) {
+            check(info.isContainer, "readInfo reports container")
+            eq(Int(info.width), 48, "container width")
+        } else {
+            check(false, "container readInfo")
+        }
+        if let dec = try? JXL.decodeImage(from: contained) {
+            check(planesEqual(dec, img), "container decodes byte-exactly")
+        } else {
+            check(false, "container decodes")
+        }
+
+        // (3) ICC embedding. Both fixture profiles, bare and container, across
+        //     the shapes whose metadata layout differs (gray, 16-bit, alpha).
+        let profiles: [String] = ["32x24_icc.icc", "appl_display.icc"]
+        for name in profiles {
+            guard let icc = try? Data(contentsOf: dir.appendingPathComponent(name)) else {
+                check(false, "ICC fixture \(name) present")
+                continue
+            }
+            let shapes: [(label: String, img: JXLDecodedImage)] = [
+                ("rgb8", metaTestImage(w: 48, h: 32, colorChannels: 3)),
+                ("gray8", metaTestImage(w: 21, h: 13, colorChannels: 1)),
+                ("rgb16", metaTestImage(w: 40, h: 30, colorChannels: 3, bits: 16)),
+                ("rgba8", metaTestImage(w: 33, h: 17, colorChannels: 3, extraChannels: 1)),
+            ]
+            for (label, shape) in shapes {
+                for container in [false, true] {
+                    let opts = JXLEncodeOptions(
+                        format: container ? .container : .bareCodestream, iccProfile: icc)
+                    guard let out = try? JXL.encode(image: shape, options: opts) else {
+                        check(false, "ICC encode \(name)/\(label)/\(container)")
+                        continue
+                    }
+                    let readBack = (try? JXL.readICCProfile(from: out)).flatMap { $0 }
+                    check(
+                        readBack == icc,
+                        "ICC \(name) \(label) \(container ? "container" : "bare"): profile byte-exact")
+                    guard let dec = try? JXL.decodeImage(from: out) else {
+                        check(false, "ICC \(name)/\(label) decodes")
+                        continue
+                    }
+                    check(
+                        planesEqual(dec, shape),
+                        "ICC \(name) \(label) \(container ? "container" : "bare"): pixels byte-exact")
+                    check(
+                        dec.iccProfile == icc,
+                        "ICC \(name) \(label): decoded image carries the profile")
+                    if let info = try? JXL.readInfo(from: out) {
+                        check(info.colorEncoding.wantICC, "ICC \(name) \(label): want_icc set")
+                        eq(
+                            info.colorChannelCount, shape.colorChannels,
+                            "ICC \(name) \(label): color space channel count")
+                        eq(
+                            info.extraChannelCount, shape.extraChannels,
+                            "ICC \(name) \(label): extra channel count")
+                    } else {
+                        check(false, "ICC \(name)/\(label) readInfo")
+                    }
+                }
+            }
+        }
+
+        // (4) The residual stream itself: every candidate the writer considers
+        //     must reconstruct the profile through the DECODER's unpredictICC,
+        //     and the optimized (command-search) candidate must be present and
+        //     preferred for a profile with a big curve table.
+        for name in profiles {
+            guard let icc = try? Data(contentsOf: dir.appendingPathComponent(name)),
+                let candidates = try? iccResidualCandidates([UInt8](icc))
+            else {
+                check(false, "ICC residual candidates \(name)")
+                continue
+            }
+            check(candidates.count >= 1, "\(name): at least the plain residual form")
+            var allRoundTrip = true
+            for candidate in candidates {
+                if (try? unpredictICC(candidate)) != [UInt8](icc) { allRoundTrip = false }
+            }
+            check(allRoundTrip, "\(name): every ICC residual candidate unpredicts exactly")
+            check(candidates.count == 2, "\(name): command-search candidate survived verification")
+        }
+
+        // (5) A profile that is nothing but a 128-byte header (no commands at
+        //     all) is still a valid residual stream.
+        var headerOnly = [UInt8](repeating: 0, count: 128)
+        headerOnly[0] = 0
+        headerOnly[1] = 0
+        headerOnly[2] = 0
+        headerOnly[3] = 128
+        headerOnly[8] = 4
+        if let candidates = try? iccResidualCandidates(headerOnly) {
+            check(
+                candidates.allSatisfy { (try? unpredictICC($0)) == headerOnly },
+                "header-only ICC profile round-trips")
+        } else {
+            check(false, "header-only ICC candidates")
+        }
+        check((try? iccResidualCandidates([])) == nil, "empty ICC profile rejected")
+
+        // (6) Exif + XMP boxes.
+        let exif = Data([0x4D, 0x4D, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00])
+        let xmp = Data("<?xpacket begin=\"\"?><x:xmpmeta/><?xpacket end=\"w\"?>".utf8)
+        guard let meta = try? JXL.encode(
+            image: img,
+            options: JXLEncodeOptions(format: .container, exif: exif, xmp: xmp))
+        else {
+            check(false, "Exif/XMP encode")
+            return
+        }
+        if let parsed = try? JXLContainer.parse(meta) {
+            eq(
+                parsed.boxes.map(\.type), ["JXL ", "ftyp", "Exif", "xml ", "jxlc"],
+                "metadata boxes precede the codestream")
+            // The Exif box payload carries the 4-byte tiff-header offset.
+            if let box = parsed.boxes.first(where: { $0.type == "Exif" }) {
+                eq(box.payload.count, exif.count + 4, "Exif box payload = offset prefix + stream")
+                eq(
+                    Array(meta[box.payload.lowerBound..<(box.payload.lowerBound + 4)]),
+                    [0, 0, 0, 0], "Exif tiff-header offset is 0")
+            } else {
+                check(false, "Exif box present")
+            }
+        } else {
+            check(false, "metadata container parses")
+        }
+        check((try? JXL.readExif(from: meta)).flatMap { $0 } == exif, "readExif byte-exact")
+        check((try? JXL.readXMP(from: meta)).flatMap { $0 } == xmp, "readXMP byte-exact")
+        check(
+            (try? JXL.readBoxPayload(from: meta, type: "xml ")).flatMap { $0 } == xmp,
+            "readBoxPayload('xml ') byte-exact")
+        if let dec = try? JXL.decodeImage(from: meta) {
+            check(planesEqual(dec, img), "metadata container decodes byte-exactly")
+        } else {
+            check(false, "metadata container decodes")
+        }
+
+        // Bare files (and containers without the box) report nil, not an error.
+        check((try? JXL.readExif(from: bare)).flatMap { $0 } == nil, "bare file has no Exif")
+        check((try? JXL.readXMP(from: bare)).flatMap { $0 } == nil, "bare file has no XMP")
+        check(
+            (try? JXL.readExif(from: contained)).flatMap { $0 } == nil,
+            "container without Exif reports nil")
+
+        // The jbrd path's Exif box reads back through the same public API.
+        if let jpeg = try? Data(contentsOf: dir.appendingPathComponent("256x192_jbrd.jpg")),
+            let transcoded = try? JXL.encodeJPEGTranscode(jpeg: [UInt8](jpeg))
+        {
+            if let parsed = try? JXLContainer.parse(transcoded) {
+                eq(
+                    parsed.boxes.map(\.type), ["JXL ", "ftyp", "jbrd", "Exif", "jxlc"],
+                    "jbrd container layout unchanged")
+            } else {
+                check(false, "jbrd container parses")
+            }
+            let jbrdExif = (try? JXL.readExif(from: transcoded)).flatMap { $0 }
+            check(jbrdExif != nil, "jbrd Exif box readable via readExif")
+            check(
+                jbrdExif.map { $0.starts(with: [0x4D, 0x4D]) || $0.starts(with: [0x49, 0x49]) }
+                    ?? false,
+                "jbrd Exif is a TIFF stream")
+        } else {
+            check(false, "jbrd fixture transcodes")
+        }
+
+        // (7) Combinations that cannot be honored must throw, not drop data.
+        check(
+            (try? JXL.encode(image: img, options: JXLEncodeOptions(exif: exif))) == nil,
+            "Exif with bare output is rejected")
+        check(
+            (try? JXL.encode(image: img, options: JXLEncodeOptions(xmp: xmp))) == nil,
+            "XMP with bare output is rejected")
+        if let icc = try? Data(contentsOf: dir.appendingPathComponent("32x24_icc.icc")) {
+            check(
+                (try? JXL.encode(
+                    image: img, options: JXLEncodeOptions(quality: 90, iccProfile: icc))) == nil,
+                "lossy + ICC is rejected (XYB is derived from sRGB-interpreted samples)")
+            // An image carrying a profile is not silently stripped either...
+            let tagged = metaTestImage(w: 48, h: 32, colorChannels: 3, icc: icc)
+            check(
+                (try? JXL.encode(image: tagged, options: JXLEncodeOptions(quality: 90))) == nil,
+                "lossy on an ICC-tagged image is rejected")
+            // ...but the caller can say so explicitly.
+            check(
+                (try? JXL.encode(
+                    image: tagged,
+                    options: JXLEncodeOptions(quality: 90, dropICCProfile: true))) != nil,
+                "lossy + dropICCProfile encodes")
+            // Lossless picks the image's own profile up by default.
+            if let out = try? JXL.encode(image: tagged) {
+                check(
+                    (try? JXL.readICCProfile(from: out)).flatMap { $0 } == icc,
+                    "image.iccProfile is embedded by default")
+            } else {
+                check(false, "ICC-tagged lossless encode")
+            }
+            if let out = try? JXL.encode(
+                image: tagged, options: JXLEncodeOptions(dropICCProfile: true))
+            {
+                check(out == legacy, "dropICCProfile reproduces the plain bare codestream")
+            } else {
+                check(false, "dropICCProfile lossless encode")
+            }
+        }
+
+        // (8) Lossy + container (no ICC) is a normal, supported combination.
+        if let lossy = try? JXL.encode(
+            image: img, options: JXLEncodeOptions(quality: 85, format: .container, xmp: xmp)),
+            let parsed = try? JXLContainer.parse(lossy)
+        {
+            eq(parsed.boxes.map(\.type), ["JXL ", "ftyp", "xml ", "jxlc"], "lossy container boxes")
+            check((try? JXL.readXMP(from: lossy)).flatMap { $0 } == xmp, "lossy container XMP")
+            check((try? JXL.decodeImage(from: lossy)) != nil, "lossy container decodes")
+        } else {
+            check(false, "lossy container encode")
+        }
+
+        // (9) Effort/squeeze options still route correctly through JXL.encode.
+        for (effort, squeeze) in [(1, false), (2, false), (2, true)] {
+            guard let out = try? JXL.encode(
+                image: img,
+                options: JXLEncodeOptions(effort: effort, squeeze: squeeze, format: .container)),
+                let ref = try? JXL.encodeLossless(image: img, effort: effort, squeeze: squeeze),
+                let parsed = try? JXLContainer.parse(out)
+            else {
+                check(false, "encode effort \(effort) squeeze \(squeeze)")
+                continue
+            }
+            eq(parsed.codestream, ref, "encode(effort: \(effort), squeeze: \(squeeze)) codestream")
+        }
+
+        FileHandle.standardError.write(
+            Data("  [container-write] ISOBMFF + ICC + Exif/XMP write->read identity\n".utf8))
     }
 }

@@ -35,14 +35,22 @@ func usage() -> Never {
                                            "dither" = blue-noise dither 8-bit output
                                            (djxl 0.12 default)
           jxl encode <in> <out.jxl> [e1|e2] [responsive] [q<N>]
+                                     [container] [icc=<f>] [exif=<f>] [xmp=<f>]
                                            Encode: PGM/PPM (int), PAM P7 (+alpha),
                                            PFM (float32). Lossless by default;
                                            e1 = fast, e2 = smaller (default);
                                            "responsive" = squeeze (progressive);
-                                           q<N> (1-100) = lossy XYB VarDCT
+                                           q<N> (1-100) = lossy XYB VarDCT;
+                                           "container" = ISOBMFF output (default
+                                           is a bare codestream);
+                                           icc= embeds an ICC profile (lossless
+                                           only), exif=/xmp= add metadata boxes
+                                           (both imply "container")
           jxl fromjpeg <in.jpg> <out.jxl>  Recompress a baseline JPEG losslessly
                                            (reconstruct with `jxl tojpeg`)
           jxl icc    <file.jxl> [out.icc]  Extract the embedded ICC profile
+          jxl exif   <file.jxl> [out.exif] Extract the Exif box (TIFF stream)
+          jxl xmp    <file.jxl> [out.xmp]  Extract the XMP (`xml ` box) packet
           jxl vardct <file.jxl>            Preflight VarDCT global metadata
           jxl vardct-dc <file.jxl> [dump]  Decode VarDCT XYB DC image (lossy)
           jxl vardct-acmeta <file.jxl>     Decode VarDCT AC metadata (strategy/quant)
@@ -289,6 +297,31 @@ do {
             print("embedded ICC profile: \(profile.count) bytes, data color space '\(desc)'")
         }
 
+    case "exif":
+        guard let exif = try JXL.readExif(from: bytes) else {
+            print("no Exif box")
+            break
+        }
+        if args.count >= 4 {
+            try exif.write(to: URL(fileURLWithPath: args[3]))
+            print("wrote \(exif.count)-byte Exif TIFF stream -> \(args[3])")
+        } else {
+            let bom = exif.count >= 2 ? String(decoding: exif[0..<2], as: UTF8.self) : "?"
+            print("Exif: \(exif.count) bytes, byte order '\(bom)'")
+        }
+
+    case "xmp":
+        guard let xmp = try JXL.readXMP(from: bytes) else {
+            print("no XMP ('xml ') box")
+            break
+        }
+        if args.count >= 4 {
+            try xmp.write(to: URL(fileURLWithPath: args[3]))
+            print("wrote \(xmp.count)-byte XMP packet -> \(args[3])")
+        } else {
+            print("XMP: \(xmp.count) bytes")
+        }
+
     case "bench":
         let iters = args.count >= 4 ? (Int(args[3]) ?? 5) : 5
         let warm = try JXL.decodeImage(from: bytes)  // warmup + dimensions
@@ -363,34 +396,60 @@ do {
         var effort = 2
         var squeeze = false
         var lossyQuality: Int? = nil
+        var container = false
+        var iccData: Data? = nil
+        var exifData: Data? = nil
+        var xmpData: Data? = nil
+        func sidecar(_ arg: String, _ prefix: String) -> Data {
+            let file = String(arg.dropFirst(prefix.count))
+            guard let d = try? Data(contentsOf: URL(fileURLWithPath: file)) else {
+                fail("error: cannot read \(prefix)\(file)")
+            }
+            return d
+        }
         for arg in args.dropFirst(4) {
             switch arg {
             case "e1": effort = 1  // fast: fixed gradient tree, RCT only
             case "e2": effort = 2  // default: learned trees, WP, palette, multipliers
             case "responsive": squeeze = true  // squeeze: progressive decodability
+            case "container": container = true  // ISOBMFF instead of bare codestream
             default:
                 if arg.hasPrefix("q"), let q = Int(arg.dropFirst()), (1...100).contains(q) {
                     lossyQuality = q  // lossy XYB VarDCT at this quality
+                } else if arg.hasPrefix("icc=") {
+                    iccData = sidecar(arg, "icc=")
+                } else if arg.hasPrefix("exif=") {
+                    exifData = sidecar(arg, "exif=")
+                } else if arg.hasPrefix("xmp=") {
+                    xmpData = sidecar(arg, "xmp=")
                 } else {
                     usage()
                 }
             }
         }
-        let jxl: [UInt8]
-        if let q = lossyQuality {
-            jxl = try JXL.encodeLossy(image: image, quality: q)
-        } else {
-            jxl = try JXL.encodeLossless(image: image, effort: effort, squeeze: squeeze)
-        }
+        // Boxes only exist in a container, so exif=/xmp= imply it rather than
+        // failing the encode on a flag the user obviously meant to have.
+        if exifData != nil || xmpData != nil { container = true }
+        let options = JXLEncodeOptions(
+            quality: lossyQuality, effort: effort, squeeze: squeeze,
+            format: container ? .container : .bareCodestream,
+            iccProfile: iccData, exif: exifData, xmp: xmpData)
+        let jxl = try JXL.encode(image: image, options: options)
         try Data(jxl).write(to: URL(fileURLWithPath: args[3]))
         let raw = image.width * image.height * (image.colorChannels + image.extraChannels)
             * (image.isFloat ? 4 : (image.bitsPerSample > 8 ? 2 : 1))
         let kind = image.isFloat ? "float32" : "\(image.bitsPerSample)-bit"
         let space = image.colorChannels == 1 ? "gray" : "RGB"
         let alpha = image.extraChannels > 0 ? "+alpha" : ""
+        var extras: [String] = []
+        if container { extras.append("container") }
+        if let iccData { extras.append("icc \(iccData.count) B") }
+        if let exifData { extras.append("exif \(exifData.count) B") }
+        if let xmpData { extras.append("xmp \(xmpData.count) B") }
+        let suffix = extras.isEmpty ? "" : "  [\(extras.joined(separator: ", "))]"
         print(
             "encoded \(image.width) x \(image.height) \(kind) \(space)\(alpha) -> \(args[3]) "
-                + "(\(jxl.count) bytes, raw \(raw))")
+                + "(\(jxl.count) bytes, raw \(raw))\(suffix)")
 
     default:
         usage()

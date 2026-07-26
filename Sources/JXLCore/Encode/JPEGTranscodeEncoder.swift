@@ -798,35 +798,8 @@ private func serializeJBRD(_ jp: ParsedJPEG) throws -> [UInt8] {
     return out
 }
 
-// MARK: - Uncompressed ("store") Brotli stream
-
-/// Emits a valid Brotli stream that decompresses to exactly `payload` (RFC 7932
-/// uncompressed meta-block, then a final empty last meta-block). Brotli and the
-/// JXL BitWriter are both LSB-first, so the same writer serializes it.
-private func brotliStore(_ payload: [UInt8]) -> [UInt8] {
-    let w = BitWriter()
-    w.write(0, 1)  // WBITS selector 0 -> window 16
-    if payload.isEmpty {
-        w.write(1, 1)  // ISLAST = 1
-        w.write(1, 1)  // ISLASTEMPTY = 1
-        return w.finalize()
-    }
-    // Uncompressed meta-block (non-last).
-    w.write(0, 1)  // ISLAST = 0
-    let mlen = payload.count
-    let stored = UInt64(mlen - 1)
-    let nibbles: Int
-    if mlen <= (1 << 16) { nibbles = 4 } else if mlen <= (1 << 20) { nibbles = 5 } else { nibbles = 6 }
-    w.write(UInt64(nibbles - 4), 2)  // MNIBBLES
-    for i in 0..<nibbles { w.write((stored >> UInt64(4 * i)) & 0xF, 4) }
-    w.write(1, 1)  // ISUNCOMPRESSED = 1
-    w.alignToByte()
-    w.append(bytes: payload)
-    // Final empty last meta-block.
-    w.write(1, 1)  // ISLAST = 1
-    w.write(1, 1)  // ISLASTEMPTY = 1
-    return w.finalize()
-}
+// (The uncompressed "store" Brotli serializer this box needs now lives in
+// ContainerWriter.swift as `brotliStore`, shared with the container writer.)
 
 // MARK: - AC block-context tables (mirror of the decoder; local dual)
 
@@ -1347,31 +1320,6 @@ private func buildTranscodeCodestream(_ jp: ParsedJPEG) throws -> [UInt8] {
     return head.finalize()
 }
 
-// MARK: - Container assembly
-
-private func be32(_ v: UInt32) -> [UInt8] {
-    [UInt8(v >> 24 & 0xFF), UInt8(v >> 16 & 0xFF), UInt8(v >> 8 & 0xFF), UInt8(v & 0xFF)]
-}
-
-private func isobmffBox(_ type: String, _ payload: [UInt8]) -> [UInt8] {
-    var b = be32(UInt32(8 + payload.count))
-    b.append(contentsOf: Array(type.utf8))
-    b.append(contentsOf: payload)
-    return b
-}
-
-private func assembleContainer(codestream: [UInt8], jbrd: [UInt8], exif: [UInt8]?) -> [UInt8] {
-    var out: [UInt8] = []
-    out.append(contentsOf: JXLContainer.containerSignature)  // JXL signature box
-    // ftyp: major brand "jxl ", minor version 0, compatible brand "jxl ".
-    let jxlBrand = Array("jxl ".utf8)
-    out.append(contentsOf: isobmffBox("ftyp", jxlBrand + [0, 0, 0, 0] + jxlBrand))
-    out.append(contentsOf: isobmffBox("jbrd", jbrd))
-    if let exif { out.append(contentsOf: isobmffBox("Exif", exif)) }
-    out.append(contentsOf: isobmffBox("jxlc", codestream))
-    return out
-}
-
 // MARK: - Public entry point
 
 enum JPEGTranscodeEncoder {
@@ -1379,7 +1327,14 @@ enum JPEGTranscodeEncoder {
         let jp = try parseJPEG(jpeg)
         let jbrd = try serializeJBRD(jp)
         let codestream = try buildTranscodeCodestream(jp)
-        return assembleContainer(codestream: codestream, jbrd: jbrd, exif: jp.exifPayload)
+        // Container layout (unchanged, byte-exact): signature, ftyp, jbrd,
+        // Exif (when the JPEG carried one), jxlc. `jp.exifPayload` already
+        // includes the Exif box's 4-byte TIFF-offset prefix.
+        var boxes = [ContainerBox(type: "jbrd", payload: jbrd)]
+        if let exif = jp.exifPayload {
+            boxes.append(ContainerBox(type: "Exif", payload: exif))
+        }
+        return try ContainerWriter.assemble(codestream: codestream, metadataBoxes: boxes)
     }
 }
 

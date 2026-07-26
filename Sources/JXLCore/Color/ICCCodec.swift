@@ -13,8 +13,11 @@
 
 import Foundation
 
-private let kICCHeaderSize = 128
-private let kNumICCContexts = 41
+// Shared with the ENCODER (Encode/ICCWriter.swift): the prediction and context
+// functions below are the load-bearing duals, so the writer calls these exact
+// definitions rather than a copy.
+let kICCHeaderSize = 128
+let kNumICCContexts = 41
 /// libjxl caps the encoded stream at 2^28; we cap the output the same way.
 private let kMaxEncodedICCSize = 1 << 28
 private let kMaxDecodedICCSize = 1 << 28
@@ -47,7 +50,7 @@ private func byteKind2(_ b: UInt8) -> Int {
 }
 
 @inline(__always)
-private func iccANSContext(_ i: Int, _ b1: UInt8, _ b2: UInt8) -> Int {
+func iccANSContext(_ i: Int, _ b1: UInt8, _ b2: UInt8) -> Int {
     if i <= 128 { return 0 }
     return 1 + byteKind1(b1) + byteKind2(b2) * 8
 }
@@ -101,10 +104,10 @@ private let kCommandTagUnknown = 1
 private let kCommandTagTRC = 2
 private let kCommandTagXYZ = 3
 private let kCommandTagStringFirst = 4
-private let kCommandInsert: UInt8 = 1
-private let kCommandShuffle2: UInt8 = 2
-private let kCommandShuffle4: UInt8 = 3
-private let kCommandPredict: UInt8 = 4
+let kCommandInsert: UInt8 = 1
+let kCommandShuffle2: UInt8 = 2
+let kCommandShuffle4: UInt8 = 3
+let kCommandPredict: UInt8 = 4
 private let kCommandXYZ: UInt8 = 10
 private let kCommandTypeStartFirst = 16
 private let kFlagBitOffset: UInt8 = 64
@@ -153,7 +156,7 @@ private func checkIs32Bit(_ v: UInt64) throws {
 }
 
 /// libjxl `Shuffle`: transpose of a ceil(size/width)-column, width-row matrix.
-private func shuffle(_ data: inout [UInt8], size: Int, width: Int) {
+func iccShuffle(_ data: inout [UInt8], size: Int, width: Int) {
     let height = (size + width - 1) / width
     var result = [UInt8](repeating: 0, count: size)
     var s = 0
@@ -171,7 +174,7 @@ private func shuffle(_ data: inout [UInt8], size: Int, width: Int) {
 
 /// Predicted first 128 header bytes, with the profile size stored big-endian
 /// in the first 4 (libjxl `ICCInitialHeaderPrediction`).
-private func iccInitialHeaderPrediction(_ size: UInt32) -> [UInt8] {
+func iccInitialHeaderPrediction(_ size: UInt32) -> [UInt8] {
     var header = [UInt8](repeating: 0, count: kICCHeaderSize)
     header[8] = 4
     let ascii: [(Int, String)] = [(12, "mntr"), (16, "RGB "), (20, "XYZ "), (36, "acsp")]
@@ -192,7 +195,7 @@ private func iccInitialHeaderPrediction(_ size: UInt32) -> [UInt8] {
 
 /// Refines the header prediction from bytes already decoded (libjxl
 /// `ICCPredictHeader`).
-private func iccPredictHeader(_ icc: [UInt8], _ size: Int, _ header: inout [UInt8], _ pos: Int) {
+func iccPredictHeader(_ icc: [UInt8], _ size: Int, _ header: inout [UInt8], _ pos: Int) {
     if pos == 8 && size >= 8 {
         header[80] = icc[4]
         header[81] = icc[5]
@@ -225,7 +228,7 @@ private func iccPredictHeader(_ icc: [UInt8], _ size: Int, _ header: inout [UInt
 
 /// Linear prediction of order 0-2 for width-byte integers `stride` bytes apart
 /// (libjxl `LinearPredictICCValue`); all math wraps like the C original.
-private func linearPredictICCValue(
+func linearPredictICCValue(
     _ data: [UInt8], start: Int, i: Int, stride: Int, width: Int, order: Int
 ) -> UInt8 {
     @inline(__always) func predict(_ p1: Int64, _ p2: Int64, _ p3: Int64) -> Int64 {
@@ -267,7 +270,7 @@ private func linearPredictICCValue(
 // MARK: - UnpredictICC (icc_codec.cc)
 
 /// Decodes the prediction-residual stream back to a valid ICC profile.
-private func unpredictICC(_ enc: [UInt8]) throws -> [UInt8] {
+func unpredictICC(_ enc: [UInt8]) throws -> [UInt8] {
     let size = enc.count
     var pos = 0
     if pos >= size { throw JXLError.malformed("ICC: out of bounds") }
@@ -403,7 +406,7 @@ private func unpredictICC(_ enc: [UInt8]) throws -> [UInt8] {
             try checkOutOfBounds(UInt64(pos), num64, UInt64(size))
             let num = Int(num64)
             var shuffled = [UInt8](enc[pos..<(pos + num)])
-            shuffle(&shuffled, size: num, width: command == kCommandShuffle2 ? 2 : 4)
+            iccShuffle(&shuffled, size: num, width: command == kCommandShuffle2 ? 2 : 4)
             result.append(contentsOf: shuffled)
             pos += num
         } else if command == kCommandPredict {
@@ -432,7 +435,7 @@ private func unpredictICC(_ enc: [UInt8]) throws -> [UInt8] {
             try checkOutOfBounds(UInt64(pos), num64, UInt64(size))
             let num = Int(num64)
             var shuffled = [UInt8](enc[pos..<(pos + num)])
-            if width > 1 { shuffle(&shuffled, size: num, width: width) }
+            if width > 1 { iccShuffle(&shuffled, size: num, width: width) }
             let start = result.count
             for i in 0..<num {
                 let predicted = linearPredictICCValue(
