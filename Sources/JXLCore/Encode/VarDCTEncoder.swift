@@ -406,11 +406,49 @@ private let kColorScale: Float = 1 / kDefaultColorFactor
 
 /// Least-squares slope -> nearest valid per-tile int8 offset from `base`.
 @inline(__always)
+/// Chroma-from-luma master switch. `JXL_CFL=0` pins every tile to the base
+/// correlation, which is how CfL is isolated when bisecting a quality anomaly
+/// (it is otherwise invisible: no other knob turns it off).
+let kEncCfLEnabled: Bool = {
+    if let s = ProcessInfo.processInfo.environment["JXL_CFL"] { return s != "0" }
+    return true
+}()
+
 private func encFitColorTile(sumTargetY: Double, sumYY: Double, base: Float) -> Int32 {
+    guard kEncCfLEnabled else { return 0 }
     guard sumYY > 1e-9 else { return 0 }
     let slope = Float(sumTargetY / sumYY)
     let raw = ((slope - base) / kColorScale).rounded()
-    return Int32(min(127, max(-128, raw)))
+    let quantized = Int32(min(127, max(-128, raw)))
+
+    // ACCEPT THE FIT ONLY IF IT ACTUALLY LOWERS THE RESIDUAL.
+    //
+    // `sumYY > 1e-9` guards division by zero but NOT ill-conditioning, and the
+    // difference is a real bug rather than a nicety. On near-flat tiles sumYY
+    // is tiny but nonzero, so the least-squares slope is driven by numerical
+    // noise and comes out enormous — and the clamp then applies a FULL-SCALE
+    // (+-127) chroma correction derived from that noise.
+    //
+    // It showed up as quality going BACKWARDS as quality rose: on the
+    // benchmark's smoothest image the B channel fell from 17.4 dB at q10 to
+    // 15.5 dB at q25. The U-shape is diagnostic — at coarse quant the
+    // reconstructed Y is all zeros so sumYY trips the guard and the fit is
+    // skipped; at high quality Y is accurate and the fit is genuine; the damage
+    // lands in between, where Y is nonzero but nearly constant.
+    //
+    // The test is exact and needs no tuned epsilon. Residual energy for slope s
+    // is `sumTT - 2*s*sumTargetY + s^2*sumYY`, so COMPARING two slopes cancels
+    // the unknown sumTT term entirely. Compare the slope the decoder will
+    // actually reconstruct (base + quantized*kColorScale, not the unrounded
+    // least-squares value) against the base, and keep the correction only when
+    // it wins. Returning 0 means "use base", which is what the decoder computes
+    // for a zero correlation index.
+    let fitted = Double(base) + Double(quantized) * Double(kColorScale)
+    let baseline = Double(base)
+    let deltaEnergy =
+        -2.0 * (fitted - baseline) * sumTargetY
+        + (fitted * fitted - baseline * baseline) * sumYY
+    return deltaEnergy < 0 ? quantized : 0
 }
 
 // MARK: - Rate-distortion coefficient quantization (E5d)
