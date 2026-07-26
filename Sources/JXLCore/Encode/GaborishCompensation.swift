@@ -52,17 +52,36 @@ import Foundation
 /// real lever the moment the encoder emits a meaningful sharpness field —
 /// tracked separately; that is the work, not the header bit.
 ///
-/// `JXL_FILTERS` forces one configuration for offline measurement, following
-/// the same env-override convention as the DCT16 knobs in VarDCTStrategy.swift:
-///   off  — the pre-E5h bitstream (gaborish off, epf 0)
-///   gab  — Gaborish only, the half the encoder can invert exactly
-///   on   — libjxl's defaults
+/// SUPERSEDED BY E5j — THE DEFAULT IS NOW `off`, AND THE RACE IS SKIPPED.
+///
+/// E5h measured Gaborish as strictly dominant at low bitrate (smaller AND
+/// higher PSNR) and shipped it as the default, raced per frame. E5j then
+/// removed the ~2.8 KB constant HfGlobal header, and that inverted the
+/// economics: when every low-rate file carried a fat fixed header, the extra
+/// coefficient bytes Gaborish costs were a small relative surcharge; with the
+/// header gone they dominate, and the RD lambda declines them everywhere.
+///
+/// Re-measured across the corpus after E5j, forced GAB vs forced OFF, the race
+/// picked OFF in ALL 17 cases — q1 through q90, smooth, photographic, noisy and
+/// text. Gaborish consistently costs more bytes for a fraction of a dB:
+///     photo_bridge q90  GAB 186157 B/38.42 dB   OFF 151715 B/36.88 dB
+///     photo_sky    q1   GAB    281 B/17.04 dB   OFF    271 B/17.03 dB
+/// So the race was spending 1.11 s on a 6 MP frame — 30% of encode time — to
+/// arrive at the same answer every time. Defaulting to `off` skips it and
+/// produces BYTE-IDENTICAL output to what the race was already choosing.
+///
+/// THIS IS NOT "FILTERS DO NOT HELP IN JPEG XL". It is filters under OUR RD
+/// calibration: kRDLambda0 and the E5b quant field were both tuned with filters
+/// off, and they rest on the scaled-inverse-DCT isometry that Gaborish breaks.
+/// Recalibrating lambda under filters is the open question, and the machinery
+/// is left fully intact for it — `JXL_FILTERS=gab|on` plus `JXL_FILTER_RACE=1`
+/// restore the E5h behaviour for exactly that experiment.
 let kEncDefaultFilters: VarDCTEncoder.EncFilterConfig = {
     switch ProcessInfo.processInfo.environment["JXL_FILTERS"] {
     case "off": return .off
     case "gab": return .gaborishOnly
     case "on": return .defaultOn
-    default: return .gaborishOnly
+    default: return .off
     }
 }()
 

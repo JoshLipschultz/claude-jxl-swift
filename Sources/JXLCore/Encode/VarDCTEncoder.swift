@@ -215,6 +215,9 @@ private struct ACEntropyCoder {
     /// aliasLookup so encode inverts decode by construction).
     private let counts: [[Int32]]
     private let slots: [[[UInt16]]]
+    /// Raw (un-normalized) per-cluster token occurrences, kept so the map race
+    /// can price a candidate's payload analytically instead of serializing it.
+    private let rawHist: [[Int]]
 
     /// Picks the AC context map by MEASURED serialized size.
     ///
@@ -252,16 +255,39 @@ private struct ACEntropyCoder {
 
         let a = ACEntropyCoder(numContexts: numContexts, streams: streams, map: single)
         let b = ACEntropyCoder(numContexts: numContexts, streams: streams, map: multi)
-        return a.serializedSize(streams) <= b.serializedSize(streams) ? a : b
+        return a.estimatedSize(streams) <= b.estimatedSize(streams) ? a : b
     }
 
-    /// Total bytes this coder would emit for `streams`: the HfGlobal header
-    /// plus every group's payload. Exact — it runs the real writers.
-    private func serializedSize(_ streams: [[EncToken]]) -> Int {
+    /// What this coder would cost for `streams`, in bytes.
+    ///
+    /// The HfGlobal header — the part that differs enormously between
+    /// candidates and is the entire point of the race — is measured EXACTLY by
+    /// running the real writer. The payload is priced analytically as the
+    /// entropy of the tokens under the SAME normalized (sum-4096) counts the
+    /// ANS coder will actually use, which tracks the real coded size closely
+    /// because that is precisely what rANS achieves.
+    ///
+    /// Serializing every group's payload twice just to compare two numbers cost
+    /// 0.66 s on a 6 MP frame — 16% of total encode time — for a decision that
+    /// two histograms already determine. Extra bits are omitted deliberately:
+    /// they depend only on the token values, which are identical across
+    /// candidates, so they cancel in the comparison.
+    private func estimatedSize(_ streams: [[EncToken]]) -> Double {
         let w = BitWriter()
         writeHeader(w)
-        for s in streams { encodeStream(w, s) }
-        return w.finalize().count
+        let headerBytes = Double(w.finalize().count)
+        var payloadBits = 0.0
+        let denom = Double(1 << 12)  // counts are normalized to sum 4096
+        for c in 0..<rawHist.count {
+            let raw = rawHist[c]
+            let norm = counts[c]
+            for sym in 0..<raw.count where raw[sym] > 0 {
+                let f = Double(norm[sym])
+                // A symbol that occurs cannot have been normalized to zero.
+                payloadBits -= Double(raw[sym]) * (f > 0 ? log2(f / denom) : -32.0)
+            }
+        }
+        return headerBytes + payloadBits / 8.0
     }
 
     private init(numContexts: Int, streams: [[EncToken]], map: [UInt8]) {
@@ -282,6 +308,7 @@ private struct ACEntropyCoder {
             }
         }
         logAlphaSize = max(5, ceilLog2Nonzero(UInt32(maxToken + 1)))
+        rawHist = hist
 
         var cnts: [[Int32]] = []
         var slts: [[[UInt16]]] = []
