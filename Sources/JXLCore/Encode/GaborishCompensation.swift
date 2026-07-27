@@ -164,3 +164,11 @@ func encGaborishResidual(
     }
     return worst
 }
+
+/// Whether the lossy path learns its global modular tree (E5k) instead of
+/// using a fixed single-leaf gradient predictor. `JXL_DC_TREE=0` restores the
+/// fixed tree, which is how the two are measured against each other.
+let kEncLearnedDCTree: Bool = {
+    if let s = ProcessInfo.processInfo.environment["JXL_DC_TREE"] { return s != "0" }
+    return true
+}()

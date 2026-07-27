@@ -1339,14 +1339,83 @@ enum VarDCTEncoder {
             acTokens.append(tokens)
         }
 
-        // ---- Modular streams (single-leaf gradient global tree): the DC
-        // image (channels in modular order Y, X, B) and the AC metadata per
-        // DC group.
-        let tree = [
-            MATreeNode(
-                property: -1, splitVal: 0, lchild: 0, rchild: 0,
-                predictor: 5, predictorOffset: 0, multiplier: 1)
-        ]
+        // ---- Modular streams: the DC image (channels in modular order
+        // Y, X, B) and the AC metadata per DC group.
+        //
+        // E5k: THE GLOBAL TREE IS LEARNED, not a fixed single-leaf gradient.
+        // On smooth content the DC image is where the bytes are — 79% of a
+        // grad_smooth q50 file, 49% of photo_sky at q90 — and coding it with
+        // one predictor and one context left it at ~1.7 bits/sample for what is
+        // essentially a ramp. This project already owns a much better modular
+        // coder (E4a's learned MA trees, the machinery the LOSSLESS encoder
+        // uses to beat cjxl -e7); the lossy path simply was not reaching for
+        // it. Same lesson as E5j: the win was in using what we had.
+        //
+        // Training samples the DC planes only. They dominate the byte count,
+        // and the AC-metadata channels (CfL maps, ACS/quant rows, the all-zero
+        // sharpness field) have such different statistics that including them
+        // mostly buys splits that serve a few hundred bytes. The tree still
+        // CODES them — correctness does not depend on what it was trained on,
+        // only the density does.
+        let tree: [MATreeNode] = {
+            guard kEncLearnedDCTree else {
+                return [
+                    MATreeNode(
+                        property: -1, splitVal: 0, lchild: 0, rchild: 0,
+                        predictor: 5, predictorOffset: 0, multiplier: 1)
+                ]
+            }
+            let planeSamples = bw * bh
+            let strideStep = max(1, (planeSamples * 3) / 400_000)
+            var training = TreeTrainingSet()
+            for (chan, plane) in [(0, qDCY), (1, qDCX), (2, qDCB)] {
+                plane.withUnsafeBufferPointer { buf in
+                    training.collect(
+                        plane: buf, width: bw, x0: 0, y0: 0, gw: bw, gh: bh,
+                        chan: chan, stride: strideStep)
+                }
+            }
+            let fixed = [
+                MATreeNode(
+                    property: -1, splitVal: 0, lchild: 0, rchild: 0,
+                    predictor: 5, predictorOffset: 0, multiplier: 1)
+            ]
+            let learned = learnTree(training)
+            guard !learned.isEmpty, learned.count > 1 else { return fixed }
+            // RACE THEM ON MEASURED COST — but see the KNOWN LIMITATION
+            // below, because this race is not yet complete.
+            //
+            // A learned tree is not free: it is serialized into LfGlobal and
+            // every extra leaf adds an ANS histogram to the residual header.
+            // The race prices both candidates on real serialized bytes and
+            // keeps the smaller, the same way E5j chooses its context map.
+            //
+            // KNOWN LIMITATION, with the mechanism measured rather than
+            // guessed: pricing covers the DC planes ONLY, while the real
+            // encoder shares one histogram set across the DC *and* the
+            // AC-metadata streams. With the single-leaf tree everything shared
+            // one context anyway, so nothing was lost; with a learned tree the
+            // contexts are DC-specialised and the metadata tokens land in those
+            // same contexts and skew the histograms — degrading the very DC
+            // they were fitted to. The estimate cannot see that, so it is
+            // optimistic. Measured on gray_city q50, where the race wrongly
+            // picks the learned tree:
+            //     LfGlobal    30 B -> 205 B   (tree + histogram header)
+            //     DC groups 6352 B -> 6781 B  (the DC itself got WORSE)
+            //     total    15772 B -> 16376 B (+3.8%)
+            // Every other measured case wins, several by a lot (grad_smooth q50
+            // -29.4%, photo_sky q30 -27.3%, synth_text q30 -16.7%), so this
+            // ships with the regression documented rather than withheld. The
+            // fix is to price both candidates over the DC *and* metadata token
+            // streams — i.e. build both token sets and compare them whole —
+            // which is a refactor of the stream-building block, tracked
+            // separately.
+            let costFixed = encDCTreeCost(
+                tree: fixed, planes: [(0, qDCY), (1, qDCX), (2, qDCB)], bw: bw, bh: bh)
+            let costLearned = encDCTreeCost(
+                tree: learned, planes: [(0, qDCY), (1, qDCX), (2, qDCB)], bw: bw, bh: bh)
+            return costLearned < costFixed ? learned : fixed
+        }()
         var dcTokens: [[EncToken]] = []
         var metaTokens: [[EncToken]] = []
         /// Varblocks placed per DC group — the `count` its AcMetadata stream
@@ -1691,6 +1760,33 @@ enum VarDCTEncoder {
             w.writeU64(0)  // loop-filter extensions
         }
         w.writeU64(0)  // frame-header extensions
+    }
+
+    /// Real serialized cost of coding the DC planes under `tree`: the tree's
+    /// own serialization, the residual ANS histogram header (one histogram per
+    /// leaf), and the payload. Exact — it runs the real writers over the DC,
+    /// which is small relative to the AC work, so racing two trees is cheap.
+    private static func encDCTreeCost(
+        tree: [MATreeNode], planes: [(Int, [Int32])], bw: Int, bh: Int
+    ) -> Int {
+        let tTokens = treeTokens(tree)
+        let tw = BitWriter()
+        let tEnc = PrefixEntropyEncoder(numContexts: 6, streams: [tTokens])
+        tEnc.writeHeader(tw)
+        tEnc.encodeStream(tw, tTokens)
+        var toks: [EncToken] = []
+        for (chan, plane) in planes {
+            plane.withUnsafeBufferPointer { buf in
+                tokenizeChannelWithTree(
+                    into: &toks, plane: buf, width: bw, x0: 0, y0: 0, gw: bw, gh: bh,
+                    chan: chan, streamID: 1, tree: tree)
+            }
+        }
+        let coder = ANSEntropyEncoder(numContexts: treeNumLeaves(tree), streams: [toks])
+        let pw = BitWriter()
+        coder.writeHeader(pw)
+        coder.encodeStream(pw, toks)
+        return tw.finalize().count + pw.finalize().count
     }
 
     /// TOC entry size (toc.cc U32 distribution; mirror of ModularEncoder's).
