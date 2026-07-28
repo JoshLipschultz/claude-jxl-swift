@@ -379,7 +379,59 @@ every milestone lands with djxl round-trip proof, never just self-consistency.
       COST: the filter race adds an encode+decode per frame (worst case three
       of each, vs two before). Whether that stays is a measurement question,
       and `JXL_FILTER_RACE=0` is the lever.
-    - Remaining lossy quality levers (E5i+): further strategies (DCT32,
+    - **E5i** (2026-07-26): **ship the lossless stream when it is smaller.**
+      The first external benchmark scored text/screen at +874% BD-rate, and the
+      cause was mode selection, not coding: our lossy path emitted 64299 B where
+      our OWN lossless emitted 4042 B. This is a DOMINANCE check, not an RD
+      trade — a lossless stream is exact, so if it is also smaller it wins on
+      both axes and needs no lambda. Text -93.7%; every other corpus image
+      BYTE-IDENTICAL, which is the evidence it is dominance and not a heuristic.
+      Affordable because lossless is ~an order of magnitude FASTER than lossy
+      (6 MP: e1 ~0.11 s vs ~2.2 s). GRAYSCALE IS EXCLUDED: the lossy path
+      replicates gray to RGB so it decodes as 3 channels while lossless
+      preserves 1, and letting the rule fire would make the decoded channel
+      COUNT depend on which candidate won (it crashed a caller indexing
+      planes[0..<3]). Fixing that is native grayscale lossy, tracked separately.
+    - **E5j** (2026-07-26): **choose the AC context map by measured size.**
+      `jxl info <file> sections` (added here) showed HfGlobal was a near-CONSTANT
+      ~2800 B — 92% of a q1 file, describing 24 B of AC data. The threshold that
+      should have caught this measured the WRONG QUANTITY: it counted AC tokens
+      including per-block nonzero-COUNT tokens, one per block per channel even
+      when every coefficient is zero, so on any non-tiny image it could not fall
+      below 4096 and the expensive 8-cluster map was always chosen. Now both
+      maps are priced on real bytes and the smaller wins — a pure size choice
+      with no quality dimension, since only the entropy coding of already-fixed
+      coefficients changes. Corpus total -5.9%, q30 wins of -18% to -72% on
+      every image, byte-identical where dense AC genuinely wants 8 clusters.
+    - **E5k** (2026-07-26): **learn the global modular tree.** With HfGlobal
+      gone, the DC image was 79% of a smooth-content file at ~1.7 bits/sample
+      for a ramp, because the lossy path used a FIXED single-leaf gradient
+      predictor while the lossless encoder has had learned MA trees since E4a.
+      Learned tree, raced against the fixed one on real serialized bytes.
+      grad_smooth q50 -29.4%, photo_sky q30 -27.3%, golden fixture q50 -34.4%,
+      all at identical PSNR. KNOWN REGRESSION shipped deliberately: gray_city
+      q50 +3.8%, because pricing covers the DC planes only while the real
+      encoder shares one histogram set with the AC-metadata streams, so a
+      DC-specialised tree gets its contexts polluted and the DC itself degrades.
+      The fix is to price both candidates over DC AND metadata; tracked.
+    - **Perf** (2026-07-26): the races had stacked to +69% encode time. Two came
+      out with BYTE-IDENTICAL output: the E5j map race is now priced
+      analytically (entropy under the same normalized counts ANS will use;
+      extra bits cancel between candidates) rather than serialized, 0.66 s ->
+      0.12 s; and the E5h filter race was RETIRED because E5j inverted its
+      economics — with the fat header gone, Gaborish's extra coefficient bytes
+      dominate and forced-GAB lost to forced-OFF in all 17 re-measured cases.
+      6 MP q90 4.25 s -> 2.26 s. That is filters under OUR RD calibration, not a
+      property of the format; recalibrating lambda under Gaborish is tracked.
+    - THE PATTERN WORTH INHERITING: E5i, E5j and E5k were all the same shape —
+      the win was in USING MACHINERY THIS REPO ALREADY OWNED (the lossless
+      encoder, a header that described nothing, E4a's learned trees). The lossy
+      path had been built as though it were a separate codec from the lossless
+      one, and the seams between them were where the bytes were hiding. Reach
+      for `jxl info <file> sections` FIRST in any density question: it found all
+      three root causes in an afternoon after whole-file differencing had failed
+      to.
+    - Remaining lossy quality levers: further strategies (DCT32,
       rectangular, AFV), real trellis/joint RD across the block,
       a real EPF sharpness field (above). Note the
       E5f finding generalizes: adding a strategy whose blocks use a distinct

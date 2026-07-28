@@ -639,7 +639,15 @@ enum VarDCTEncoder {
     /// decodes; it is skipped entirely when DCT16 is disabled or when the
     /// DCT16 encode chose no DCT16 blocks at all (then the two are identical
     /// by construction).
-    static func encodeLossy(_ image: JXLDecodedImage, quality: Int = 90) throws -> [UInt8] {
+    static func encodeLossy(
+        _ image: JXLDecodedImage, quality: Int = 90, effort: Int = 2
+    ) throws -> [UInt8] {
+        // Effort 1 skips learning the global modular tree (E5k). That tree buys
+        // 20-30% on smooth content at identical quality, but `learnTree`'s
+        // greedy split search runs over every DC sample and roughly DOUBLES
+        // encode time on typical images (photo_city q50 0.08 s -> 0.18 s), so
+        // which side of that trade you want is a caller's decision, not ours.
+        let learnDCTree = effort >= 2 && kEncLearnedDCTree
         // Score any candidate on what was actually produced: true SSE against
         // the source (decoded through our own decoder) plus lambda * bytes.
         //
@@ -682,11 +690,13 @@ enum VarDCTEncoder {
         // pre-sharpens the input), so the DCT16 decision is better made on the
         // filter setting we are actually keeping.
         var best = try encodeLossyPass(
-            image, quality: quality, allowDCT16: true, filters: kEncDefaultFilters)
+            image, quality: quality, allowDCT16: true, filters: kEncDefaultFilters,
+            learnDCTree: learnDCTree)
         var bestScore = rdScore(best.bytes)
         if kEncFilterRaceEnabled, kEncDefaultFilters != .off {
             let unfiltered = try encodeLossyPass(
-                image, quality: quality, allowDCT16: true, filters: .off)
+                image, quality: quality, allowDCT16: true, filters: .off,
+                learnDCTree: learnDCTree)
             if let a = bestScore, let b = rdScore(unfiltered.bytes), b < a {
                 best = unfiltered
                 bestScore = b
@@ -706,7 +716,8 @@ enum VarDCTEncoder {
             return preferLosslessIfSmaller(image, lossy: best.bytes)
         }
         let plainDCT8 = try encodeLossyPass(
-            image, quality: quality, allowDCT16: false, filters: bestFilters)
+            image, quality: quality, allowDCT16: false, filters: bestFilters,
+            learnDCTree: learnDCTree)
         guard let s16 = bestScore, let s8 = rdScore(plainDCT8.bytes) else {
             // decode failure: keep the primary path
             return preferLosslessIfSmaller(image, lossy: best.bytes)
@@ -770,7 +781,7 @@ enum VarDCTEncoder {
 
     private static func encodeLossyPass(
         _ image: JXLDecodedImage, quality: Int, allowDCT16: Bool,
-        filters: EncFilterConfig = .off
+        filters: EncFilterConfig = .off, learnDCTree: Bool = true
     ) throws -> (bytes: [UInt8], usedDCT16: Bool, usedFilters: EncFilterConfig) {
         guard !image.isFloat else {
             throw JXLEncodeError(reason: "lossy encode supports integer samples only")
@@ -1358,7 +1369,7 @@ enum VarDCTEncoder {
         // CODES them — correctness does not depend on what it was trained on,
         // only the density does.
         let tree: [MATreeNode] = {
-            guard kEncLearnedDCTree else {
+            guard learnDCTree else {
                 return [
                     MATreeNode(
                         property: -1, splitVal: 0, lchild: 0, rchild: 0,
@@ -1813,7 +1824,12 @@ extension JXL {
     /// lossless while the color planes are lossy**. Float samples are still
     /// rejected, matching the decoder, which rejects float extra channels in a
     /// VarDCT frame outright.
-    public static func encodeLossy(image: JXLDecodedImage, quality: Int = 90) throws -> [UInt8] {
-        try VarDCTEncoder.encodeLossy(image, quality: quality)
+    /// `effort` 1 skips learning the global modular tree: roughly half the
+    /// encode time, at 20-30% larger files on smooth content. 2 (default)
+    /// learns it.
+    public static func encodeLossy(
+        image: JXLDecodedImage, quality: Int = 90, effort: Int = 2
+    ) throws -> [UInt8] {
+        try VarDCTEncoder.encodeLossy(image, quality: quality, effort: effort)
     }
 }

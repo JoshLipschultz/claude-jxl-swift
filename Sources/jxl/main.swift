@@ -38,7 +38,10 @@ func usage() -> Never {
                                      [container] [icc=<f>] [exif=<f>] [xmp=<f>]
                                            Encode: PGM/PPM (int), PAM P7 (+alpha),
                                            PFM (float32). Lossless by default;
-                                           e1 = fast, e2 = smaller (default);
+                                           e1 = fast, e2 = smaller (default) —
+                                           applies to lossy too: e1 skips the
+                                           learned DC tree, ~half the time for
+                                           20-30% larger smooth content;
                                            "responsive" = squeeze (progressive);
                                            q<N> (1-100) = lossy XYB VarDCT;
                                            "container" = ISOBMFF output (default
