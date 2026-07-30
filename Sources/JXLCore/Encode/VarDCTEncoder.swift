@@ -1368,27 +1368,21 @@ enum VarDCTEncoder {
         // mostly buys splits that serve a few hundred bytes. The tree still
         // CODES them — correctness does not depend on what it was trained on,
         // only the density does.
-        let tree: [MATreeNode] = {
-            guard learnDCTree else {
-                return [
-                    MATreeNode(
-                        property: -1, splitVal: 0, lchild: 0, rchild: 0,
-                        predictor: 5, predictorOffset: 0, multiplier: 1)
-                ]
-            }
+        // Candidate trees. The fixed single-leaf gradient predictor is the
+        // pre-E5k behaviour and the fallback; the learned one is fitted to the
+        // DC planes, which is where the bytes are (79% of a smooth-content
+        // file). Training is capped well below the lossless encoder's 400k
+        // sample target: a DC image is two orders of magnitude smaller than a
+        // full-resolution plane, so that target never engaged and learnTree
+        // walked every sample.
+        let candidateFixedTree = [
+            MATreeNode(
+                property: -1, splitVal: 0, lchild: 0, rchild: 0,
+                predictor: 5, predictorOffset: 0, multiplier: 1)
+        ]
+        let candidateLearnedTree: [MATreeNode]? = {
+            guard kEncLearnedDCTree, learnDCTree else { return nil }
             let planeSamples = bw * bh
-            // The 400k sample target the LOSSLESS encoder uses is calibrated
-            // for megapixel-scale planes; on a DC image (bw*bh, e.g. ~9k
-            // samples for a 0.7 MP frame) it never engages and the stride
-            // collapses to 1, so learnTree's greedy split search visits EVERY
-            // DC sample. That, not the race's pricing encodes, is what made
-            // E5k roughly double encode time — verified by measurement: cutting
-            // the pricing cost recovered only ~4%.
-            //
-            // A decision tree over ~10 properties and a handful of candidate
-            // predictors does not need tens of thousands of samples to rank
-            // splits; the target here is deliberately far lower, and the size
-            // effect is measured rather than assumed.
             let strideStep = max(1, (planeSamples * 3) / kEncDCTreeTrainingTarget)
             var training = TreeTrainingSet()
             for (chan, plane) in [(0, qDCY), (1, qDCX), (2, qDCB)] {
@@ -1398,129 +1392,146 @@ enum VarDCTEncoder {
                         chan: chan, stride: strideStep)
                 }
             }
-            let fixed = [
-                MATreeNode(
-                    property: -1, splitVal: 0, lchild: 0, rchild: 0,
-                    predictor: 5, predictorOffset: 0, multiplier: 1)
-            ]
             let learned = learnTree(training)
-            guard !learned.isEmpty, learned.count > 1 else { return fixed }
-            // RACE THEM ON MEASURED COST — but see the KNOWN LIMITATION
-            // below, because this race is not yet complete.
-            //
-            // A learned tree is not free: it is serialized into LfGlobal and
-            // every extra leaf adds an ANS histogram to the residual header.
-            // The race prices both candidates on real serialized bytes and
-            // keeps the smaller, the same way E5j chooses its context map.
-            //
-            // KNOWN LIMITATION, with the mechanism measured rather than
-            // guessed: pricing covers the DC planes ONLY, while the real
-            // encoder shares one histogram set across the DC *and* the
-            // AC-metadata streams. With the single-leaf tree everything shared
-            // one context anyway, so nothing was lost; with a learned tree the
-            // contexts are DC-specialised and the metadata tokens land in those
-            // same contexts and skew the histograms — degrading the very DC
-            // they were fitted to. The estimate cannot see that, so it is
-            // optimistic. Measured on gray_city q50, where the race wrongly
-            // picks the learned tree:
-            //     LfGlobal    30 B -> 205 B   (tree + histogram header)
-            //     DC groups 6352 B -> 6781 B  (the DC itself got WORSE)
-            //     total    15772 B -> 16376 B (+3.8%)
-            // Every other measured case wins, several by a lot (grad_smooth q50
-            // -29.4%, photo_sky q30 -27.3%, synth_text q30 -16.7%), so this
-            // ships with the regression documented rather than withheld. The
-            // fix is to price both candidates over the DC *and* metadata token
-            // streams — i.e. build both token sets and compare them whole —
-            // which is a refactor of the stream-building block, tracked
-            // separately.
-            let costFixed = encDCTreeCost(
-                tree: fixed, planes: [(0, qDCY), (1, qDCX), (2, qDCB)], bw: bw, bh: bh)
-            let costLearned = encDCTreeCost(
-                tree: learned, planes: [(0, qDCY), (1, qDCX), (2, qDCB)], bw: bw, bh: bh)
-            return costLearned < costFixed ? learned : fixed
+            return learned.count > 1 ? learned : nil
         }()
-        var dcTokens: [[EncToken]] = []
-        var metaTokens: [[EncToken]] = []
-        /// Varblocks placed per DC group — the `count` its AcMetadata stream
-        /// codes, and the width of that stream's (count x 2) ACS+QF channel.
-        var dcGroupVarblocks = [Int](repeating: 0, count: dim.numDCGroups)
+
         let dcTile = dim.groupDim  // DC group tile in blocks (256)
-        for dcg in 0..<dim.numDCGroups {
-            let x0 = (dcg % dim.xsizeDCGroups) * dcTile
-            let y0 = (dcg / dim.xsizeDCGroups) * dcTile
-            let rw = min(dcTile, bw - x0)
-            let rh = min(dcTile, bh - y0)
 
-            // VarDCTDC stream: modular channel c holds plane (c<2 ? c^1 : c),
-            // i.e. channels [Y, X, B]; group-local borders at the rect edge.
-            var t: [EncToken] = []
-            let dcStreamID = 1 + dcg
-            for (chan, plane) in [(0, qDCY), (1, qDCX), (2, qDCB)] {
-                plane.withUnsafeBufferPointer { buf in
-                    tokenizeChannelWithTree(
-                        into: &t, plane: buf, width: bw, x0: x0, y0: y0, gw: rw, gh: rh,
-                        chan: chan, streamID: dcStreamID, tree: tree)
-                }
-            }
-            dcTokens.append(t)
+        // ---- Global modular tree (E5k) and the streams it codes.
+        //
+        // The DC and AC-metadata streams SHARE one tree and one residual
+        // histogram set, so a candidate tree can only be priced honestly by
+        // building both. Pricing the DC alone (the original E5k race) was
+        // optimistic: a DC-specialised tree has its contexts polluted by
+        // metadata tokens and the DC it was fitted to degrades — measured as a
+        // +3.8% regression on gray_city q50.
+        //
+        // So the streams are built once per candidate and the ASSEMBLED cost is
+        // compared. The winner's tokens are then KEPT rather than rebuilt,
+        // which is also why this is cheaper than the version it replaces: that
+        // one priced two candidates and then tokenized the winner a third time.
+        func buildDCAndMeta(_ tree: [MATreeNode]) -> (
+            dc: [[EncToken]], meta: [[EncToken]], varblocks: [Int]
+        ) {
+            var dcTokens: [[EncToken]] = []
+            var metaTokens: [[EncToken]] = []
+            /// Varblocks placed per DC group — the `count` its AcMetadata stream
+            /// codes, and the width of that stream's (count x 2) ACS+QF channel.
+            var dcGroupVarblocks = [Int](repeating: 0, count: dim.numDCGroups)
+            for dcg in 0..<dim.numDCGroups {
+                let x0 = (dcg % dim.xsizeDCGroups) * dcTile
+                let y0 = (dcg / dim.xsizeDCGroups) * dcTile
+                let rw = min(dcTile, bw - x0)
+                let rh = min(dcTile, bh - y0)
 
-            // AcMetadata stream: 4 channels — YtoX/YtoB color-tile maps
-            // (E5c per-tile CfL search), (count x 2) strategy+quant rows, EPF
-            // sharpness (zeros). `count` is the number of varblocks whose
-            // top-left block lies in this DC group's rect (E5e: no longer
-            // rw*rh, since a DCT16 covers four blocks with one entry).
-            let crW = divCeil(rw, kColorTileDimInBlocks)
-            let crH = divCeil(rh, kColorTileDimInBlocks)
-            var count = 0
-            for iy in 0..<rh {
-                for ix in 0..<rw where frameIsFirst[(y0 + iy) * bw + (x0 + ix)] { count += 1 }
-            }
-            dcGroupVarblocks[dcg] = count
-            // Same (ctX0, ctY0) full-frame color-tile origin the decoder
-            // computes from the DC group's rect (ACMetadata.swift).
-            let ctX0 = x0 >> 3
-            let ctY0 = y0 >> 3
-            var cmapX = [Int32](repeating: 0, count: crW * crH)
-            var cmapB = [Int32](repeating: 0, count: crW * crH)
-            for cy in 0..<crH {
-                for cx in 0..<crW {
-                    let src = (ctY0 + cy) * cmapFullW + (ctX0 + cx)
-                    cmapX[cy * crW + cx] = globalYtoX[src]
-                    cmapB[cy * crW + cx] = globalYtoB[src]
+                // VarDCTDC stream: modular channel c holds plane (c<2 ? c^1 : c),
+                // i.e. channels [Y, X, B]; group-local borders at the rect edge.
+                var t: [EncToken] = []
+                let dcStreamID = 1 + dcg
+                for (chan, plane) in [(0, qDCY), (1, qDCX), (2, qDCB)] {
+                    plane.withUnsafeBufferPointer { buf in
+                        tokenizeChannelWithTree(
+                            into: &t, plane: buf, width: bw, x0: x0, y0: y0, gw: rw, gh: rh,
+                            chan: chan, streamID: dcStreamID, tree: tree)
+                    }
                 }
-            }
-            var acsQF = [Int32](repeating: 0, count: count * 2)
-            // Row-major (iy, ix) over the DC group's rect, SKIPPING blocks an
-            // earlier varblock already covers — the exact walk
-            // decodeAcMetadataGroup performs, so `num` there and `num` here
-            // index the same (count x 2) channel entries. Row 0 is the raw AC
-            // strategy, row 1 the quant field.
-            var num = 0
-            for iy in 0..<rh {
-                for ix in 0..<rw {
-                    let p = (y0 + iy) * bw + (x0 + ix)
-                    if !frameIsFirst[p] { continue }
-                    acsQF[num] = Int32(frameStrategy[p])
-                    // decoder: quant = 1 + clamp(coded, 0, 255)
-                    acsQF[count + num] = blockQuantField[p] - 1
-                    num += 1
+                dcTokens.append(t)
+
+                // AcMetadata stream: 4 channels — YtoX/YtoB color-tile maps
+                // (E5c per-tile CfL search), (count x 2) strategy+quant rows, EPF
+                // sharpness (zeros). `count` is the number of varblocks whose
+                // top-left block lies in this DC group's rect (E5e: no longer
+                // rw*rh, since a DCT16 covers four blocks with one entry).
+                let crW = divCeil(rw, kColorTileDimInBlocks)
+                let crH = divCeil(rh, kColorTileDimInBlocks)
+                var count = 0
+                for iy in 0..<rh {
+                    for ix in 0..<rw where frameIsFirst[(y0 + iy) * bw + (x0 + ix)] { count += 1 }
                 }
-            }
-            let epfZero = [Int32](repeating: 0, count: rw * rh)
-            var mt: [EncToken] = []
-            let metaStreamID = 1 + 2 * dim.numDCGroups + dcg
-            let chans: [(plane: [Int32], w: Int, h: Int)] = [
-                (cmapX, crW, crH), (cmapB, crW, crH),
-                (acsQF, count, 2), (epfZero, rw, rh),
-            ]
-            for (i, ch) in chans.enumerated() {
-                ch.plane.withUnsafeBufferPointer { buf in
-                    tokenizeChannelWithTree(
-                        into: &mt, plane: buf, width: ch.w, x0: 0, y0: 0, gw: ch.w, gh: ch.h,
-                        chan: i, streamID: metaStreamID, tree: tree)
+                dcGroupVarblocks[dcg] = count
+                // Same (ctX0, ctY0) full-frame color-tile origin the decoder
+                // computes from the DC group's rect (ACMetadata.swift).
+                let ctX0 = x0 >> 3
+                let ctY0 = y0 >> 3
+                var cmapX = [Int32](repeating: 0, count: crW * crH)
+                var cmapB = [Int32](repeating: 0, count: crW * crH)
+                for cy in 0..<crH {
+                    for cx in 0..<crW {
+                        let src = (ctY0 + cy) * cmapFullW + (ctX0 + cx)
+                        cmapX[cy * crW + cx] = globalYtoX[src]
+                        cmapB[cy * crW + cx] = globalYtoB[src]
+                    }
                 }
+                var acsQF = [Int32](repeating: 0, count: count * 2)
+                // Row-major (iy, ix) over the DC group's rect, SKIPPING blocks an
+                // earlier varblock already covers — the exact walk
+                // decodeAcMetadataGroup performs, so `num` there and `num` here
+                // index the same (count x 2) channel entries. Row 0 is the raw AC
+                // strategy, row 1 the quant field.
+                var num = 0
+                for iy in 0..<rh {
+                    for ix in 0..<rw {
+                        let p = (y0 + iy) * bw + (x0 + ix)
+                        if !frameIsFirst[p] { continue }
+                        acsQF[num] = Int32(frameStrategy[p])
+                        // decoder: quant = 1 + clamp(coded, 0, 255)
+                        acsQF[count + num] = blockQuantField[p] - 1
+                        num += 1
+                    }
+                }
+                let epfZero = [Int32](repeating: 0, count: rw * rh)
+                var mt: [EncToken] = []
+                let metaStreamID = 1 + 2 * dim.numDCGroups + dcg
+                let chans: [(plane: [Int32], w: Int, h: Int)] = [
+                    (cmapX, crW, crH), (cmapB, crW, crH),
+                    (acsQF, count, 2), (epfZero, rw, rh),
+                ]
+                for (i, ch) in chans.enumerated() {
+                    ch.plane.withUnsafeBufferPointer { buf in
+                        tokenizeChannelWithTree(
+                            into: &mt, plane: buf, width: ch.w, x0: 0, y0: 0, gw: ch.w, gh: ch.h,
+                            chan: i, streamID: metaStreamID, tree: tree)
+                    }
+                }
+                metaTokens.append(mt)
             }
-            metaTokens.append(mt)
+            return (dcTokens, metaTokens, dcGroupVarblocks)
+        }
+
+        /// Assembled cost of coding `dc` + `meta` under `tree`: the tree's own
+        /// serialization plus the shared residual header and every payload.
+        /// Exact — it runs the real writers over exactly the streams the frame
+        /// will contain.
+        func modularCost(_ tree: [MATreeNode], _ dc: [[EncToken]], _ meta: [[EncToken]]) -> Int {
+            let tTokens = treeTokens(tree)
+            let tw = BitWriter()
+            let tEnc = PrefixEntropyEncoder(numContexts: 6, streams: [tTokens])
+            tEnc.writeHeader(tw)
+            tEnc.encodeStream(tw, tTokens)
+            let coder = ANSEntropyEncoder(numContexts: treeNumLeaves(tree), streams: dc + meta)
+            let pw = BitWriter()
+            coder.writeHeader(pw)
+            for s in dc { coder.encodeStream(pw, s) }
+            for s in meta { coder.encodeStream(pw, s) }
+            return tw.finalize().count + pw.finalize().count
+        }
+
+        let builtFixed = buildDCAndMeta(candidateFixedTree)
+        var tree = candidateFixedTree
+        var dcTokens = builtFixed.dc
+        var metaTokens = builtFixed.meta
+        var dcGroupVarblocks = builtFixed.varblocks
+        if let learned = candidateLearnedTree {
+            let builtLearned = buildDCAndMeta(learned)
+            let costFixed = modularCost(candidateFixedTree, builtFixed.dc, builtFixed.meta)
+            let costLearned = modularCost(learned, builtLearned.dc, builtLearned.meta)
+            if costLearned < costFixed {
+                tree = learned
+                dcTokens = builtLearned.dc
+                metaTokens = builtLearned.meta
+                dcGroupVarblocks = builtLearned.varblocks
+            }
         }
 
         // ---- Extra channels (E5g). In a VarDCT frame the ECs are a MODULAR
@@ -1783,33 +1794,6 @@ enum VarDCTEncoder {
             w.writeU64(0)  // loop-filter extensions
         }
         w.writeU64(0)  // frame-header extensions
-    }
-
-    /// Real serialized cost of coding the DC planes under `tree`: the tree's
-    /// own serialization, the residual ANS histogram header (one histogram per
-    /// leaf), and the payload. Exact — it runs the real writers over the DC,
-    /// which is small relative to the AC work, so racing two trees is cheap.
-    private static func encDCTreeCost(
-        tree: [MATreeNode], planes: [(Int, [Int32])], bw: Int, bh: Int
-    ) -> Int {
-        let tTokens = treeTokens(tree)
-        let tw = BitWriter()
-        let tEnc = PrefixEntropyEncoder(numContexts: 6, streams: [tTokens])
-        tEnc.writeHeader(tw)
-        tEnc.encodeStream(tw, tTokens)
-        var toks: [EncToken] = []
-        for (chan, plane) in planes {
-            plane.withUnsafeBufferPointer { buf in
-                tokenizeChannelWithTree(
-                    into: &toks, plane: buf, width: bw, x0: 0, y0: 0, gw: bw, gh: bh,
-                    chan: chan, streamID: 1, tree: tree)
-            }
-        }
-        let coder = ANSEntropyEncoder(numContexts: treeNumLeaves(tree), streams: [toks])
-        let pw = BitWriter()
-        coder.writeHeader(pw)
-        coder.encodeStream(pw, toks)
-        return tw.finalize().count + pw.finalize().count
     }
 
     /// TOC entry size (toc.cc U32 distribution; mirror of ModularEncoder's).
