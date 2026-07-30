@@ -172,3 +172,16 @@ let kEncLearnedDCTree: Bool = {
     if let s = ProcessInfo.processInfo.environment["JXL_DC_TREE"] { return s != "0" }
     return true
 }()
+
+/// Training samples `learnTree` sees when fitting the lossy path's DC tree
+/// (E5k). Far below the lossless encoder's 400k, because the DC image is two
+/// orders of magnitude smaller than a full-resolution plane and that target
+/// never engaged — leaving the greedy split search walking every DC sample,
+/// which is what made E5k expensive. `JXL_DC_TREE_SAMPLES` overrides it so the
+/// size/time curve can be swept.
+let kEncDCTreeTrainingTarget: Int = {
+    if let s = ProcessInfo.processInfo.environment["JXL_DC_TREE_SAMPLES"],
+        let v = Int(s), v > 0
+    { return v }
+    return 8192
+}()

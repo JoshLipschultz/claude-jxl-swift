@@ -1377,7 +1377,19 @@ enum VarDCTEncoder {
                 ]
             }
             let planeSamples = bw * bh
-            let strideStep = max(1, (planeSamples * 3) / 400_000)
+            // The 400k sample target the LOSSLESS encoder uses is calibrated
+            // for megapixel-scale planes; on a DC image (bw*bh, e.g. ~9k
+            // samples for a 0.7 MP frame) it never engages and the stride
+            // collapses to 1, so learnTree's greedy split search visits EVERY
+            // DC sample. That, not the race's pricing encodes, is what made
+            // E5k roughly double encode time — verified by measurement: cutting
+            // the pricing cost recovered only ~4%.
+            //
+            // A decision tree over ~10 properties and a handful of candidate
+            // predictors does not need tens of thousands of samples to rank
+            // splits; the target here is deliberately far lower, and the size
+            // effect is measured rather than assumed.
+            let strideStep = max(1, (planeSamples * 3) / kEncDCTreeTrainingTarget)
             var training = TreeTrainingSet()
             for (chan, plane) in [(0, qDCY), (1, qDCX), (2, qDCB)] {
                 plane.withUnsafeBufferPointer { buf in
