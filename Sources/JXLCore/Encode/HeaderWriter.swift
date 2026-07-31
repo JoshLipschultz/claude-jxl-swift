@@ -55,7 +55,10 @@ enum HeaderWriter {
     }
 
     /// BitDepth bundle — dual of `ImageMetadataFields.readBitDepth`.
-    private static func writeBitDepth(
+    /// Internal rather than private so ICCWriter's header path shares this
+    /// exact bit layout instead of duplicating it — the duplicate drifted out
+    /// of sight once and is not worth a second chance.
+    static func writeBitDepth(
         _ w: BitWriter, bitsPerSample: UInt32, exponentBits: UInt32
     ) {
         if exponentBits == 0 {
@@ -73,7 +76,8 @@ enum HeaderWriter {
     /// exactly the bundle's all-default shape (one bit); anything else is
     /// written explicitly: type Alpha, the color bit depth, dim_shift 0,
     /// empty name, alpha_associated=false.
-    private static func writeExtraChannelInfo(
+    /// Internal for the same reason as `writeBitDepth`.
+    static func writeExtraChannelInfo(
         _ w: BitWriter, bitsPerSample: UInt32, exponentBits: UInt32
     ) {
         if bitsPerSample == 8 && exponentBits == 0 {

@@ -339,13 +339,15 @@ enum ICCHeaderWriter {
     ) {
         w.writeBool(false)  // all_default
         w.writeBool(false)  // extra_fields
-        writeBitDepth(w, bitsPerSample: bitsPerSample, exponentBits: exponentBits)
+        HeaderWriter.writeBitDepth(
+            w, bitsPerSample: bitsPerSample, exponentBits: exponentBits)
         w.writeBool(exponentBits == 0)  // modular_16bit_buffers
         w.writeU32(
             UInt32(alphaChannels), .value(0), .value(1), .bits(4, offset: 2),
             .bits(12, offset: 1))  // num_extra_channels
         for _ in 0..<alphaChannels {
-            writeExtraChannelInfo(w, bitsPerSample: bitsPerSample, exponentBits: exponentBits)
+            HeaderWriter.writeExtraChannelInfo(
+                w, bitsPerSample: bitsPerSample, exponentBits: exponentBits)
         }
         w.writeBool(false)  // xyb_encoded: native-space samples
         w.writeBool(false)  // ColorEncoding all_default
@@ -354,31 +356,4 @@ enum ICCHeaderWriter {
         w.writeU64(0)  // extensions
     }
 
-    private static func writeBitDepth(
-        _ w: BitWriter, bitsPerSample: UInt32, exponentBits: UInt32
-    ) {
-        if exponentBits == 0 {
-            w.writeBool(false)  // floating_point_sample
-            w.writeU32(bitsPerSample, .value(8), .value(10), .value(12), .bits(6, offset: 1))
-        } else {
-            w.writeBool(true)
-            w.writeU32(bitsPerSample, .value(32), .value(16), .value(24), .bits(6, offset: 1))
-            w.write(UInt64(exponentBits - 1), 4)
-        }
-    }
-
-    private static func writeExtraChannelInfo(
-        _ w: BitWriter, bitsPerSample: UInt32, exponentBits: UInt32
-    ) {
-        if bitsPerSample == 8 && exponentBits == 0 {
-            w.writeBool(true)  // all_default (= 8-bit unassociated alpha)
-            return
-        }
-        w.writeBool(false)
-        w.writeEnum(0)  // type: kAlpha
-        writeBitDepth(w, bitsPerSample: bitsPerSample, exponentBits: exponentBits)
-        w.writeU32(0, .value(0), .value(3), .value(4), .bits(3, offset: 1))  // dim_shift
-        w.writeU32(0, .value(0), .bits(4), .bits(5, offset: 16), .bits(10, offset: 48))  // name
-        w.writeBool(false)  // alpha_associated
-    }
 }
