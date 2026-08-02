@@ -14,6 +14,11 @@ public struct JXLBitDepth: Equatable, Sendable {
     public let exponentBitsPerSample: UInt32
 
     public var isFloatingPoint: Bool { exponentBitsPerSample > 0 }
+
+    public init(bitsPerSample: UInt32, exponentBitsPerSample: UInt32 = 0) {
+        self.bitsPerSample = bitsPerSample
+        self.exponentBitsPerSample = exponentBitsPerSample
+    }
 }
 
 public enum JXLColorSpace: UInt32, Equatable, Sendable {
@@ -63,6 +68,35 @@ public struct JXLExtraChannelInfo: Equatable, Sendable {
     public let alphaAssociated: Bool
     /// SpotColor only: RGBA, where [3] is the global blend scale.
     public let spotColor: [Float]?
+
+    /// Full memberwise initialiser. Declared explicitly because adding the
+    /// encode-side convenience below suppresses the synthesized one, which the
+    /// decoder's own parser uses.
+    public init(
+        type: UInt32, bitDepth: JXLBitDepth, dimShift: UInt32,
+        alphaAssociated: Bool, spotColor: [Float]?
+    ) {
+        self.type = type
+        self.bitDepth = bitDepth
+        self.dimShift = dimShift
+        self.alphaAssociated = alphaAssociated
+        self.spotColor = spotColor
+    }
+
+    /// Encode-side constructor. The decoder builds these from the bitstream;
+    /// this is how a CALLER describes an extra channel to the encoder, which is
+    /// otherwise impossible — the only other initialiser takes a BitReader.
+    ///
+    /// `bitDepth` is omitted deliberately: the encoder writes the image's own
+    /// depth for every extra channel, so accepting one here would invite a
+    /// value that is silently ignored.
+    public init(type: UInt32, alphaAssociated: Bool = false, dimShift: UInt32 = 0) {
+        self.type = type
+        self.bitDepth = JXLBitDepth(bitsPerSample: 8, exponentBitsPerSample: 0)
+        self.dimShift = dimShift
+        self.alphaAssociated = alphaAssociated
+        self.spotColor = nil
+    }
 }
 
 /// ToneMapping (libjxl image_metadata.h): the display characteristics the

@@ -33,7 +33,8 @@ enum HeaderWriter {
     /// the color bit depth (dim_shift 0, unassociated, unnamed).
     static func writeImageMetadata(
         _ w: BitWriter, bitsPerSample: UInt32, grayscale: Bool,
-        exponentBits: UInt32 = 0, alphaChannels: Int = 0
+        exponentBits: UInt32 = 0, alphaChannels: Int = 0,
+        extraChannelInfo: [JXLExtraChannelInfo]? = nil
     ) {
         w.writeBool(false)  // all_default (false: we need xyb_encoded=0)
         w.writeBool(false)  // extra_fields (no orientation/preview/animation)
@@ -45,8 +46,10 @@ enum HeaderWriter {
         w.writeU32(
             UInt32(alphaChannels), .value(0), .value(1), .bits(4, offset: 2),
             .bits(12, offset: 1))  // num_extra_channels
-        for _ in 0..<alphaChannels {
-            writeExtraChannelInfo(w, bitsPerSample: bitsPerSample, exponentBits: exponentBits)
+        for i in 0..<alphaChannels {
+            writeExtraChannelInfo(
+                w, bitsPerSample: bitsPerSample, exponentBits: exponentBits,
+                info: extraChannelInfo.flatMap { i < $0.count ? $0[i] : nil })
         }
         w.writeBool(false)  // xyb_encoded: native-space samples (lossless)
         writeColorEncoding(w, grayscale: grayscale)
@@ -77,19 +80,55 @@ enum HeaderWriter {
     /// written explicitly: type Alpha, the color bit depth, dim_shift 0,
     /// empty name, alpha_associated=false.
     /// Internal for the same reason as `writeBitDepth`.
+    ///
+    /// `info` describes the channel; nil means the historical assumption of
+    /// unassociated alpha. The all_default shortcut is only legal when the
+    /// channel actually IS 8-bit unassociated alpha — taking it for a depth
+    /// channel or premultiplied alpha would encode a lie that decodes cleanly,
+    /// which is the worst kind of bug to find later.
     static func writeExtraChannelInfo(
-        _ w: BitWriter, bitsPerSample: UInt32, exponentBits: UInt32
+        _ w: BitWriter, bitsPerSample: UInt32, exponentBits: UInt32,
+        info: JXLExtraChannelInfo? = nil
     ) {
-        if bitsPerSample == 8 && exponentBits == 0 {
+        let type = info?.type ?? 0  // kAlpha
+        let associated = info?.alphaAssociated ?? false
+        if bitsPerSample == 8 && exponentBits == 0 && type == 0 && !associated {
             w.writeBool(true)  // all_default (= 8-bit unassociated alpha)
             return
         }
         w.writeBool(false)  // all_default
-        w.writeEnum(0)  // type: kAlpha
+        w.writeEnum(UInt32(type))
         writeBitDepth(w, bitsPerSample: bitsPerSample, exponentBits: exponentBits)
         w.writeU32(0, .value(0), .value(3), .value(4), .bits(3, offset: 1))  // dim_shift
         w.writeU32(0, .value(0), .bits(4), .bits(5, offset: 16), .bits(10, offset: 48))  // name len
-        w.writeBool(false)  // alpha_associated
+        // alpha_associated is only serialized for kAlpha; other types carry
+        // their own trailing fields, which this encoder does not yet emit (see
+        // the validation in encValidateExtraChannelInfo).
+        if type == 0 { w.writeBool(associated) }
+    }
+
+    /// Rejects extra-channel descriptors this encoder cannot faithfully write.
+    /// Refusing is the point: silently encoding a spot-colour channel without
+    /// its colour, or a shifted channel at full resolution, produces a file
+    /// that decodes without complaint and means something different.
+    static func encValidateExtraChannelInfo(_ infos: [JXLExtraChannelInfo]?, count: Int) throws {
+        guard let infos else { return }
+        guard infos.count == count else {
+            throw JXLEncodeError(
+                reason: "extraChannelInfo count \(infos.count) != extraChannels \(count)")
+        }
+        for (i, info) in infos.enumerated() {
+            guard info.dimShift == 0 else {
+                throw JXLEncodeError(
+                    reason: "extra channel \(i): dim_shift \(info.dimShift) unsupported")
+            }
+            // kSpotColor (2) needs its RGBA blend written; kCFA (5) needs a
+            // pattern index. Neither is emitted yet.
+            guard info.type != 2, info.type != 5 else {
+                throw JXLEncodeError(
+                    reason: "extra channel \(i): type \(info.type) unsupported by the encoder")
+            }
+        }
     }
 
     /// ColorEncoding (§D.3.5): all-default (= sRGB) for RGB; explicit
@@ -121,7 +160,8 @@ enum HeaderWriter {
     /// written explicitly — dual of `JXLImageMetadata.init(_:)`, whose
     /// all-default branch sets `xybEncoded = true`.
     static func writeImageMetadataXYB(
-        _ w: BitWriter, bitsPerSample: UInt32, alphaChannels: Int = 0
+        _ w: BitWriter, bitsPerSample: UInt32, alphaChannels: Int = 0,
+        extraChannelInfo: [JXLExtraChannelInfo]? = nil
     ) {
         if bitsPerSample == 8 && alphaChannels == 0 {
             w.writeBool(true)  // all_default: 8-bit sRGB, xyb_encoded, no ECs
@@ -136,8 +176,10 @@ enum HeaderWriter {
             .bits(12, offset: 1))  // num_extra_channels
         // Alpha ECs at the color bit depth. In a VarDCT frame these are
         // modular-coded, so alpha stays LOSSLESS while color is lossy.
-        for _ in 0..<alphaChannels {
-            writeExtraChannelInfo(w, bitsPerSample: bitsPerSample, exponentBits: 0)
+        for i in 0..<alphaChannels {
+            writeExtraChannelInfo(
+                w, bitsPerSample: bitsPerSample, exponentBits: 0,
+                info: extraChannelInfo.flatMap { i < $0.count ? $0[i] : nil })
         }
         w.writeBool(true)  // xyb_encoded
         w.writeBool(true)  // ColorEncoding all_default = sRGB
@@ -151,13 +193,14 @@ enum HeaderWriter {
     /// bundle entirely), byte alignment.
     static func writeCodestreamHeadersXYB(
         _ w: BitWriter, width: UInt32, height: UInt32, bitsPerSample: UInt32,
-        alphaChannels: Int = 0
+        alphaChannels: Int = 0, extraChannelInfo: [JXLExtraChannelInfo]? = nil
     ) {
         w.write(0xFF, 8)
         w.write(0x0A, 8)
         writeSizeHeader(w, width: width, height: height)
         writeImageMetadataXYB(
-            w, bitsPerSample: bitsPerSample, alphaChannels: alphaChannels)
+            w, bitsPerSample: bitsPerSample, alphaChannels: alphaChannels,
+            extraChannelInfo: extraChannelInfo)
         writeCustomTransformData(w)
         w.alignToByte()
     }
@@ -167,14 +210,16 @@ enum HeaderWriter {
     /// `JumpToByteBoundary` before frames).
     static func writeCodestreamHeaders(
         _ w: BitWriter, width: UInt32, height: UInt32, bitsPerSample: UInt32,
-        grayscale: Bool, exponentBits: UInt32 = 0, alphaChannels: Int = 0
+        grayscale: Bool, exponentBits: UInt32 = 0, alphaChannels: Int = 0,
+        extraChannelInfo: [JXLExtraChannelInfo]? = nil
     ) {
         w.write(0xFF, 8)
         w.write(0x0A, 8)
         writeSizeHeader(w, width: width, height: height)
         writeImageMetadata(
             w, bitsPerSample: bitsPerSample, grayscale: grayscale,
-            exponentBits: exponentBits, alphaChannels: alphaChannels)
+            exponentBits: exponentBits, alphaChannels: alphaChannels,
+            extraChannelInfo: extraChannelInfo)
         writeCustomTransformData(w)
         w.alignToByte()
     }

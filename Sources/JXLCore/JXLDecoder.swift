@@ -95,10 +95,30 @@ public struct JXLDecodedImage: Sendable {
     /// use `JXL.readICCProfile` to obtain the raw embedded profile regardless.
     public let iccProfile: Data?
 
+    /// Per-extra-channel descriptors, in plane order after the colour planes.
+    ///
+    /// `nil` (the default) means "every extra channel is 8-bit-style
+    /// unassociated ALPHA", which is what the encoder assumed unconditionally
+    /// before this existed. Supplying real descriptors matters in two cases the
+    /// encoder previously got silently wrong:
+    ///
+    ///   - ASSOCIATED (premultiplied) alpha encoded as unassociated. The samples
+    ///     round-trip exactly, but a consumer honouring the label premultiplies
+    ///     a second time and darkens everything where alpha < 1.
+    ///   - A depth, thermal or selection-mask channel relabelled as alpha.
+    ///
+    /// Reusing the decoder's own `JXLExtraChannelInfo` is deliberate: it makes a
+    /// decode -> encode round trip carry the flags it used to drop. `bitDepth`
+    /// is ignored (the encoder writes the image's own), and `dimShift` must be 0
+    /// — anything else is rejected rather than silently mis-encoded.
+    public let extraChannelInfo: [JXLExtraChannelInfo]?
+
     public init(
         width: Int, height: Int, colorChannels: Int, extraChannels: Int,
-        bitsPerSample: Int, isFloat: Bool, planes: [[Int32]], iccProfile: Data? = nil
+        bitsPerSample: Int, isFloat: Bool, planes: [[Int32]], iccProfile: Data? = nil,
+        extraChannelInfo: [JXLExtraChannelInfo]? = nil
     ) {
+        self.extraChannelInfo = extraChannelInfo
         self.width = width
         self.height = height
         self.colorChannels = colorChannels

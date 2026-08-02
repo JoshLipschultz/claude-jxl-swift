@@ -3656,6 +3656,70 @@ struct TestRunner {
             check(false, "AC context-map race: \(error)")
         }
 
+        // Extra-channel descriptors (#52). Before these existed the encoder
+        // typed EVERY extra channel as unassociated alpha, so a premultiplied
+        // alpha round-tripped with a label that tells consumers to premultiply
+        // AGAIN, and a depth channel was relabelled alpha. Samples were always
+        // exact; only the declaration lied, which is why nothing caught it.
+        do {
+            let w = 64
+            let h = 48
+            let n = w * h
+            var planes = (0..<3).map { c in
+                (0..<n).map { Int32(40 + (($0 * 7 + c * 31) % 180)) }
+            }
+            planes.append((0..<n).map { Int32(($0 * 5) % 256) })
+
+            func encodeWith(_ info: [JXLExtraChannelInfo]?) throws -> [UInt8] {
+                let img = JXLDecodedImage(
+                    width: w, height: h, colorChannels: 3, extraChannels: 1,
+                    bitsPerSample: 8, isFloat: false, planes: planes, iccProfile: nil,
+                    extraChannelInfo: info)
+                return try JXL.encodeLossless(image: img, effort: 1)
+            }
+
+            // Default (nil) stays byte-identical to the pre-#52 encoder: the
+            // all_default shortcut is still taken for plain 8-bit alpha.
+            let plain = try encodeWith(nil)
+            let explicitAlpha = try encodeWith([
+                JXLExtraChannelInfo(type: 0, alphaAssociated: false)
+            ])
+            check(plain == explicitAlpha, "explicit unassociated alpha == default encoding")
+
+            // Premultiplied alpha must now be DECLARED, and must read back.
+            let assoc = try encodeWith([
+                JXLExtraChannelInfo(type: 0, alphaAssociated: true)
+            ])
+            check(assoc != plain, "associated alpha changes the bitstream")
+            let assocMeta = try JXL.readInfo(from: assoc)
+            check(
+                assocMeta.alphaPremultiplied,
+                "associated alpha survives the round trip")
+            let assocDec = try JXL.decodeImage(from: assoc)
+            check(assocDec.planes[3] == planes[3], "associated alpha samples still exact")
+
+            // A non-alpha channel must not be relabelled alpha.
+            let depth = try encodeWith([
+                JXLExtraChannelInfo(type: 1)
+            ])
+            let depthMeta = try JXL.readInfo(from: depth)
+            check(
+                !depthMeta.hasAlpha && depthMeta.extraChannelCount == 1,
+                "depth channel is not relabelled alpha")
+
+            // Unsupported descriptors are REFUSED, not silently mis-encoded.
+            check(
+                (try? encodeWith([
+                    JXLExtraChannelInfo(type: 2)
+                ])) == nil, "spot-colour extra channel is rejected")
+            check(
+                (try? encodeWith([
+                    JXLExtraChannelInfo(type: 0, dimShift: 2)
+                ])) == nil, "dim_shift != 0 is rejected")
+        } catch {
+            check(false, "extra-channel descriptors: \(error)")
+        }
+
         // Documented rejection: float input is still an E5a non-goal.
         do {
             let one = [Int32](repeating: 128, count: 16)

@@ -313,14 +313,15 @@ enum ICCHeaderWriter {
     static func writeCodestreamHeaders(
         _ w: BitWriter, width: UInt32, height: UInt32, bitsPerSample: UInt32,
         grayscale: Bool, exponentBits: UInt32 = 0, alphaChannels: Int = 0,
-        iccProfile: [UInt8]
+        iccProfile: [UInt8], extraChannelInfo: [JXLExtraChannelInfo]? = nil
     ) throws {
         w.write(0xFF, 8)
         w.write(0x0A, 8)
         HeaderWriter.writeSizeHeader(w, width: width, height: height)
         writeImageMetadataICC(
             w, bitsPerSample: bitsPerSample, grayscale: grayscale,
-            exponentBits: exponentBits, alphaChannels: alphaChannels)
+            exponentBits: exponentBits, alphaChannels: alphaChannels,
+            extraChannelInfo: extraChannelInfo)
         HeaderWriter.writeCustomTransformData(w)
         // `want_icc` promises the compressed profile here, before the byte
         // alignment that precedes the frames (dual of FrameDecoder's init).
@@ -335,7 +336,8 @@ enum ICCHeaderWriter {
     /// its channel count from it.
     private static func writeImageMetadataICC(
         _ w: BitWriter, bitsPerSample: UInt32, grayscale: Bool,
-        exponentBits: UInt32, alphaChannels: Int
+        exponentBits: UInt32, alphaChannels: Int,
+        extraChannelInfo: [JXLExtraChannelInfo]? = nil
     ) {
         w.writeBool(false)  // all_default
         w.writeBool(false)  // extra_fields
@@ -345,9 +347,10 @@ enum ICCHeaderWriter {
         w.writeU32(
             UInt32(alphaChannels), .value(0), .value(1), .bits(4, offset: 2),
             .bits(12, offset: 1))  // num_extra_channels
-        for _ in 0..<alphaChannels {
+        for i in 0..<alphaChannels {
             HeaderWriter.writeExtraChannelInfo(
-                w, bitsPerSample: bitsPerSample, exponentBits: exponentBits)
+                w, bitsPerSample: bitsPerSample, exponentBits: exponentBits,
+                info: extraChannelInfo.flatMap { i < $0.count ? $0[i] : nil })
         }
         w.writeBool(false)  // xyb_encoded: native-space samples
         w.writeBool(false)  // ColorEncoding all_default

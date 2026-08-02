@@ -522,6 +522,8 @@ enum ModularEncoder {
         // inline. With `icc`, the ICC-carrying variant is used instead; that
         // one can throw (profile size limits), which is why it is hoisted out
         // of the non-throwing `assemble`.
+        try HeaderWriter.encValidateExtraChannelInfo(
+            image.extraChannelInfo, count: image.extraChannels)
         let headerBlock: [UInt8]
         do {
             let hw = BitWriter()
@@ -530,12 +532,13 @@ enum ModularEncoder {
                     hw, width: UInt32(image.width), height: UInt32(image.height),
                     bitsPerSample: UInt32(image.bitsPerSample), grayscale: gray,
                     exponentBits: image.isFloat ? 8 : 0, alphaChannels: image.extraChannels,
-                    iccProfile: icc)
+                    iccProfile: icc, extraChannelInfo: image.extraChannelInfo)
             } else {
                 HeaderWriter.writeCodestreamHeaders(
                     hw, width: UInt32(image.width), height: UInt32(image.height),
                     bitsPerSample: UInt32(image.bitsPerSample), grayscale: gray,
-                    exponentBits: image.isFloat ? 8 : 0, alphaChannels: image.extraChannels)
+                    exponentBits: image.isFloat ? 8 : 0, alphaChannels: image.extraChannels,
+                    extraChannelInfo: image.extraChannelInfo)
             }
             headerBlock = hw.finalize()
         }

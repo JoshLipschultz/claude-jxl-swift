@@ -802,6 +802,8 @@ enum VarDCTEncoder {
         guard image.width >= 1, image.height >= 1 else {
             throw JXLEncodeError(reason: "empty image")
         }
+        try HeaderWriter.encValidateExtraChannelInfo(
+            image.extraChannelInfo, count: image.extraChannels)
         let planeSize = image.width * image.height
         guard image.planes.allSatisfy({ $0.count == planeSize }) else {
             throw JXLEncodeError(reason: "plane size mismatch")
@@ -1678,7 +1680,8 @@ enum VarDCTEncoder {
         HeaderWriter.writeCodestreamHeadersXYB(
             head, width: UInt32(w), height: UInt32(h),
             bitsPerSample: UInt32(image.bitsPerSample),
-            alphaChannels: image.extraChannels)
+            alphaChannels: image.extraChannels,
+            extraChannelInfo: image.extraChannelInfo)
         writeFrameHeader(head, numExtraChannels: image.extraChannels, filters: filters)
 
         if dim.numGroups == 1 {
