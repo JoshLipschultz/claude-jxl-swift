@@ -569,9 +569,11 @@ let kRDNonzeroBits: Float = {
 /// candidates {q0, q0 shrunk one step toward zero, 0}; recon mirrors the
 /// decoder's adjustQuantBias. Enabled only for kRDLambda0 > 0.
 @inline(__always)
-func encRDQuant(c: Float, mul: Float, q0: Int32, bias: Float) -> Int32 {
-    if q0 == 0 || kRDLambda0 <= 0 { return q0 }
-    let lambda = kRDLambda0 * mul * mul
+func encRDQuant(
+    c: Float, mul: Float, q0: Int32, bias: Float, lambda0: Float = kRDLambda0
+) -> Int32 {
+    if q0 == 0 || lambda0 <= 0 { return q0 }
+    let lambda = lambda0 * mul * mul
     @inline(__always) func recon(_ q: Int32) -> Float {
         encAdjustQuantBias(q, bias) * mul
     }
@@ -716,6 +718,34 @@ enum VarDCTEncoder {
         }
         let bestFilters = best.usedFilters
 
+        // Axis 3 (E5m): the RD dead-zone lambda. Smooth content prefers a much
+        // larger lambda than photographs — measured over eight real smooth
+        // images (Scripts/gen-smooth-corpus.py), kRDLambda0 = 1.0 buys ~12.5
+        // SSIMULACRA2 points of BD-rate there, while photographs already prefer
+        // the shipped 0.10 and simply keep it.
+        //
+        // THIS AXIS IS SSE-RACEABLE WHERE THE GABORISH HALF OF THE SAME FINDING
+        // IS NOT, and the distinction is the whole reason it can be built now.
+        // Lambda moves the rate/distortion operating point, and both PSNR and
+        // SSIMULACRA2 agree about where that should sit — so the existing
+        // decode-scored race is a sound referee. Gaborish improves squared
+        // error while DEGRADING perceptual quality on photographs, so the same
+        // referee would be a broken one there; that half stays blocked behind a
+        // perceptual metric in the encoder.
+        //
+        // Raced before the large-transform rung so that rung sees the lambda we
+        // are actually keeping, for the same reason the filter axis goes first.
+        if kEncLambdaRaceEnabled, learnDCTree, let baseScore = bestScore {
+            let alt = try encodeLossyPass(
+                image, quality: quality, allowDCT16: true, allowDCT32: true,
+                filters: bestFilters, learnDCTree: learnDCTree,
+                rdLambda: kEncLambdaRaceAlternate)
+            if let altScore = rdScore(alt.bytes), altScore < baseScore {
+                best = alt
+                bestScore = altScore
+            }
+        }
+
         // Axis 2 (E5f): large transforms (DCT16/DCT32) vs all-DCT8, on the
         // winning filter setting. Only worth an encode when some cell actually
         // chose a large transform — otherwise the two candidates are identical
@@ -796,7 +826,8 @@ enum VarDCTEncoder {
 
     private static func encodeLossyPass(
         _ image: JXLDecodedImage, quality: Int, allowDCT16: Bool, allowDCT32: Bool,
-        filters: EncFilterConfig = .off, learnDCTree: Bool = true
+        filters: EncFilterConfig = .off, learnDCTree: Bool = true,
+        rdLambda: Float = kRDLambda0
     ) throws -> (bytes: [UInt8], usedLarge: Bool, usedFilters: EncFilterConfig) {
         guard !image.isFloat else {
             throw JXLEncodeError(reason: "lossy encode supports integer samples only")
@@ -1175,7 +1206,7 @@ enum VarDCTEncoder {
                         let qAgg = encCellQuant(blockQuant, gw: gw, bxl: bxl, byl: byl)
                         let sd = invGlobalScale / Float(qAgg)
                         let lambda =
-                            kRDLambda0 * kEncStratLambdaScale * kEncStratRefEnergy * sd * sd
+                            rdLambda * kEncStratLambdaScale * kEncStratRefEnergy * sd * sd
                         let base = slotOf(bxl, byl) * 64
                         let srcPx = (by0 + byl) * 8 * pw + (bx0 + bxl) * 8
                         planeY.withUnsafeBufferPointer {
@@ -1260,7 +1291,7 @@ enum VarDCTEncoder {
                         let qAgg = encCellQuant(blockQuant, gw: gw, bxl: bxl, byl: byl, cov: 4)
                         let sd = invGlobalScale / Float(qAgg)
                         let lambda =
-                            kRDLambda0 * kEncStratLambdaScale * kEncStratRefEnergy * sd * sd
+                            rdLambda * kEncStratLambdaScale * kEncStratRefEnergy * sd * sd
                         var costSub: Float = 0
                         for cy in 0..<2 {
                             for cx in 0..<2 {
@@ -1415,7 +1446,9 @@ enum VarDCTEncoder {
                         // RD-refine (E5d) BEFORE recon: the CfL fit and the
                         // pass-2 B/X-minus-Y correction must both see the Y
                         // value the decoder will actually reconstruct.
-                        let yq = encRDQuant(c: gcY[base + k], mul: yMulK, q0: yq0, bias: kEncQuantBiasY)
+                        let yq = encRDQuant(
+                            c: gcY[base + k], mul: yMulK, q0: yq0,
+                            bias: kEncQuantBiasY, lambda0: rdLambda)
                         gQY[base + k] = yq
                         let recY = encAdjustQuantBias(yq, kEncQuantBiasY) * yMulK
                         gRecY[base + k] = recY

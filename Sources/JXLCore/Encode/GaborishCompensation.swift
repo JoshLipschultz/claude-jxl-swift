@@ -185,3 +185,47 @@ let kEncDCTreeTrainingTarget: Int = {
     { return v }
     return 8192
 }()
+
+/// Whether `encodeLossy` races a second RD dead-zone lambda (E5m).
+///
+/// DEFAULT OFF — THE MECHANISM IS CIRCULAR, and the measurement is unambiguous.
+/// Smooth content really does prefer lambda 1.0 (verified over eight images:
+/// BD-rate S2 +47.9% -> +35.4% when forced), and racing it did capture most of
+/// that. But on the MAIN corpus, racing it is a disaster:
+///
+///     corpus            race OFF            race ON
+///     main   PSNR med    +20.5 %             +44.6 %
+///     main   S2   med    +14.9 %             +27.3 %
+///     noise-heavy         -0.4 % (a win)      +3.3 % (lost)
+///     dark/grain         +46.5 %             +70.7 %
+///
+/// WHY, and it is a reasoning error worth not repeating: the frame race scores
+/// `SSE + kEncFrameRaceLambda * step^2 * bytes`. That score IS ITSELF a
+/// rate/distortion preference. Two RD lambdas are two points on the
+/// rate/distortion CURVE — a larger lambda simply buys a smaller, worse file.
+/// Scoring them against a fixed byte price therefore does not discover which
+/// lambda is better; it reports which end of the curve that byte price prefers,
+/// and it answers the same way on every image. YOU CANNOT CHOOSE A POINT ON THE
+/// RD CURVE WITH AN RD SCORE.
+///
+/// This is why the axis differs from every other race in this encoder: palette,
+/// DCT16/32, the AC context map, the DC tree and lossless dominance all compare
+/// candidates that target the SAME operating point by different means, so a
+/// fixed byte price is a fair referee. Lambda moves the target.
+///
+/// Choosing a lambda needs an objective that is not itself an RD tradeoff —
+/// BD-rate over a sweep, or a perceptual metric at matched size. The machinery
+/// is left intact behind `JXL_LAMBDA_RACE=1` for whoever builds one.
+let kEncLambdaRaceEnabled: Bool = {
+    if let s = ProcessInfo.processInfo.environment["JXL_LAMBDA_RACE"] { return s != "0" }
+    return false
+}()
+
+/// The alternate lambda raced against `kRDLambda0`. 1.0 is where the eight-image
+/// smooth study put the optimum; `JXL_LAMBDA_ALT` sweeps it.
+let kEncLambdaRaceAlternate: Float = {
+    if let s = ProcessInfo.processInfo.environment["JXL_LAMBDA_ALT"], let v = Float(s) {
+        return v
+    }
+    return 1.0
+}()
