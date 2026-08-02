@@ -477,6 +477,21 @@ every milestone lands with djxl round-trip proof, never just self-consistency.
       worst case (synth_noise q90 0.221 s -> 0.172 s) and is 41/45 corpus points
       byte-identical, the other four differing by -0.005%…+0.51% in both
       directions at equal PSNR. `JXL_DCT32=0` / `JXL_DCT32_GATE=0` isolate both.
+    - **BENCHMARK after E5l** (vs `cjxl -e7`, 9 measurable corpus images):
+      BD-rate PSNR median **+22.0%**, SSIMULACRA2 median **+11.2%** — down from
+      +35.4/+35.5% at the start of the E5i..E5l sequence, with the perceptual
+      metric roughly halving. Against `cjxl -e3` the mean is +12.4%, and we now
+      WIN on photo_rocks (-3.4%) and synth_noise (-15.4%) and sit at parity on
+      grad_smooth (+0.1%) — the first operating points where this encoder beats
+      the reference at any preset. Equal-PSNR size 1.28x mean. Encode ~4.1x
+      `cjxl -e7`, which remains the weak axis.
+      Remaining worst classes: smooth gradient +53.9% and dark/grain +46.5%.
+      Weight SSIMULACRA2 over PSNR — cjxl targets butteraugli, and the RD
+      calibration study showed the two can disagree in SIGN about a tool.
+      CAVEAT that applies to every number here: the corpus has only THREE
+      genuinely independent photographs, and no repo fixture is photographic.
+      That is how every lossy decision from E5a to E5h came to be tuned on
+      synthetic content in the first place.
     - Remaining lossy quality levers: further strategies (rectangular
       DCT16x8/32x16, AFV), real trellis/joint RD across the block,
       a real EPF sharpness field (above). Note what E5l refined about the E5f
