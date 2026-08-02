@@ -1,17 +1,19 @@
 // VarDCTStrategy.swift
 //
-// E5e: variable-size AC transforms for the lossy VarDCT encoder — DCT8
-// (AC strategy 0) plus DCT16 (AC strategy 4), chosen per aligned 2x2 block
-// cell by rate-distortion. This file holds the two pieces of DCT16 machinery
-// that are pure math, so `VarDCTEncoder` keeps only the bitstream walk:
+// E5e/E5l: variable-size AC transforms for the lossy VarDCT encoder — DCT8
+// (AC strategy 0), DCT16 (strategy 4) and DCT32 (strategy 5), chosen
+// hierarchically per aligned 2x2 / 4x4 block cell by rate-distortion. This
+// file holds the pieces that are pure math, so `VarDCTEncoder` keeps only the
+// bitstream walk:
 //
-//   1. The LLF <-> DC coupling. A DCT16 varblock's four lowest-frequency
+//   1. The LLF <-> DC coupling. A large varblock's lowest-frequency
 //      coefficients are NOT in the AC token stream: the decoder fills them
 //      from the DC image with `insertLLF` (DCTTransforms.swift) after AC
-//      dequant and before the inverse transform. `encDCT16DCFromLLF` is the
-//      exact numeric inverse of that function for strategy 4, so the four DC
-//      samples this encoder quantizes are precisely the ones that reproduce
-//      the forward transform's 2x2 corner.
+//      dequant and before the inverse transform. `encDCT16DCFromLLF` /
+//      `encDCT32DCFromLLF` are the exact numeric inverses of that function for
+//      strategies 4 and 5, so the DC samples this encoder quantizes are
+//      precisely the ones that reproduce the forward transform's 2x2 / 4x4
+//      corner.
 //
 //   2. The per-cell RD choice (`encStrategyACCost`): the pixel-domain
 //      distortion + lambda * rate of quantizing one candidate transform's
@@ -25,6 +27,7 @@ import Foundation
 /// AC strategy indices this encoder places (`AcStrategyType`).
 let kEncStrategyDCT8 = 0
 let kEncStrategyDCT16 = 4
+let kEncStrategyDCT32 = 5
 
 // MARK: - LLF <-> DC coupling (inverse of insertLLF, strategy 4)
 //
@@ -67,11 +70,91 @@ func encDCT16DCFromLLF(_ c: UnsafePointer<Float>) -> (Float, Float, Float, Float
 @inline(__always)
 func encIsDCT16LLF(_ k: Int) -> Bool { (k >> 4) < 2 && (k & 15) < 2 }
 
+/// True at the four LLF storage positions of a DCT32 varblock — `u < 4 && v <
+/// 4` in the `S[u*32 + v]` layout, i.e. exactly `computeNaturalCoeffOrder(cbx:
+/// 4, cby: 4)`'s first sixteen entries. Filled from the DC image, never coded.
+@inline(__always)
+func encIsDCT32LLF(_ k: Int) -> Bool { (k >> 5) < 4 && (k & 31) < 4 }
+
 /// True at the LLF position(s) of a varblock of `size` coefficients (64 =
-/// DCT8, one LLF at index 0; 256 = DCT16, the 2x2 corner).
+/// DCT8, one LLF at index 0; 256 = DCT16, the 2x2 corner; 1024 = DCT32, the
+/// 4x4 corner).
 @inline(__always)
 func encIsLLF(size: Int, _ k: Int) -> Bool {
-    size == 64 ? k == 0 : encIsDCT16LLF(k)
+    switch size {
+    case 64: return k == 0
+    case 256: return encIsDCT16LLF(k)
+    default: return encIsDCT32LLF(k)
+    }
+}
+
+// MARK: - LLF <-> DC coupling (inverse of insertLLF, strategy 5)
+//
+// The DCT32 case is the same construction one level up: `insertLLF` for a
+// 4x4-covering strategy takes the 4x4 patch of DC samples D[iy][ix] under the
+// varblock and computes
+//
+//   rows[v][u] = 4-point forward scaled DCT of D[v][0..3]      (horizontal)
+//   f_u[v]     = 4-point forward scaled DCT of rows[0..3][u]   (vertical)
+//   coeffs[u*32 + v] = f_u[v] * s[v] * s[u],  s = kResampleScale4
+//
+// so the inverse is: undo the two resample scales, then apply the 4-point
+// scaled INVERSE DCT twice. The 4-point forward there is
+// `F[k] = w(k)/4 Σ_x f(x) cos((2x+1)kπ/8)`, whose exact inverse is
+// `f(x) = Σ_k w(k) cos((2x+1)kπ/8) F[k]` — i.e. `makeIDCTBasis(4)` — because
+// `Σ_k w(k)² cos((2x+1)kπ/8) cos((2y+1)kπ/8) = 4·δ(x,y)`. Both tables below
+// are therefore read off the decoder, not off the spec, exactly as for DCT16.
+
+/// `kResampleScale4` from DCTTransforms.swift.
+let kEncResampleScale4: [Float] = [
+    1.0, 1.025760096781116015, 1.108937353592731823, 1.270559368765487251,
+]
+
+/// `makeIDCTBasis(4)`: `b[x*4 + k] = w(k) * cos((2x+1) k π / 8)`.
+let kEncIDCT4Basis: [Float] = {
+    var b = [Float](repeating: 0, count: 16)
+    for x in 0..<4 {
+        for k in 0..<4 {
+            let w: Double = k == 0 ? 1.0 : 2.0.squareRoot()
+            b[x * 4 + k] = Float(w * cos(Double(2 * x + 1) * Double(k) * Double.pi / 8))
+        }
+    }
+    return b
+}()
+
+/// The sixteen DC-image samples (row-major over the varblock's 4x4 block
+/// patch) that `insertLLF(strategy: 5)` turns back into the DCT32 coefficient
+/// corner `c[u*32 + v]`, `u, v < 4`. Writes 16 floats to `out`.
+@inline(__always)
+func encDCT32DCFromLLF(_ c: UnsafePointer<Float>, into out: UnsafeMutablePointer<Float>) {
+    kEncResampleScale4.withUnsafeBufferPointer { s in
+        kEncIDCT4Basis.withUnsafeBufferPointer { b in
+            // Undo the vertical stage: rows[v][u] for u, v < 4.
+            var rows = [Float](repeating: 0, count: 16)
+            for u in 0..<4 {
+                var f = (Float(0), Float(0), Float(0), Float(0))
+                f.0 = c[u * 32] / s[u]
+                f.1 = c[u * 32 + 1] / (s[1] * s[u])
+                f.2 = c[u * 32 + 2] / (s[2] * s[u])
+                f.3 = c[u * 32 + 3] / (s[3] * s[u])
+                for v in 0..<4 {
+                    rows[v * 4 + u] =
+                        b[v * 4] * f.0 + b[v * 4 + 1] * f.1 + b[v * 4 + 2] * f.2
+                        + b[v * 4 + 3] * f.3
+                }
+            }
+            // Undo the horizontal stage: D[iy][ix].
+            for iy in 0..<4 {
+                let r0 = rows[iy * 4], r1 = rows[iy * 4 + 1]
+                let r2 = rows[iy * 4 + 2], r3 = rows[iy * 4 + 3]
+                for ix in 0..<4 {
+                    out[iy * 4 + ix] =
+                        b[ix * 4] * r0 + b[ix * 4 + 1] * r1 + b[ix * 4 + 2] * r2
+                        + b[ix * 4 + 3] * r3
+                }
+            }
+        }
+    }
 }
 
 // MARK: - Strategy selection (rate-distortion)
@@ -115,6 +198,35 @@ func encIsLLF(size: Int, _ k: Int) -> Bool {
 /// the suite pins that path byte-identical to the pre-E5e bitstream.
 let kEncDCT16Enabled: Bool = {
     if let s = ProcessInfo.processInfo.environment["JXL_DCT16"] { return s != "0" }
+    return true
+}()
+
+/// DCT32 (AC strategy 5) master switch. `JXL_DCT32=0` restricts the encoder to
+/// the E5e DCT8+DCT16 mix, which is how the E5l addition is isolated when
+/// measuring. DCT32 is only ever considered where DCT16 already is.
+///
+/// A note on why DCT32 is NOT gated behind its own frame race the way DCT16 is
+/// (see the E5f discussion below): DCT16 and DCT32 land in the SAME block
+/// context. `kStrategyOrder` maps strategy 4 -> order bucket 2 and strategy 5
+/// -> bucket 3, and the default block context map's luma row is
+/// [0, 1, 2, 2, 3, ...] — buckets 2 and 3 both select cluster 2 (and both
+/// chroma rows likewise select 9). So mixing DCT32 into a frame that already
+/// contains DCT16 adds NO new ANS histogram bucket, which is exactly the
+/// frame-global cost that made the DCT16-vs-DCT8 decision unpriceable per
+/// cell. The per-cell RD choice can therefore stand on its own here, and the
+/// existing large-vs-all-DCT8 race still covers the case where large
+/// transforms should not be used at all.
+let kEncDCT32Enabled: Bool = {
+    if let s = ProcessInfo.processInfo.environment["JXL_DCT32"] { return s != "0" }
+    return true
+}()
+
+/// Admission test for the DCT32 candidate: evaluate a 4x4 super-cell only when
+/// at least one of its four 2x2 cells already chose DCT16. `JXL_DCT32_GATE=0`
+/// evaluates every super-cell, which is how the gate was verified — it is a
+/// SPEED gate, not a quality one, and must stay one.
+let kEncDCT32Gate: Bool = {
+    if let s = ProcessInfo.processInfo.environment["JXL_DCT32_GATE"] { return s != "0" }
     return true
 }()
 
@@ -201,18 +313,20 @@ let kEncStratRefEnergy: Float = {
     return 64 * s / 63
 }()
 
-/// The single quant value a 2x2 cell's DCT16 varblock carries: the rounded
-/// mean of its four blocks' own adaptive-quant values (E5b). The decoder fills
+/// The single quant value a multi-block varblock carries: the rounded mean of
+/// its `cov * cov` blocks' own adaptive-quant values (E5b). The decoder fills
 /// every covered block with one coded value, so there is nothing finer to
-/// carry; the same number is used for the RD comparison so both candidates are
-/// judged under one quantization step.
+/// carry; the same number is used for the RD comparison so all candidates over
+/// a region are judged under one quantization step.
 @inline(__always)
-func encCellQuant(_ blockQuant: [Int32], gw: Int, bxl: Int, byl: Int) -> Int32 {
-    let a = blockQuant[byl * gw + bxl]
-    let b = blockQuant[byl * gw + bxl + 1]
-    let c = blockQuant[(byl + 1) * gw + bxl]
-    let d = blockQuant[(byl + 1) * gw + bxl + 1]
-    return min(256, max(1, (a + b + c + d + 2) / 4))
+func encCellQuant(_ blockQuant: [Int32], gw: Int, bxl: Int, byl: Int, cov: Int = 2) -> Int32 {
+    var s: Int32 = 0
+    for dy in 0..<cov {
+        let row = (byl + dy) * gw + bxl
+        for dx in 0..<cov { s += blockQuant[row + dx] }
+    }
+    let n = Int32(cov * cov)
+    return min(256, max(1, (s + n / 2) / n))
 }
 
 /// Pixel-domain RD cost of one candidate transform over all three channels:

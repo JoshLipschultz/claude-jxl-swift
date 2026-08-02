@@ -431,13 +431,61 @@ every milestone lands with djxl round-trip proof, never just self-consistency.
       for `jxl info <file> sections` FIRST in any density question: it found all
       three root causes in an afternoon after whole-file differencing had failed
       to.
-    - Remaining lossy quality levers: further strategies (DCT32,
-      rectangular, AFV), real trellis/joint RD across the block,
-      a real EPF sharpness field (above). Note the
-      E5f finding generalizes: adding a strategy whose blocks use a distinct
-      context bucket carries a frame-global histogram-fragmentation cost, so
-      each new strategy likely wants the same race treatment rather than
-      per-cell selection alone.
+    - **E5l** (2026-08-02): **DCT32 (AC strategy 5).** Smooth content was the
+      encoder's worst class (+54.6% BD-rate on a gradient, +72.0% on a smooth
+      photo, vs +24–26% for ordinary photos) while the encoder placed only two
+      of the format's ~27 strategies. A 4x4 block super-cell is now raced
+      against the DCT16/DCT8 tiling that won those sixteen blocks.
+      Three pieces: `forwardDCT32`; `encDCT32DCFromLLF`, the exact inverse of
+      the decoder's `insertLLF` for a 4x4 LLF corner (two 4-point scaled IDCTs
+      plus `kResampleScale4`, pinned by a round-trip test through the DECODER's
+      own `insertLLF`); and a per-group scratch layout changed from cell-major
+      to **Z-order over 4x4 super-cells**, because cell-major does not nest at
+      the 4x4 level — a super-cell's sixteen blocks were not contiguous, so a
+      1024-coefficient varblock had nowhere to land.
+      SELECTION IS HIERARCHICAL, and the alternative it is scored against
+      matters: one DCT32 replaces not "sixteen DCT8" but whatever DCT16/DCT8
+      mixture already won those blocks, RE-SCORED at the super-cell's own quant
+      step (cost is not comparable across steps — lambda scales as step², the
+      modelled rate does not). Re-scoring runs no new transform.
+      RESULT, sizes at matched quality (DCT32 off -> on):
+        grad_smooth  q50  5697 -> 4988  (-12.5%)   q90 26320 -> 24543 (-6.8%)
+        photo_sky    q50  1748 -> 1606  ( -8.1%)   q90 11538 -> 10890 (-5.6%)
+        gray_city    q50 15772 -> 13777 (-12.7%)   photo_city q50 -6.4%
+        photo_bridge q50 20904 -> 19400 ( -7.2%)   synth_noise  byte-identical
+      Matched-SIZE PSNR (the only honest read) is positive everywhere measured:
+      grad_smooth +0.38…+1.81 dB, photo_sky +0.31…+1.95 dB, photo_bridge
+      +0.05…+0.94 dB, photo_city +0.05…+0.78 dB. Golden fixture 24958 -> 21038
+      (-15.7%), re-verified against djxl before the constant moved.
+      **NO NEW FRAME-LEVEL RACE, and this is the interesting part.** E5f's
+      lesson was that a new strategy fragments the ANS histograms because its
+      blocks use a different block-context bucket. DCT32 does NOT: `kStrategy
+      Order` sends DCT16 to order bucket 2 and DCT32 to bucket 3, and the
+      default block context map's rows are [0,1,2,2,3,…] / [7,8,9,9,10,…] — 2
+      and 3 collapse to the SAME cluster in all three channel buckets. So
+      mixing DCT32 into a DCT16 frame adds no histogram, the per-cell RD choice
+      stands on its own, and the existing large-vs-all-DCT8 rung still answers
+      the only frame-global question there is. Asserted in-suite against the
+      DECODER's table so a future map change cannot silently invalidate it.
+      Checked at frame-race lambda 6.0 / 0.5 / 0.1: the DCT32 decision is
+      identical at all three on 8 of 9 corpus images. The exception is
+      photo_rocks q50, where lambda 6.0 declines large transforms entirely and
+      hides a +0.76 dB / +1.1% DCT32 win that appears at 0.5 — i.e. a lambda
+      recalibration would make DCT32 look BETTER, never worse.
+      COST: +16–30% encode time. A cheap admission gate (evaluate a super-cell
+      only where some sub-cell already chose DCT16) recovers up to 22% of the
+      worst case (synth_noise q90 0.221 s -> 0.172 s) and is 41/45 corpus points
+      byte-identical, the other four differing by -0.005%…+0.51% in both
+      directions at equal PSNR. `JXL_DCT32=0` / `JXL_DCT32_GATE=0` isolate both.
+    - Remaining lossy quality levers: further strategies (rectangular
+      DCT16x8/32x16, AFV), real trellis/joint RD across the block,
+      a real EPF sharpness field (above). Note what E5l refined about the E5f
+      finding: the histogram-fragmentation cost is not "one per new strategy",
+      it is one per new **block-context cluster**. Check `kStrategyOrder`
+      composed with `kDefaultBlockContextMap` before assuming a new strategy
+      needs its own race — the rectangular transforms land in buckets 4/5/6,
+      which map to luma clusters 3/3/4, i.e. distinct from DCT8's 0 and
+      DCT16/32's 2, so those probably DO need the race treatment.
 - **E6 (undecided) — jbrd**: JPEG recompression, byte-exact reconstruction.
 
 Each milestone = the full existing ritual: suite + fuzz + bench + size gate +

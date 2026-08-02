@@ -3079,6 +3079,106 @@ struct TestRunner {
             check(order8[0] == 0, "DCT8 LLF order position")
         }
 
+        // E5l: the same three identities one size up, for DCT32.
+        var worstDCT32: Float = 0
+        for _ in 0..<20 {
+            var pix = [Float](repeating: 0, count: 1024)
+            for i in 0..<1024 { pix[i] = Float(rnd() * 2 - 1) }
+            var coeffs = [Float](repeating: 0, count: 1024)
+            pix.withUnsafeBufferPointer { p in
+                coeffs.withUnsafeMutableBufferPointer { o in
+                    forwardDCT32(pixels: p.baseAddress!, stride: 32, out: o.baseAddress!)
+                }
+            }
+            var back = [Float](repeating: 0, count: 1024)
+            var tmp = [Float](repeating: 0, count: 1024)
+            coeffs.withUnsafeMutableBufferPointer { c in
+                back.withUnsafeMutableBufferPointer { b in
+                    tmp.withUnsafeMutableBufferPointer { t in
+                        scaledIDCT(
+                            c.baseAddress!, h: 32, w: 32, pixels: b.baseAddress!, stride: 32,
+                            tmp: t.baseAddress!)
+                    }
+                }
+            }
+            for i in 0..<1024 { worstDCT32 = max(worstDCT32, abs(back[i] - pix[i])) }
+        }
+        check(worstDCT32 < 1e-5, "forward DCT32 -> scaledIDCT identity (max err \(worstDCT32))")
+
+        do {
+            var pix = [Float](repeating: 0, count: 1024)
+            var mean: Float = 0
+            for i in 0..<1024 {
+                pix[i] = Float(rnd())
+                mean += pix[i]
+            }
+            mean /= 1024
+            var coeffs = [Float](repeating: 0, count: 1024)
+            pix.withUnsafeBufferPointer { p in
+                coeffs.withUnsafeMutableBufferPointer { o in
+                    forwardDCT32(pixels: p.baseAddress!, stride: 32, out: o.baseAddress!)
+                }
+            }
+            check(abs(coeffs[0] - mean) < 1e-5, "DCT32 DC == 32x32 region mean")
+        }
+
+        // The DCT32 LLF <-> DC coupling: sixteen DC-image samples derived from
+        // the 4x4 corner must be exactly what the DECODER'S OWN insertLLF turns
+        // back into that corner. Same argument as the DCT16 case — the 4-point
+        // resample scales live only in the decoder — one level up, where the
+        // inverse is a real 4-point IDCT rather than a two-term butterfly.
+        var worstLLF32: Float = 0
+        for _ in 0..<200 {
+            var coeffs = [Float](repeating: 0, count: 1024)
+            for i in 0..<1024 { coeffs[i] = Float(rnd() * 2 - 1) }
+            var want = [Float](repeating: 0, count: 16)
+            for u in 0..<4 {
+                for v in 0..<4 { want[u * 4 + v] = coeffs[u * 32 + v] }
+            }
+            var dcPlane = [Float](repeating: 0, count: 16)
+            coeffs.withUnsafeBufferPointer { c in
+                dcPlane.withUnsafeMutableBufferPointer { d in
+                    encDCT32DCFromLLF(c.baseAddress!, into: d.baseAddress!)
+                }
+            }
+            var round = [Float](repeating: 0, count: 1024)
+            round.withUnsafeMutableBufferPointer { c in
+                dcPlane.withUnsafeBufferPointer { d in
+                    insertLLF(
+                        c.baseAddress!, strategy: kEncStrategyDCT32,
+                        dc: d.baseAddress!, dcStride: 4, dcOrigin: 0)
+                }
+            }
+            for u in 0..<4 {
+                for v in 0..<4 {
+                    worstLLF32 = max(worstLLF32, abs(round[u * 32 + v] - want[u * 4 + v]))
+                }
+            }
+        }
+        check(worstLLF32 < 1e-4, "DCT32 LLF -> DC -> insertLLF identity (max err \(worstLLF32))")
+
+        do {
+            let order = computeNaturalCoeffOrder(cbx: 4, cby: 4)
+            eq(order.count, 1024, "DCT32 natural coeff order size")
+            let llf = Set(order[0..<16].map { Int($0) })
+            var mismatches = 0
+            for k in 0..<1024 where encIsLLF(size: 1024, k) != llf.contains(k) { mismatches += 1 }
+            eq(mismatches, 0, "encIsLLF matches the DCT32 order's LLF prefix")
+        }
+
+        // DCT16 and DCT32 must land in the SAME block-context cluster: that is
+        // the property E5l relies on when it declines to give DCT32 its own
+        // frame-level race (see kEncDCT32Enabled). It is a fact about the
+        // DECODER's tables, so it is asserted against them.
+        do {
+            let map = kDefaultBlockContextMap
+            for bucket in 0..<3 {
+                let c16 = map[bucket * kNumCoeffOrders + kStrategyOrder[kEncStrategyDCT16]]
+                let c32 = map[bucket * kNumCoeffOrders + kStrategyOrder[kEncStrategyDCT32]]
+                eq(Int(c16), Int(c32), "DCT16/DCT32 share block context (bucket \(bucket))")
+            }
+        }
+
         // Forward XYB -> decoder inverse-opsin == identity on random samples.
         let opsin = ForwardOpsin()
         let state = ConvertState(
@@ -3096,7 +3196,9 @@ struct TestRunner {
         }
         check(worstXYB < 1e-4, "forward XYB -> ConvertState.linear identity (max err \(worstXYB))")
         FileHandle.standardError.write(
-            Data("  [lossy-identities] DCT8/DCT16 + LLF + XYB forward transforms invert the decoder\n".utf8))
+            Data(
+                "  [lossy-identities] DCT8/DCT16/DCT32 + LLF + XYB forward transforms invert the decoder\n"
+                    .utf8))
     }
 
     /// Peak signal-to-noise between two integer plane sets (same depth).
@@ -3155,7 +3257,11 @@ struct TestRunner {
             // cross-oracle sweep before updating the constant.
             let again = try JXL.encodeLossy(image: srcImage)
             check(again == jxl, "lossy encode deterministic")
-            eq(jxl.count, 24958, "lossy size golden (q90, 384x256_prog)")
+            // E5l moved this from 24958 (DCT8+DCT16) to 21038 by adding DCT32:
+            // the fixture is smooth enough that 92 of its 108 varblocks are
+            // 32x32. Re-verified against djxl 0.12 before the constant changed
+            // (djxl decodes it; float cross-oracle vs our decoder 122.6 dB).
+            eq(jxl.count, 21038, "lossy size golden (q90, 384x256_prog)")
 
             // Lower quality: smaller file, lower PSNR, still decodable.
             let q50 = try JXL.encodeLossy(image: srcImage, quality: 50)
@@ -3226,7 +3332,9 @@ struct TestRunner {
                         for c in 0..<3 { noisy[c][i] = r8() }
                     }
                 }
-                func placement(_ planes: [[Int32]]) throws -> (jxl: [UInt8], n8: Int, n16: Int) {
+                func placement(_ planes: [[Int32]]) throws -> (
+                    jxl: [UInt8], n8: Int, n16: Int, n32: Int
+                ) {
                     let img = JXLDecodedImage(
                         width: w, height: h, colorChannels: 3, extraChannels: 0,
                         bitsPerSample: 8, isFloat: false, planes: planes, iccProfile: nil)
@@ -3234,27 +3342,34 @@ struct TestRunner {
                     let meta = try decodeVarDCTACMetadata(from: jxl)
                     var n8 = 0
                     var n16 = 0
+                    var n32 = 0
                     for i in 0..<(meta.widthBlocks * meta.heightBlocks) where meta.isFirstBlock[i] {
-                        if meta.strategy[i] == UInt8(kEncStrategyDCT16) {
+                        if meta.strategy[i] == UInt8(kEncStrategyDCT32) {
+                            n32 += 1
+                        } else if meta.strategy[i] == UInt8(kEncStrategyDCT16) {
                             n16 += 1
                         } else if meta.strategy[i] == UInt8(kEncStrategyDCT8) {
                             n8 += 1
                         }
                     }
-                    eq(meta.varblockCount, n8 + n16, "\(w)x\(h) varblock count == placement")
+                    eq(meta.varblockCount, n8 + n16 + n32, "\(w)x\(h) varblock count == placement")
+                    // 0x31 = strategies 0 (DCT8), 4 (DCT16), 5 (DCT32).
                     check(
-                        meta.usedACs & ~UInt32(0x11) == 0,
-                        "\(w)x\(h) uses only DCT8/DCT16 (mask 0x\(String(meta.usedACs, radix: 16)))")
-                    return (jxl, n8, n16)
+                        meta.usedACs & ~UInt32(0x31) == 0,
+                        "\(w)x\(h) uses only DCT8/16/32 (mask 0x\(String(meta.usedACs, radix: 16)))")
+                    return (jxl, n8, n16, n32)
                 }
 
                 let s = try placement(smooth)
+                let sLargeBlocks = 4 * s.n16 + 16 * s.n32
                 check(
-                    s.n16 > 0,
-                    "\(w)x\(h) smooth gradient selects DCT16 (\(s.n16) of \(s.n8 + s.n16))")
+                    s.n32 > 0,
+                    "\(w)x\(h) smooth gradient selects DCT32 "
+                        + "(\(s.n32) of \(s.n8 + s.n16 + s.n32) varblocks)")
                 check(
-                    4 * s.n16 > s.n8,
-                    "\(w)x\(h) smooth gradient is mostly DCT16 coverage (\(4 * s.n16) vs \(s.n8) blocks)")
+                    sLargeBlocks > s.n8,
+                    "\(w)x\(h) smooth gradient is mostly large-transform coverage "
+                        + "(\(sLargeBlocks) vs \(s.n8) blocks)")
                 let dec = try JXL.decodeImage(from: s.jxl)
                 check(dec.width == w && dec.height == h, "\(w)x\(h) DCT16 round-trip dims")
                 let psnr = planePSNR(Array(dec.planes[0..<3]), smooth, maxVal: 255)
@@ -3262,8 +3377,8 @@ struct TestRunner {
 
                 let n = try placement(noisy)
                 check(
-                    4 * n.n16 < n.n8 / 4,
-                    "\(w)x\(h) noise stays DCT8 (\(n.n16) DCT16 vs \(n.n8) DCT8)")
+                    4 * n.n16 + 16 * n.n32 < n.n8 / 4,
+                    "\(w)x\(h) noise stays DCT8 (\(n.n16) DCT16, \(n.n32) DCT32 vs \(n.n8) DCT8)")
                 let decN = try JXL.decodeImage(from: n.jxl)
                 check(decN.width == w, "\(w)x\(h) noise round-trip dims")
             } catch {

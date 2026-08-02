@@ -197,3 +197,56 @@ func forwardDCT16(
         }
     }
 }
+
+// MARK: - Forward DCT32 (E5l)
+
+/// Forward basis rows for N = 32: `fdct32Basis[k*32 + t] = w(k)/32 *
+/// cos((2t+1) k π / 64)` — the inverse weighting of `makeIDCTBasis(32)`
+/// (DCTTransforms.swift), whose 1D basis has squared norm 32 per frequency.
+/// Same amplitude convention as N = 8 and N = 16, which is why one dequant
+/// scale and one RD lambda can be shared across all three sizes.
+private let fdct32Basis: [Double] = {
+    var b = [Double](repeating: 0, count: 1024)
+    for k in 0..<32 {
+        let w: Double = k == 0 ? 1.0 : 2.0.squareRoot()
+        for t in 0..<32 {
+            b[k * 32 + t] = w / 32.0 * cos(Double(2 * t + 1) * Double(k) * Double.pi / 64.0)
+        }
+    }
+    return b
+}()
+
+/// Forward scaled DCT of one 32x32 pixel region into the decoder's coefficient
+/// storage for square blocks: `out[u*32 + v] = F[v][u]` (v = vertical
+/// frequency, u = horizontal) — the layout `scaledIDCT(h:32, w:32)` consumes
+/// and the one `insertLLF` writes its 4x4 lowest frequencies into
+/// (`coeffs[u*cm + v]`, cm = 32). `out` gets 1024 values; out[0] is the mean of
+/// the 32x32 region.
+func forwardDCT32(
+    pixels: UnsafePointer<Float>, stride: Int, out: UnsafeMutablePointer<Float>
+) {
+    // Pass 1 (horizontal): t1[u*32 + y] = Σ_x basis[u][x] * p[y][x].
+    var t1 = [Double](repeating: 0, count: 1024)
+    fdct32Basis.withUnsafeBufferPointer { fb in
+        t1.withUnsafeMutableBufferPointer { t1b in
+            for y in 0..<32 {
+                let row = pixels + y * stride
+                for u in 0..<32 {
+                    var s = 0.0
+                    let basisRow = u * 32
+                    for x in 0..<32 { s += fb[basisRow + x] * Double(row[x]) }
+                    t1b[u * 32 + y] = s
+                }
+            }
+            // Pass 2 (vertical): out[u*32 + v] = Σ_y basis[v][y] * t1[u*32 + y].
+            for u in 0..<32 {
+                for v in 0..<32 {
+                    var s = 0.0
+                    let basisRow = v * 32
+                    for y in 0..<32 { s += fb[basisRow + y] * t1b[u * 32 + y] }
+                    out[u * 32 + v] = Float(s)
+                }
+            }
+        }
+    }
+}

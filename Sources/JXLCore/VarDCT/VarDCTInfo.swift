@@ -31,7 +31,11 @@ private let kQFThresholdDist1 = U32Choice.bits(3, offset: 4)
 private let kQFThresholdDist2 = U32Choice.bits(5, offset: 12)
 private let kQFThresholdDist3 = U32Choice.bits(8, offset: 44)
 private let kNumOrders = 13
-private let kDefaultBlockContextMap: [UInt8] = [
+/// libjxl `kDefaultBlockContextMap`: `channelBucket * kNumOrders + orderBucket`
+/// -> context cluster. Internal rather than file-private so the encoder's tests
+/// can assert strategy-to-cluster facts (e.g. that DCT16 and DCT32 share one)
+/// against the DECODER's table rather than a copy of it.
+let kDefaultBlockContextMap: [UInt8] = [
     0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6,
     7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
     7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
