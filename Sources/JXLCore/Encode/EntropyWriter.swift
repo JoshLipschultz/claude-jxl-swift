@@ -840,18 +840,21 @@ private func clusterPairCost(_ a: [Int], _ b: [Int], _ ea: Double, _ eb: Double)
     clusterEntropyBits(clusterMerged(a, b)) - ea - eb
 }
 
-// @_optimize(none): the Swift 6.4 beta optimizer's LoopInvariantCodeMotion
-// pass crashes (signal 5) on this function's pairwise merge loop at -O. All
-// heavy math lives in the -O free functions above; with the pair costs cached
-// the driver's own work is O(clusters² ≤ 48²) double compares per merge —
-// optimization is irrelevant here.
+// HISTORICAL: this function carried `@_optimize(none)` from E4a until
+// 2026-08-02, because the Swift 6.4 beta optimizer's LoopInvariantCodeMotion
+// pass crashed (signal 5) on the pairwise merge loop below at -O. Retested on
+// swiftlang-6.4.0.20.104 (Apple Swift 6.4) and the crash is GONE: full -O build
+// clean, suite 18858/0, encode-fuzz 400 clean, and every size golden unmoved —
+// which is the check that matters, since a miscompile here would not crash but
+// would silently produce a different clustering and therefore different output.
+// The attribute is removed; if it ever has to come back, note that only
+// `Scripts/build.sh` reproduced the crash — `run-tests.sh` did not.
 //
 // The cache is exact, not approximate: cluster entropies and pair costs are
 // pure functions of cluster contents, recomputed only when a cluster's
 // contents change, so every comparison sees the same doubles the original
 // recompute-everything loop saw, in the same (i asc, j asc, strict <) scan
 // order — index shifts from `remove(at:)` preserve relative pair order.
-@_optimize(none)
 private func greedyCluster(
     perCtx: [[Int]], numContexts: Int, maxClusters: Int
 ) -> (map: [UInt8], clusters: [[Int]]) {
